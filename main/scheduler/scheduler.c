@@ -38,8 +38,6 @@ static const char *TAG = "SCHED";
 static QueueHandle_t s_raw_data_queue   = NULL;
 static QueueHandle_t s_context_queue    = NULL;
 static QueueHandle_t s_mqtt_out_queue  = NULL;
-static QueueHandle_t s_mqtt_cmd_queue  = NULL;
-static QueueHandle_t s_eval_queue       = NULL;
 
 static TaskHandle_t s_task_modbus_poll    = NULL;
 static TaskHandle_t s_task_context_build  = NULL;
@@ -457,17 +455,13 @@ static void resource_monitor_task(void *arg)
 
 void scheduler_init(QueueHandle_t raw_q,
                     QueueHandle_t ctx_q,
-                    QueueHandle_t mqtt_out_q,
-                    QueueHandle_t mqtt_cmd_q,
-                    QueueHandle_t eval_q)
+                    QueueHandle_t mqtt_out_q)
 {
     ESP_LOGI(TAG, "Initializing scheduler");
 
     s_raw_data_queue  = raw_q;
     s_context_queue   = ctx_q;
     s_mqtt_out_queue  = mqtt_out_q;
-    s_mqtt_cmd_queue  = mqtt_cmd_q;
-    s_eval_queue      = eval_q;
 
     /* Create synchronization primitives */
     s_network_state_mutex = xSemaphoreCreateMutex();
@@ -480,69 +474,61 @@ void scheduler_init(QueueHandle_t raw_q,
         ESP_LOGE(TAG, "Failed to create replay trigger semaphore");
     }
 
-    /* Create tasks - they begin executing immediately.
-     * The s_running flag gates their main loops.
-     */
-    BaseType_t ret;
-
-    ret = xTaskCreate(modbus_poll_task,
-                      "modbus_poll",
-                      TASK_STACK_SIZE_MODBUS,
-                      NULL,
-                      TASK_PRIORITY_MODBUS,
-                      &s_task_modbus_poll);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create modbus_poll_task");
-    }
-
-    ret = xTaskCreate(context_build_task,
-                      "ctx_build",
-                      TASK_STACK_SIZE_TCM,
-                      NULL,
-                      TASK_PRIORITY_TCM,
-                      &s_task_context_build);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create context_build_task");
-    }
-
-    ret = xTaskCreate(publish_task,
-                      "publish",
-                      TASK_STACK_SIZE_MQTT,
-                      NULL,
-                      TASK_PRIORITY_MQTT,
-                      &s_task_publish);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create publish_task");
-    }
-
-    ret = xTaskCreate(replay_task,
-                      "replay",
-                      TASK_STACK_SIZE_SCHED,
-                      NULL,
-                      TASK_PRIORITY_SCHED,
-                      &s_task_replay);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create replay_task");
-    }
-
-    ret = xTaskCreate(resource_monitor_task,
-                      "res_monitor",
-                      TASK_STACK_SIZE_EVAL,
-                      NULL,
-                      TASK_PRIORITY_EVAL,
-                      &s_task_resource_mon);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create resource_monitor_task");
-    }
-
     ESP_LOGI(TAG, "Scheduler initialized with dynamic AMM polling");
 }
 
 void scheduler_start(void)
 {
+    if (s_running) {
+        ESP_LOGW(TAG, "Scheduler is already running");
+        return;
+    }
+
     ESP_LOGI(TAG, "Starting scheduler tasks");
     s_running = true;
-    ESP_LOGI(TAG, "All scheduler tasks started");
+    bool all_started = true;
+    BaseType_t ret;
+
+    ret = xTaskCreate(modbus_poll_task, "modbus_poll", TASK_STACK_SIZE_MODBUS,
+                      NULL, TASK_PRIORITY_MODBUS, &s_task_modbus_poll);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create modbus_poll_task");
+    }
+
+    ret = xTaskCreate(context_build_task, "ctx_build", TASK_STACK_SIZE_TCM,
+                      NULL, TASK_PRIORITY_TCM, &s_task_context_build);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create context_build_task");
+    }
+
+    ret = xTaskCreate(publish_task, "publish", TASK_STACK_SIZE_MQTT,
+                      NULL, TASK_PRIORITY_MQTT, &s_task_publish);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create publish_task");
+    }
+
+    ret = xTaskCreate(replay_task, "replay", TASK_STACK_SIZE_SCHED,
+                      NULL, TASK_PRIORITY_SCHED, &s_task_replay);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create replay_task");
+    }
+
+    ret = xTaskCreate(resource_monitor_task, "res_monitor", TASK_STACK_SIZE_EVAL,
+                      NULL, TASK_PRIORITY_EVAL, &s_task_resource_mon);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create resource_monitor_task");
+    }
+
+    if (all_started) {
+        ESP_LOGI(TAG, "All scheduler tasks started");
+    } else {
+        ESP_LOGE(TAG, "Scheduler started with missing tasks");
+    }
 }
 
 void scheduler_stop(void)

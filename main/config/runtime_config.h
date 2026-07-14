@@ -64,6 +64,7 @@ typedef struct {
 
 esp_err_t runtime_config_init(void);
 void runtime_config_get(runtime_config_t *out);
+ui_locale_t runtime_config_get_locale(void);
 esp_err_t runtime_config_set(const runtime_config_t *config);
 esp_err_t runtime_config_reset(void);
 

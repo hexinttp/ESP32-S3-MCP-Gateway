@@ -215,7 +215,7 @@ class GatewayHandler(SimpleHTTPRequestHandler):
                 "mqtt_connected": True,
                 "modbus_active": True,
                 "free_heap": 200000,
-                "flash_size": 2097152,
+                "flash_size": 16777216,
                 "uptime_seconds": int(time.time() - START_TIME),
             }
             data.update(METRICS)

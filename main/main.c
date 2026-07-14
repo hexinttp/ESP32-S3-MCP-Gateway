@@ -79,25 +79,56 @@ static void lcd_menu_task(void *argument)
     while (true) {
         network_status_t network;
         network_manager_get_status(&network);
-        char line1[40], line2[40], line3[40];
+        char value1[24], value2[24], value3[24];
+        const char *title;
+        const char *label1;
+        const char *label2;
+        const char *label3;
+        uint16_t accent;
+
         if (page == 0) {
-            snprintf(line1, sizeof(line1), "ETH %s", network.ethernet_ip ? network.ethernet_address : "OFFLINE");
-            snprintf(line2, sizeof(line2), "WIFI %s", network.wifi_connected ? network.wifi_address : "OFFLINE");
-            snprintf(line3, sizeof(line3), "MQTT %s", mqtt_is_connected() ? "ONLINE" : "OFFLINE");
-            lcd_st7735_status("GATEWAY NETWORK", line1, line2, line3,
-                              network_manager_is_online() ? LCD_COLOR_GREEN : LCD_COLOR_YELLOW);
+            title = "NETWORK";
+            label1 = "ETHERNET";
+            label2 = "WI-FI";
+            label3 = "MQTT";
+            strlcpy(value1, network.ethernet_ip ? "ONLINE" :
+                    (network.ethernet_link ? "LINK" : "OFFLINE"), sizeof(value1));
+            strlcpy(value2, network.wifi_connected ? "ONLINE" : "OFFLINE", sizeof(value2));
+            strlcpy(value3, mqtt_is_connected() ? "ONLINE" : "OFFLINE", sizeof(value3));
+            accent = network_manager_is_online() ? LCD_COLOR_GREEN : LCD_COLOR_YELLOW;
         } else if (page == 1) {
-            snprintf(line1, sizeof(line1), "POINTS %d", amm_get_mapping_count());
-            snprintf(line2, sizeof(line2), "CACHE %d", uif_get_cached_count());
-            snprintf(line3, sizeof(line3), "FLASH %d%%", uif_get_cache_usage_percent());
-            lcd_st7735_status("TCM AMM UIF", line1, line2, line3, LCD_COLOR_CYAN);
+            title = "IP ADDRESS";
+            label1 = "ETH IP";
+            label2 = "WIFI IP";
+            label3 = "WEB AP";
+            strlcpy(value1, network.ethernet_ip ? network.ethernet_address : "NO ADDRESS", sizeof(value1));
+            strlcpy(value2, network.wifi_connected ? network.wifi_address : "NO ADDRESS", sizeof(value2));
+            strlcpy(value3, "192.168.4.1", sizeof(value3));
+            accent = LCD_COLOR_CYAN;
+        } else if (page == 2) {
+            title = "GATEWAY";
+            label1 = "POINTS";
+            label2 = "CACHE";
+            label3 = "FLASH USED";
+            snprintf(value1, sizeof(value1), "%d", amm_get_mapping_count());
+            snprintf(value2, sizeof(value2), "%d", uif_get_cached_count());
+            snprintf(value3, sizeof(value3), "%d%%", uif_get_cache_usage_percent());
+            accent = LCD_COLOR_CYAN;
         } else {
-            snprintf(line1, sizeof(line1), "AP %s", network.config_ap_ssid);
-            strlcpy(line2, "WEB 192.168.4.1", sizeof(line2));
-            snprintf(line3, sizeof(line3), "TF %s", tf_storage_is_mounted() ? "READY" : "ABSENT");
-            lcd_st7735_status("CONFIGURATION", line1, line2, line3, LCD_COLOR_BLUE);
+            title = "SYSTEM";
+            label1 = "TF CARD";
+            label2 = "RS485";
+            label3 = "LANGUAGE";
+            strlcpy(value1, tf_storage_is_mounted() ? "READY" : "ABSENT", sizeof(value1));
+            strlcpy(value2, board_get_status()->rs485_ready ? "READY" : "OFFLINE", sizeof(value2));
+            strlcpy(value3, runtime_config_get_locale() == UI_LOCALE_ZH_CN ?
+                    "ZH-CN" : "EN-US", sizeof(value3));
+            accent = LCD_COLOR_ORANGE;
         }
-        page = (page + 1) % 3;
+
+        lcd_st7735_dashboard(title, label1, value1, label2, value2,
+                             label3, value3, accent);
+        page = (page + 1) % 4;
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
@@ -136,12 +167,14 @@ void app_main(void)
     QueueHandle_t raw = xQueueCreate(QUEUE_RAW_DATA_SIZE, sizeof(modbus_read_result_t));
     QueueHandle_t context = xQueueCreate(QUEUE_CONTEXT_SIZE, sizeof(tcm_context_t));
     QueueHandle_t mqtt_out = xQueueCreate(QUEUE_MQTT_OUT_SIZE, sizeof(mqtt_out_msg_t));
-    QueueHandle_t mqtt_cmd = xQueueCreate(QUEUE_MQTT_CMD_SIZE, TCM_MAX_JSON_LEN);
-    QueueHandle_t eval = xQueueCreate(QUEUE_EVAL_SIZE, sizeof(eval_event_t));
-    if (!raw || !context || !mqtt_out || !mqtt_cmd || !eval) abort();
+    if (!raw || !context || !mqtt_out) {
+        ESP_LOGE(TAG, "Pipeline queue allocation failed: raw=%p context=%p mqtt=%p",
+                 raw, context, mqtt_out);
+        abort();
+    }
 
-    scheduler_init(raw, context, mqtt_out, mqtt_cmd, eval);
-    xTaskCreate(mqtt_publish_task, "mqtt_out", TASK_STACK_SIZE_MQTT, mqtt_out,
+    scheduler_init(raw, context, mqtt_out);
+    xTaskCreate(mqtt_publish_task, "mqtt_out", 4096, mqtt_out,
                 TASK_PRIORITY_MQTT, NULL);
     char command_topic[128];
     snprintf(command_topic, sizeof(command_topic), "%s%s", config.mqtt.command_prefix,

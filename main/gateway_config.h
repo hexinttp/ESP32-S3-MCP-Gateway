@@ -74,12 +74,10 @@
 #define TASK_PRIORITY_EVAL      2
 
 /* ======================== Queue Configuration ======================== */
-#define QUEUE_RAW_DATA_SIZE      32
-#define QUEUE_CONTEXT_SIZE       32
-#define QUEUE_MQTT_OUT_SIZE      32
-#define QUEUE_MQTT_CMD_SIZE      16
+#define QUEUE_RAW_DATA_SIZE      8
+#define QUEUE_CONTEXT_SIZE       4
+#define QUEUE_MQTT_OUT_SIZE      4
 #define QUEUE_CACHE_SIZE         32
-#define QUEUE_EVAL_SIZE          64
 
 /* ======================== Evaluation Configuration ======================== */
 #define EVAL_LOG_INTERVAL_MS     5000

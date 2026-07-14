@@ -35,32 +35,51 @@ static void lcd_window(int x0, int y0, int x1, int y1)
     lcd_cmd(0x2C);
 }
 
-static uint32_t glyph(char c)
+static const uint8_t s_digits[10][5] = {
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00},
+    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
+    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E},
+};
+
+static const uint8_t s_letters[26][5] = {
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36},
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, {0x7F, 0x41, 0x41, 0x22, 0x1C},
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01},
+    {0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F},
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3F, 0x01},
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, {0x7F, 0x40, 0x40, 0x40, 0x40},
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F},
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, {0x7F, 0x09, 0x09, 0x09, 0x06},
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46},
+    {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7F, 0x01, 0x01},
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, {0x1F, 0x20, 0x40, 0x20, 0x1F},
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, {0x63, 0x14, 0x08, 0x14, 0x63},
+    {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43},
+};
+
+static const uint8_t *glyph(char c)
 {
+    static const uint8_t space[5] = {0};
+    static const uint8_t dash[5] = {0x08, 0x08, 0x08, 0x08, 0x08};
+    static const uint8_t dot[5] = {0x00, 0x60, 0x60, 0x00, 0x00};
+    static const uint8_t colon[5] = {0x00, 0x36, 0x36, 0x00, 0x00};
+    static const uint8_t slash[5] = {0x20, 0x10, 0x08, 0x04, 0x02};
+    static const uint8_t percent[5] = {0x23, 0x13, 0x08, 0x64, 0x62};
+    static const uint8_t question[5] = {0x02, 0x01, 0x51, 0x09, 0x06};
+
     c = (char)toupper((unsigned char)c);
+    if (c >= '0' && c <= '9') return s_digits[c - '0'];
+    if (c >= 'A' && c <= 'Z') return s_letters[c - 'A'];
     switch (c) {
-    case 'A': return 0x7C12F17C; case 'B': return 0x7E52D12E;
-    case 'C': return 0x3C820104; case 'D': return 0x7E82013C;
-    case 'E': return 0xFE52D100; case 'F': return 0xFE12D000;
-    case 'G': return 0x3C82953C; case 'H': return 0xFE1010FE;
-    case 'I': return 0x0082FE82; case 'J': return 0x040281FC;
-    case 'K': return 0xFE102844; case 'L': return 0xFE020202;
-    case 'M': return 0xFE4030FE; case 'N': return 0xFE2010FE;
-    case 'O': return 0x7C82017C; case 'P': return 0xFE90A060;
-    case 'Q': return 0x7C82857E; case 'R': return 0xFE90A06E;
-    case 'S': return 0x6252918C; case 'T': return 0x8080FE80;
-    case 'U': return 0xFC0201FC; case 'V': return 0xF80403F8;
-    case 'W': return 0xFE0418FE; case 'X': return 0xC62810C6;
-    case 'Y': return 0xC0201EC0; case 'Z': return 0x868A92C2;
-    case '0': return 0x7C8A927C; case '1': return 0x0042FE02;
-    case '2': return 0x468A9272; case '3': return 0x4482926C;
-    case '4': return 0xF010FE10; case '5': return 0xE492928C;
-    case '6': return 0x7C92920C; case '7': return 0x808E90E0;
-    case '8': return 0x6C92926C; case '9': return 0x6092927C;
-    case '-': return 0x00101010; case '_': return 0x02020202;
-    case '.': return 0x00000200; case ':': return 0x00280000;
-    case '/': return 0x06081060; case '%': return 0xC6081063;
-    default: return 0;
+    case ' ': return space;
+    case '-': return dash;
+    case '.': return dot;
+    case ':': return colon;
+    case '/': return slash;
+    case '%': return percent;
+    default: return question;
     }
 }
 
@@ -127,29 +146,59 @@ void lcd_st7735_fill(uint16_t color)
 void lcd_st7735_text(int x, int y, const char *text, uint16_t fg, uint16_t bg, int scale)
 {
     if (text == NULL || scale < 1) return;
+    const int advance = 5 * scale + 1;
     for (; *text != '\0'; ++text) {
-        if (x + 6 * scale > BOARD_LCD_WIDTH) { x = 0; y += 9 * scale; }
-        uint32_t bits = glyph(*text);
-        lcd_rect(x, y, 6 * scale, 8 * scale, bg);
-        for (int col = 0; col < 4; ++col) {
-            uint8_t column = (uint8_t)(bits >> (24 - col * 8));
-            for (int row = 0; row < 8; ++row) {
-                if (column & (1U << (7 - row))) {
+        if (x + advance > BOARD_LCD_WIDTH) return;
+        const uint8_t *bits = glyph(*text);
+        lcd_rect(x, y, advance, 7 * scale, bg);
+        for (int col = 0; col < 5; ++col) {
+            for (int row = 0; row < 7; ++row) {
+                if (bits[col] & (1U << row)) {
                     lcd_rect(x + col * scale, y + row * scale, scale, scale, fg);
                 }
             }
         }
-        x += 6 * scale;
+        x += advance;
     }
 }
 
-void lcd_st7735_status(const char *title, const char *line1, const char *line2,
-                       const char *line3, uint16_t accent)
+static int text_width(const char *text, int scale)
+{
+    if (text == NULL || text[0] == '\0') return 0;
+    return (int)strlen(text) * (5 * scale + 1) - 1;
+}
+
+static void centered_text(int y, const char *text, uint16_t fg, uint16_t bg, int scale)
+{
+    int width = text_width(text, scale);
+    int x = width < BOARD_LCD_WIDTH ? (BOARD_LCD_WIDTH - width) / 2 : 0;
+    lcd_st7735_text(x, y, text, fg, bg, scale);
+}
+
+static void dashboard_row(int y, const char *label, const char *value, uint16_t accent,
+                          bool alternate)
+{
+    uint16_t background = alternate ? 0x1082 : LCD_COLOR_BLACK;
+    lcd_rect(0, y, BOARD_LCD_WIDTH, 42, background);
+    lcd_st7735_text(6, y + 4, label, accent, background, 1);
+
+    int scale = text_width(value, 2) <= BOARD_LCD_WIDTH - 8 ? 2 : 1;
+    int value_y = y + (scale == 2 ? 20 : 23);
+    centered_text(value_y, value, LCD_COLOR_WHITE, background, scale);
+    lcd_rect(0, y + 41, BOARD_LCD_WIDTH, 1, 0x2945);
+}
+
+void lcd_st7735_dashboard(const char *title,
+                          const char *label1, const char *value1,
+                          const char *label2, const char *value2,
+                          const char *label3, const char *value3,
+                          uint16_t accent)
 {
     lcd_st7735_fill(LCD_COLOR_BLACK);
-    lcd_rect(0, 0, BOARD_LCD_WIDTH, 24, accent);
-    lcd_st7735_text(6, 7, title, LCD_COLOR_BLACK, accent, 1);
-    lcd_st7735_text(4, 38, line1, LCD_COLOR_WHITE, LCD_COLOR_BLACK, 1);
-    lcd_st7735_text(4, 65, line2, LCD_COLOR_WHITE, LCD_COLOR_BLACK, 1);
-    lcd_st7735_text(4, 92, line3, LCD_COLOR_WHITE, LCD_COLOR_BLACK, 1);
+    lcd_rect(0, 0, 5, 29, accent);
+    lcd_rect(5, 27, BOARD_LCD_WIDTH - 5, 2, accent);
+    lcd_st7735_text(11, 7, title, LCD_COLOR_WHITE, LCD_COLOR_BLACK, 2);
+    dashboard_row(31, label1, value1, accent, false);
+    dashboard_row(73, label2, value2, accent, true);
+    dashboard_row(115, label3, value3, accent, false);
 }

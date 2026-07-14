@@ -216,7 +216,7 @@ static void automation_task(void *argument)
 esp_err_t automation_start(void)
 {
     if (s_task != NULL) return ESP_OK;
-    return xTaskCreate(automation_task, "automation", 6144, NULL, 4, &s_task) == pdPASS
+    return xTaskCreate(automation_task, "automation", 4096, NULL, 4, &s_task) == pdPASS
         ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

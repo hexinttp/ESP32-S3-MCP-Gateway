@@ -1,5 +1,6 @@
 #include "runtime_config.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -63,14 +64,21 @@ static void load_defaults(runtime_config_t *cfg)
 
 static esp_err_t save_locked(void)
 {
-    stored_config_t stored = {.magic = CONFIG_MAGIC, .config = s_config};
-    stored.crc32 = crc32_bytes((const uint8_t *)&stored.config, sizeof(stored.config));
+    stored_config_t *stored = calloc(1, sizeof(*stored));
+    if (stored == NULL) return ESP_ERR_NO_MEM;
+    stored->magic = CONFIG_MAGIC;
+    stored->config = s_config;
+    stored->crc32 = crc32_bytes((const uint8_t *)&stored->config, sizeof(stored->config));
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) return err;
-    err = nvs_set_blob(nvs, CONFIG_NVS_KEY, &stored, sizeof(stored));
+    if (err != ESP_OK) {
+        free(stored);
+        return err;
+    }
+    err = nvs_set_blob(nvs, CONFIG_NVS_KEY, stored, sizeof(*stored));
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
+    free(stored);
     return err;
 }
 
@@ -80,25 +88,28 @@ esp_err_t runtime_config_init(void)
     if (s_mutex == NULL) return ESP_ERR_NO_MEM;
 
     load_defaults(&s_config);
-    stored_config_t stored = {0};
-    size_t size = sizeof(stored);
+    stored_config_t *stored = calloc(1, sizeof(*stored));
+    if (stored == NULL) return ESP_ERR_NO_MEM;
+    size_t size = sizeof(*stored);
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_OK) {
-        err = nvs_get_blob(nvs, CONFIG_NVS_KEY, &stored, &size);
+        err = nvs_get_blob(nvs, CONFIG_NVS_KEY, stored, &size);
         nvs_close(nvs);
     }
     uint32_t crc = 0;
-    if (err == ESP_OK && size == sizeof(stored)) {
-        crc = crc32_bytes((const uint8_t *)&stored.config, sizeof(stored.config));
+    if (err == ESP_OK && size == sizeof(*stored)) {
+        crc = crc32_bytes((const uint8_t *)&stored->config, sizeof(stored->config));
     }
-    if (err == ESP_OK && size == sizeof(stored) && stored.magic == CONFIG_MAGIC &&
-        stored.crc32 == crc && stored.config.schema_version == RUNTIME_CONFIG_SCHEMA_VERSION) {
-        s_config = stored.config;
+    if (err == ESP_OK && size == sizeof(*stored) && stored->magic == CONFIG_MAGIC &&
+        stored->crc32 == crc && stored->config.schema_version == RUNTIME_CONFIG_SCHEMA_VERSION) {
+        s_config = stored->config;
+        free(stored);
         ESP_LOGI(TAG, "Runtime configuration loaded from NVS");
         return ESP_OK;
     }
 
+    free(stored);
     ESP_LOGW(TAG, "Using default runtime configuration");
     return save_locked();
 }
@@ -109,6 +120,14 @@ void runtime_config_get(runtime_config_t *out)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_config;
     xSemaphoreGive(s_mutex);
+}
+
+ui_locale_t runtime_config_get_locale(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    ui_locale_t locale = s_config.locale;
+    xSemaphoreGive(s_mutex);
+    return locale;
 }
 
 esp_err_t runtime_config_set(const runtime_config_t *config)

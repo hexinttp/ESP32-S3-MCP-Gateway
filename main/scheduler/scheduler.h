@@ -35,14 +35,10 @@ typedef struct {
  * @param raw_q Queue for raw MODBUS read results (modbus_read_result_t)
  * @param ctx_q Queue for validated TCM contexts (tcm_context_t)
  * @param mqtt_out_q Queue for outbound MQTT messages (mqtt_out_msg_t)
- * @param mqtt_cmd_q Queue for inbound MQTT commands (char[TCM_MAX_JSON_LEN])
- * @param eval_q Queue for evaluation events (eval_event_t)
  */
 void scheduler_init(QueueHandle_t raw_q,
                     QueueHandle_t ctx_q,
-                    QueueHandle_t mqtt_out_q,
-                    QueueHandle_t mqtt_cmd_q,
-                    QueueHandle_t eval_q);
+                    QueueHandle_t mqtt_out_q);
 
 /**
  * @brief Start all scheduler tasks
