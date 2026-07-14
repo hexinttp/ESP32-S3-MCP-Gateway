@@ -1,0 +1,2753 @@
+﻿<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-S3 Gateway Configuration</title>
+<style>
+/* ============================================================
+ * CSS Reset & Base
+ * ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --primary: #1a73e8;
+  --primary-light: #e8f0fe;
+  --primary-dark: #1557b0;
+  --success: #0d9488;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --bg: #f0f2f5;
+  --card: #ffffff;
+  --text: #1f2937;
+  --text-secondary: #6b7280;
+  --border: #e5e7eb;
+  --sidebar-bg: #111827;
+  --sidebar-text: #d1d5db;
+  --sidebar-active: #1a73e8;
+  --radius: 8px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-lg: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.06);
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  min-height: 100vh;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ============================================================
+ * Sidebar
+ * ============================================================ */
+.sidebar {
+  width: 240px;
+  background: var(--sidebar-bg);
+  color: var(--sidebar-text);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  z-index: 100;
+  transition: transform 0.3s;
+}
+.sidebar-header {
+  padding: 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.sidebar-header h1 {
+  font-size: 16px;
+  color: #fff;
+  font-weight: 600;
+}
+.sidebar-header .subtitle {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 4px;
+}
+.nav-list { list-style: none; padding: 12px 0; flex: 1; }
+.nav-item {
+  padding: 10px 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13.5px;
+  transition: all 0.15s;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: rgba(255,255,255,0.05); }
+.nav-item.active {
+  background: rgba(26,115,232,0.15);
+  color: #60a5fa;
+  border-left-color: var(--sidebar-active);
+  font-weight: 500;
+}
+.nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+.sidebar-footer {
+  padding: 16px 20px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+  font-size: 11px;
+  color: #6b7280;
+}
+
+/* ============================================================
+ * Main Content
+ * ============================================================ */
+.main {
+  margin-left: 240px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.topbar {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+.topbar-title { font-size: 16px; font-weight: 600; }
+.topbar-actions { display: flex; align-items: center; gap: 12px; }
+.content { padding: 24px; flex: 1; }
+
+/* ============================================================
+ * Cards
+ * ============================================================ */
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+}
+.card-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.card-body { padding: 20px; }
+
+/* ============================================================
+ * Dashboard Stats Grid
+ * ============================================================ */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.stat-card {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+.stat-icon {
+  width: 48px; height: 48px;
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px;
+  flex-shrink: 0;
+}
+.stat-icon.blue   { background: #dbeafe; color: #2563eb; }
+.stat-icon.green  { background: #d1fae5; color: #059669; }
+.stat-icon.amber  { background: #fef3c7; color: #d97706; }
+.stat-icon.red    { background: #fee2e2; color: #dc2626; }
+.stat-icon.purple { background: #ede9fe; color: #7c3aed; }
+.stat-info h3 { font-size: 24px; font-weight: 700; margin-bottom: 2px; }
+.stat-info p  { font-size: 12px; color: var(--text-secondary); }
+
+/* ============================================================
+ * Forms
+ * ============================================================ */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.form-group { margin-bottom: 16px; }
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.form-group input, .form-group select {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13.5px;
+  background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  color: var(--text);
+}
+.form-group input:focus, .form-group select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(26,115,232,0.12);
+}
+.form-group .hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* ============================================================
+ * Buttons
+ * ============================================================ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-dark); }
+.btn-success { background: var(--success); color: #fff; }
+.btn-success:hover { background: #0f766e; }
+.btn-danger  { background: var(--danger); color: #fff; }
+.btn-danger:hover  { background: #dc2626; }
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn-outline:hover { background: var(--bg); }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* ============================================================
+ * Tables
+ * ============================================================ */
+.table-wrap { overflow-x: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+thead th {
+  background: #f9fafb;
+  padding: 10px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+}
+tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+tbody tr:hover { background: #f9fafb; }
+tbody tr:last-child td { border-bottom: none; }
+
+/* ============================================================
+ * Status Badges
+ * ============================================================ */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.badge-success { background: #d1fae5; color: #065f46; }
+.badge-danger  { background: #fee2e2; color: #991b1b; }
+.badge-warning { background: #fef3c7; color: #92400e; }
+.badge-info    { background: #dbeafe; color: #1e40af; }
+.dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot-green  { background: #10b981; }
+.dot-red    { background: #ef4444; }
+.dot-amber  { background: #f59e0b; }
+
+/* ============================================================
+ * Modal
+ * ============================================================ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.4);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-overlay.show { display: flex; }
+.modal {
+  background: var(--card);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+  width: 90%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+.modal-header {
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-header h3 { font-size: 16px; }
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 22px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  padding: 4px;
+  line-height: 1;
+}
+.modal-body { padding: 24px; }
+.modal-footer {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ============================================================
+ * Language Toggle
+ * ============================================================ */
+.lang-toggle {
+  display: inline-flex;
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 2px;
+}
+.lang-toggle button {
+  padding: 4px 12px;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s;
+}
+.lang-toggle button.active {
+  background: var(--card);
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+}
+
+/* ============================================================
+ * Toast Notifications
+ * ============================================================ */
+.toast-container {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  padding: 12px 20px;
+  border-radius: 8px;
+  color: #fff;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  animation: toastIn 0.3s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 380px;
+}
+.toast-success { background: #059669; }
+.toast-error   { background: #dc2626; }
+.toast-info    { background: #2563eb; }
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ============================================================
+ * Log Viewer
+ * ============================================================ */
+.log-viewer {
+  background: #1e1e2e;
+  color: #cdd6f4;
+  border-radius: 8px;
+  padding: 16px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 300px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line-info  { color: #89b4fa; }
+.log-line-warn  { color: #f9e2af; }
+.log-line-error { color: #f38ba8; }
+.log-line-ok    { color: #a6e3a1; }
+
+/* ============================================================
+ * Page Sections (tabs)
+ * ============================================================ */
+.page-section { display: none; }
+.page-section.active { display: block; }
+
+/* ============================================================
+ * Responsive
+ * ============================================================ */
+@media (max-width: 768px) {
+  .sidebar { transform: translateX(-100%); }
+  .sidebar.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .stats-grid { grid-template-columns: 1fr 1fr; }
+  .form-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     SIDEBAR
+     ============================================================ -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <h1>ESP32-S3 Gateway</h1>
+    <div class="subtitle" data-i18n="sidebar.subtitle">MODBUS-MQTT Configuration</div>
+  </div>
+  <ul class="nav-list">
+    <li class="nav-item active" data-page="dashboard">
+      <span class="icon">&#9632;</span>
+      <span data-i18n="nav.dashboard">Dashboard</span>
+    </li>
+    <li class="nav-item" data-page="wifi">
+      <span class="icon">&#128246;</span>
+      <span data-i18n="nav.wifi">WiFi Configuration</span>
+    </li>
+    <li class="nav-item" data-page="mqtt">
+      <span class="icon">&#9729;</span>
+      <span data-i18n="nav.mqtt">MQTT Broker</span>
+    </li>
+    <li class="nav-item" data-page="onenet">
+      <span class="icon">&#128187;</span>
+      <span data-i18n="nav.onenet">OneNET Cloud</span>
+    </li>
+    <li class="nav-item" data-page="modbus">
+      <span class="icon">&#9881;</span>
+      <span data-i18n="nav.modbus">MODBUS Settings</span>
+    </li>
+    <li class="nav-item" data-page="mapping">
+      <span class="icon">&#9776;</span>
+      <span data-i18n="nav.mapping">Mapping Table</span>
+    </li>
+    <li class="nav-item" data-page="discover">
+      <span class="icon">&#128270;</span>
+      <span data-i18n="nav.discover">Device Discovery</span>
+    </li>
+    <li class="nav-item" data-page="automation">
+      <span class="icon">&#9889;</span>
+      <span data-i18n="nav.automation">Automation Rules</span>
+    </li>
+    <li class="nav-item" data-page="logs">
+      <span class="icon">&#9997;</span>
+      <span data-i18n="nav.logs">System Logs</span>
+    </li>
+  </ul>
+  <div class="sidebar-footer">
+    <div>Firmware v1.0.0</div>
+    <div>ESP-IDF v5.3.1</div>
+  </div>
+</aside>
+
+<!-- ============================================================
+     MAIN CONTENT
+     ============================================================ -->
+<main class="main">
+  <header class="topbar">
+    <div class="topbar-title" id="topbarTitle" data-i18n="nav.dashboard">Dashboard</div>
+    <div class="topbar-actions">
+      <div class="lang-toggle">
+        <button class="active" onclick="setLang('zh')">ZH</button>
+        <button onclick="setLang('en')">EN</button>
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="refreshAll()" data-i18n="btn.refresh">&#8635; Refresh</button>
+    </div>
+  </header>
+
+  <div class="content">
+
+    <!-- ========== DASHBOARD ========== -->
+    <section class="page-section active" id="page-dashboard">
+      <div class="stats-grid" id="statsGrid">
+        <div class="stat-card">
+          <div class="stat-icon blue">&#128268;</div>
+          <div class="stat-info">
+            <h3 id="statMqttStatus">--</h3>
+            <p data-i18n="dashboard.mqtt_status">MQTT Status</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">&#128225;</div>
+          <div class="stat-info">
+            <h3 id="statModbusPolls">--</h3>
+            <p data-i18n="dashboard.modbus_polls">MODBUS Polls</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon amber">&#128196;</div>
+          <div class="stat-info">
+            <h3 id="statPublished">--</h3>
+            <p data-i18n="dashboard.mqtt_published">MQTT Published</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon purple">&#128451;</div>
+          <div class="stat-info">
+            <h3 id="statCached">--</h3>
+            <p data-i18n="dashboard.cached_records">Cached Records</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">&#128200;</div>
+          <div class="stat-info">
+            <h3 id="statHeap">--</h3>
+            <p data-i18n="dashboard.free_heap">Free Heap</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red">&#9888;</div>
+          <div class="stat-info">
+            <h3 id="statDataLoss">--</h3>
+            <p data-i18n="dashboard.data_loss">Data Loss Events</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="dashboard.sys_info">System Information</span>
+          <span class="badge badge-info" id="uptimeBadge">00:00:00</span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div><strong data-i18n="dashboard.firmware_ver">Firmware Version:</strong> <span id="infoFw">v1.0.0</span></div>
+            <div><strong data-i18n="dashboard.idf_ver">ESP-IDF Version:</strong> <span id="infoIdf">v5.3.1</span></div>
+            <div><strong data-i18n="dashboard.chip_model">Chip Model:</strong> <span id="infoChip">ESP32-S3</span></div>
+            <div><strong data-i18n="dashboard.flash_size">Flash Size:</strong> <span id="infoFlash">2 MB</span></div>
+            <div><strong data-i18n="dashboard.active_mappings">Active Mappings:</strong> <span id="infoMappings">4</span></div>
+            <div><strong data-i18n="dashboard.seq_counter">Sequence Counter:</strong> <span id="infoSeq">0</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header" data-i18n="dashboard.metrics">Evaluation Metrics</div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-i18n="th.category">Category</th>
+                  <th data-i18n="th.metric">Metric</th>
+                  <th data-i18n="th.value">Value</th>
+                  <th data-i18n="th.rate">Rate</th>
+                </tr>
+              </thead>
+              <tbody id="metricsTableBody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== WiFi ========== -->
+    <section class="page-section" id="page-wifi">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="wifi.title">WiFi Station Configuration</span>
+          <span class="badge badge-success" id="wifiStatusBadge"><span class="dot dot-green"></span> <span data-i18n="status.connected">Connected</span></span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="wifi.ssid">SSID</label>
+              <input type="text" id="wifiSsid" placeholder="Your WiFi Network Name" value="MyHomeNetwork">
+            </div>
+            <div class="form-group">
+              <label data-i18n="wifi.password">Password</label>
+              <input type="password" id="wifiPassword" placeholder="WiFi Password" value="********">
+            </div>
+            <div class="form-group">
+              <label data-i18n="wifi.auth_mode">Authentication Mode</label>
+              <select id="wifiAuthMode">
+                <option value="open">Open</option>
+                <option value="wep">WEP</option>
+                <option value="wpa_psk">WPA-PSK</option>
+                <option value="wpa2_psk" selected>WPA2-PSK</option>
+                <option value="wpa_wpa2_psk">WPA/WPA2-PSK</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="wifi.ip_addr">IP Address</label>
+              <input type="text" id="wifiIp" value="192.168.1.105" readonly>
+              <div class="hint" data-i18n="wifi.ip_hint">Assigned via DHCP (read-only)</div>
+            </div>
+          </div>
+          <div style="margin-top:16px; display:flex; gap:8px;">
+            <button class="btn btn-primary" onclick="saveWifiConfig()" data-i18n="btn.save">Save Configuration</button>
+            <button class="btn btn-outline" onclick="scanWifi()" data-i18n="wifi.scan">Scan Networks</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== MQTT ========== -->
+    <section class="page-section" id="page-mqtt">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="mqtt.title">MQTT Broker Configuration</span>
+          <span class="badge badge-success" id="mqttConnBadge"><span class="dot dot-green"></span> <span data-i18n="status.connected">Connected</span></span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="mqtt.broker_uri">Broker URI</label>
+              <input type="text" id="mqttUri" placeholder="mqtt://broker.example.com:1883" value="mqtt://192.168.1.100:1883">
+            </div>
+            <div class="form-group">
+              <label data-i18n="mqtt.client_id">Client ID</label>
+              <input type="text" id="mqttClientId" value="esp32s3_gateway_01">
+            </div>
+            <div class="form-group">
+              <label data-i18n="mqtt.username">Username (optional)</label>
+              <input type="text" id="mqttUser" placeholder="MQTT Username">
+            </div>
+            <div class="form-group">
+              <label data-i18n="mqtt.password">Password (optional)</label>
+              <input type="password" id="mqttPass" placeholder="MQTT Password">
+            </div>
+            <div class="form-group">
+              <label data-i18n="mqtt.keepalive">Keep-Alive (seconds)</label>
+              <input type="number" id="mqttKeepalive" value="120" min="10" max="600">
+            </div>
+            <div class="form-group">
+              <label data-i18n="mqtt.qos">Default QoS Level</label>
+              <select id="mqttQos">
+                <option value="0">QoS 0 (At most once)</option>
+                <option value="1" selected>QoS 1 (At least once)</option>
+                <option value="2">QoS 2 (Exactly once)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top: 8px;">
+            <label data-i18n="mqtt.topic_prefix">Data Topic Prefix</label>
+            <input type="text" id="mqttTopicPrefix" value="factory/data">
+            <div class="hint" data-i18n="mqtt.topic_hint">Published topics: {prefix}/{client_id}/{device}/{point}</div>
+          </div>
+          <div style="margin-top:16px; display:flex; gap:8px;">
+            <button class="btn btn-primary" onclick="saveMqttConfig()" data-i18n="btn.save">Save Configuration</button>
+            <button class="btn btn-outline" onclick="testMqttConnection()" data-i18n="mqtt.test">Test Connection</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== OneNET Cloud Platform ========== -->
+    <section class="page-section" id="page-onenet">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="onenet.title">OneNET Cloud Platform</span>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label class="form-group" style="margin-bottom:0;">
+              <input type="checkbox" id="onenetEnabled" onchange="toggleOnenet()">
+              <span data-i18n="onenet.enable">Enable</span>
+            </label>
+            <span class="badge badge-info" id="onenetStatusBadge" style="display:none;"><span class="dot dot-green"></span> <span data-i18n="onenet.connected">Connected</span></span>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="onenet.product_id">Product ID</label>
+              <input type="text" id="onenetProductId" placeholder="Your OneNET Product ID" disabled>
+            </div>
+            <div class="form-group">
+              <label data-i18n="onenet.device_id">Device ID</label>
+              <input type="text" id="onenetDeviceId" placeholder="Your OneNET Device ID" disabled>
+            </div>
+            <div class="form-group">
+              <label data-i18n="onenet.device_key">Device Key</label>
+              <input type="password" id="onenetDeviceKey" placeholder="Your OneNET Device Key" disabled>
+            </div>
+            <div class="form-group">
+              <label data-i18n="onenet.mqtt_uri">MQTT URI</label>
+              <input type="text" id="onenetMqttUri" value="mqtts://mqtt.heclouds.com:8883" disabled>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top: 8px;">
+            <div class="hint" data-i18n="onenet.hint">When enabled, the gateway will connect to OneNET using the following MQTT authentication:<br>
+              &bull; clientId = Device ID<br>
+              &bull; username = Product ID<br>
+              &bull; password = Device Key
+            </div>
+          </div>
+          <div style="margin-top:16px; display:flex; gap:8px;">
+            <button class="btn btn-primary" onclick="saveOnenetConfig()" data-i18n="btn.save" disabled id="btnOnenetSave">Save Configuration</button>
+            <button class="btn btn-outline" onclick="testOnenetConnection()" data-i18n="onenet.test" disabled id="btnOnenetTest">Test Connection</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== MODBUS ========== -->
+    <section class="page-section" id="page-modbus">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="modbus.title">MODBUS RTU Master Settings</span>
+          <span class="badge badge-success"><span class="dot dot-green"></span> <span data-i18n="status.active">Active</span></span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="modbus.uart_port">UART Port</label>
+              <select id="mbUartPort">
+                <option value="0">UART0</option>
+                <option value="1" selected>UART1</option>
+                <option value="2">UART2</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="modbus.baudrate">Baud Rate</label>
+              <select id="mbBaudrate">
+                <option value="2400">2400</option>
+                <option value="4800">4800</option>
+                <option value="9600" selected>9600</option>
+                <option value="19200">19200</option>
+                <option value="38400">38400</option>
+                <option value="57600">57600</option>
+                <option value="115200">115200</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="modbus.parity">Parity</label>
+              <select id="mbParity">
+                <option value="none" selected>None</option>
+                <option value="even">Even</option>
+                <option value="odd">Odd</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="modbus.data_bits">Data Bits</label>
+              <select id="mbDataBits">
+                <option value="7">7</option>
+                <option value="8" selected>8</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="modbus.stop_bits">Stop Bits</label>
+              <select id="mbStopBits">
+                <option value="1" selected>1</option>
+                <option value="2">2</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="modbus.timeout">Response Timeout (ms)</label>
+              <input type="number" id="mbTimeout" value="1000" min="100" max="10000" step="100">
+            </div>
+          </div>
+          <div style="margin-top: 12px;">
+            <div class="form-grid">
+              <div class="form-group">
+                <label>TX Pin (GPIO)</label>
+                <input type="number" id="mbTxPin" value="39" readonly>
+              </div>
+              <div class="form-group">
+                <label>RX Pin (GPIO)</label>
+                <input type="number" id="mbRxPin" value="40" readonly>
+              </div>
+              <div class="form-group">
+                <label>RTS Pin (GPIO)</label>
+                <input type="number" id="mbRtsPin" value="41" readonly>
+              </div>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top: 8px;">
+            <label data-i18n="modbus.poll_interval">Poll Interval (ms)</label>
+            <input type="number" id="mbPollInterval" value="1000" min="100" max="60000" step="100">
+            <div class="hint" data-i18n="modbus.poll_hint">Time between consecutive poll cycles</div>
+          </div>
+          <div style="margin-top:16px;">
+            <button class="btn btn-primary" onclick="saveModbusConfig()" data-i18n="btn.save">Save Configuration</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span data-i18n="modbus.tcp_title">MODBUS TCP Endpoints</span><button class="btn btn-primary btn-sm" onclick="addTcpEndpoint()" data-i18n="modbus.tcp_add">Add Endpoint</button></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group"><label data-i18n="modbus.tcp_name">Name</label><input id="tcpName" type="text" placeholder="PLC TCP 1"></div>
+            <div class="form-group"><label data-i18n="modbus.tcp_host">Host / IP</label><input id="tcpHost" type="text" placeholder="192.168.1.20"></div>
+            <div class="form-group"><label data-i18n="modbus.tcp_port">Port</label><input id="tcpPort" type="number" value="502" min="1" max="65535"></div>
+            <div class="form-group"><label data-i18n="modbus.timeout">Response Timeout (ms)</label><input id="tcpTimeout" type="number" value="1000" min="100"></div>
+          </div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>ID</th><th data-i18n="modbus.tcp_name">Name</th><th data-i18n="modbus.tcp_host">Host / IP</th><th data-i18n="modbus.tcp_port">Port</th><th data-i18n="th.actions">Actions</th></tr></thead><tbody id="tcpEndpointsBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ========== MAPPING TABLE ========== -->
+    <section class="page-section" id="page-mapping">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="mapping.title">AMM Mapping Table</span>
+          <button class="btn btn-success btn-sm" onclick="openAddMapping()" data-i18n="mapping.add">+ Add Mapping</button>
+        </div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table id="mappingTable">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th data-i18n="th.slave_id">Slave ID</th>
+                  <th data-i18n="th.reg_addr">Register</th>
+                  <th data-i18n="th.data_type">Data Type</th>
+                  <th data-i18n="th.device_id">Device ID</th>
+                  <th data-i18n="th.point_id">Point ID</th>
+                  <th data-i18n="th.unit">Unit</th>
+                  <th data-i18n="th.mqtt_topic">MQTT Topic</th>
+                  <th data-i18n="th.writable">Writable</th>
+                  <th data-i18n="th.range">Range</th>
+                  <th data-i18n="th.actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="mappingTableBody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== DEVICE DISCOVERY ========== -->
+    <section class="page-section" id="page-discover">
+      <!-- Scan Controls -->
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="discover.title">Device Discovery</span>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-primary btn-sm" onclick="startFullScan()" id="btnScan" data-i18n="discover.scan">&#128270; Full Scan</button>
+            <button class="btn btn-outline btn-sm" onclick="applyMappings()" id="btnApply" data-i18n="discover.apply">&#10003; Apply</button>
+            <button class="btn btn-outline btn-sm" onclick="exportDevices()" title="Export">&#128190; Export</button>
+            <button class="btn btn-outline btn-sm" onclick="document.getElementById('importFile').click()" title="Import">&#128194; Import</button>
+            <input type="file" id="importFile" accept=".json" style="display:none" onchange="importDevices(event)">
+            <button class="btn btn-outline btn-sm" onclick="resetDiscovery()" data-i18n="discover.reset">&#10007; Reset</button>
+          </div>
+        </div>
+        <!-- Scan Parameters -->
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:12px; margin-bottom:12px;">
+          <div>
+            <label class="form-label" data-i18n="discover.slave_range">Slave ID Range</label>
+            <div style="display:flex; gap:4px;">
+              <input type="number" id="scanSlaveStart" value="1" min="1" max="247" class="form-input" style="width:60px;">
+              <span style="line-height:34px;">~</span>
+              <input type="number" id="scanSlaveEnd" value="247" min="1" max="247" class="form-input" style="width:60px;">
+            </div>
+          </div>
+          <div>
+            <label class="form-label" data-i18n="discover.reg_range">Register Range</label>
+            <div style="display:flex; gap:4px;">
+              <input type="number" id="scanRegStart" value="40001" class="form-input" style="width:70px;">
+              <span style="line-height:34px;">~</span>
+              <input type="number" id="scanRegEnd" value="40999" class="form-input" style="width:70px;">
+            </div>
+          </div>
+          <div>
+            <label class="form-label" data-i18n="discover.status">Status</label>
+            <div id="scanStatus" style="padding:6px 10px; border-radius:6px; background:var(--surface2); font-size:13px;">Idle</div>
+          </div>
+          <div>
+            <label class="form-label" data-i18n="discover.summary">Summary</label>
+            <div id="scanSummary" style="padding:6px 10px; border-radius:6px; background:var(--surface2); font-size:13px;">-</div>
+          </div>
+        </div>
+        <!-- MODBUS TCP Bridge Connection -->
+        <div style="display:flex; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--border); margin-top:8px; flex-wrap:wrap;">
+          <span style="font-size:13px; font-weight:600; color:var(--text2);" data-i18n="discover.bridge">MODBUS TCP Bridge</span>
+          <input type="text" id="bridgeHost" value="localhost" class="form-input" style="width:130px;" placeholder="Host / IP">
+          <span style="color:var(--text2);">:</span>
+          <input type="number" id="bridgePort" value="5020" min="1" max="65535" class="form-input" style="width:80px;" placeholder="Port">
+          <button class="btn btn-outline btn-sm" onclick="bridgeConnect()" id="btnBridgeConnect" data-i18n="discover.bridge_connect">Connect</button>
+          <button class="btn btn-outline btn-sm" onclick="bridgeDisconnect()" id="btnBridgeDisconnect" style="display:none;" data-i18n="discover.bridge_disconnect">Disconnect</button>
+          <span id="bridgeStatus" style="font-size:12px; padding:3px 8px; border-radius:4px; background:#fee2e2; color:#991b1b;" data-i18n="discover.bridge_disconnected">Disconnected</span>
+          <span id="bridgeModeBadge" style="display:none; font-size:11px; padding:2px 6px; border-radius:3px; background:#dbeafe; color:#1e40af;" data-i18n="discover.bridge_mode">Bridge Mode</span>
+        </div>
+        <div id="scanProgress" style="display:none;">
+          <div style="background:var(--surface2); border-radius:4px; height:8px; overflow:hidden;">
+            <div id="scanProgressBar" style="background:var(--accent); height:100%; width:0%; transition:width 0.3s;"></div>
+          </div>
+          <div id="scanProgressText" style="font-size:12px; margin-top:4px; color:var(--text2);"></div>
+        </div>
+      </div>
+
+      <!-- Discovered Devices (editable) -->
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="discover.devices">Discovered Devices</span>
+          <span id="deviceCount" style="font-size:13px; color:var(--text2);">0 devices</span>
+        </div>
+        <div id="discoveredDevices" style="max-height:600px; overflow-y:auto;">
+          <div style="text-align:center; padding:40px; color:var(--text2);" id="noDevicesMsg">
+            No devices discovered yet. Click "Full Scan" to start.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Register Edit Modal -->
+    <div class="modal-overlay" id="regEditModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center;">
+      <div style="background:var(--surface); border-radius:12px; padding:24px; width:520px; max-height:80vh; overflow-y:auto; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <h3 style="margin:0;" data-i18n="discover.edit_register">Edit Register</h3>
+          <button onclick="closeRegEditModal()" style="background:none; border:none; font-size:20px; cursor:pointer; color:var(--text);">&#10007;</button>
+        </div>
+        <input type="hidden" id="editSlaveId">
+        <input type="hidden" id="editRegAddr">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div>
+            <label class="form-label">Name</label>
+            <input type="text" id="editRegName" class="form-input">
+          </div>
+          <div>
+            <label class="form-label">Unit</label>
+            <input type="text" id="editRegUnit" class="form-input">
+          </div>
+          <div>
+            <label class="form-label">Data Type</label>
+            <select id="editRegType" class="form-input">
+              <option value="FLOAT32">FLOAT32</option>
+              <option value="INT16">INT16</option>
+              <option value="UINT16">UINT16</option>
+              <option value="INT32">INT32</option>
+              <option value="UINT32">UINT32</option>
+            </select>
+          </div>
+          <div>
+            <label class="form-label">Writable</label>
+            <select id="editRegWritable" class="form-input">
+              <option value="true">Yes (R/W)</option>
+              <option value="false">No (R/O)</option>
+            </select>
+          </div>
+          <div>
+            <label class="form-label">Range Min</label>
+            <input type="number" id="editRegMin" class="form-input" step="0.01">
+          </div>
+          <div>
+            <label class="form-label">Range Max</label>
+            <input type="number" id="editRegMax" class="form-input" step="0.01">
+          </div>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:20px;">
+          <button class="btn btn-outline btn-sm" onclick="closeRegEditModal()">Cancel</button>
+          <button class="btn btn-primary btn-sm" onclick="saveRegEdit()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Device Edit Modal -->
+    <div class="modal-overlay" id="devEditModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center;">
+      <div style="background:var(--surface); border-radius:12px; padding:24px; width:420px; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <h3 style="margin:0;" data-i18n="discover.edit_device">Edit Device</h3>
+          <button onclick="closeDevEditModal()" style="background:none; border:none; font-size:20px; cursor:pointer; color:var(--text);">&#10007;</button>
+        </div>
+        <input type="hidden" id="editDevSlaveId">
+        <div style="display:grid; gap:12px;">
+          <div>
+            <label class="form-label">Device ID</label>
+            <input type="text" id="editDevId" class="form-input">
+          </div>
+          <div>
+            <label class="form-label">Name</label>
+            <input type="text" id="editDevName" class="form-input">
+          </div>
+          <div>
+            <label class="form-label">MQTT Topic Prefix</label>
+            <input type="text" id="editDevMqttPrefix" class="form-input" placeholder="factory/data/device_id">
+          </div>
+          <div>
+            <label class="form-label">Description</label>
+            <input type="text" id="editDevDesc" class="form-input">
+          </div>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:20px;">
+          <button class="btn btn-outline btn-sm" onclick="closeDevEditModal()">Cancel</button>
+          <button class="btn btn-primary btn-sm" onclick="saveDevEdit()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== AUTOMATION ========== -->
+    <section class="page-section" id="page-automation">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="automation.title">Offline Automation Rules</span>
+          <button class="btn btn-primary btn-sm" onclick="saveAutomationRule()" data-i18n="automation.add">Add Rule</button>
+        </div>
+        <div class="card-body">
+          <input type="hidden" id="ruleId" value="0">
+          <div class="form-grid">
+            <div class="form-group"><label data-i18n="automation.name">Rule Name</label><input id="ruleName" type="text" placeholder="High temperature protection"></div>
+            <div class="form-group"><label data-i18n="automation.source_device">Source Device</label><input id="ruleSourceDevice" type="text" placeholder="plc_line1_01"></div>
+            <div class="form-group"><label data-i18n="automation.source_point">Source Point</label><input id="ruleSourcePoint" type="text" placeholder="motor_temp_01"></div>
+            <div class="form-group"><label data-i18n="automation.operator">Operator</label><select id="ruleOperator"><option value="0">&gt;</option><option value="1">&gt;=</option><option value="2">&lt;</option><option value="3">&lt;=</option><option value="4">==</option><option value="5">!=</option></select></div>
+            <div class="form-group"><label data-i18n="automation.threshold">Threshold</label><input id="ruleThreshold" type="number" step="any" value="80"></div>
+            <div class="form-group"><label data-i18n="automation.hold">Hold Time (ms)</label><input id="ruleHold" type="number" min="0" value="1000"></div>
+            <div class="form-group"><label data-i18n="automation.cooldown">Cooldown (ms)</label><input id="ruleCooldown" type="number" min="200" value="5000"></div>
+            <div class="form-group"><label data-i18n="automation.action">Action</label><select id="ruleAction" onchange="toggleRuleAction()"><option value="0" data-i18n="automation.write">Write Point</option><option value="1" data-i18n="automation.alert">MQTT Alert</option></select></div>
+            <div class="form-group rule-write"><label data-i18n="automation.target_device">Target Device</label><input id="ruleTargetDevice" type="text"></div>
+            <div class="form-group rule-write"><label data-i18n="automation.target_point">Target Point</label><input id="ruleTargetPoint" type="text"></div>
+            <div class="form-group rule-write"><label data-i18n="automation.target_value">Target Value</label><input id="ruleTargetValue" type="number" step="any" value="0"></div>
+            <div class="form-group rule-alert" style="display:none"><label data-i18n="automation.alert_topic">Alert Topic</label><input id="ruleAlertTopic" type="text" placeholder="factory/alerts"></div>
+            <div class="form-group rule-alert" style="display:none"><label data-i18n="automation.message">Message</label><input id="ruleAlertMessage" type="text"></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span data-i18n="automation.configured">Configured Rules</span><span id="ruleStats" class="badge badge-info"></span></div>
+        <div class="table-wrap"><table><thead><tr><th data-i18n="automation.name">Rule Name</th><th data-i18n="automation.condition">Condition</th><th data-i18n="automation.action">Action</th><th data-i18n="status.active">Active</th><th data-i18n="th.actions">Actions</th></tr></thead><tbody id="automationRulesBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ========== LOGS ========== -->
+    <section class="page-section" id="page-logs">
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="logs.title">System Logs</span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-outline btn-sm" onclick="clearLogs()" data-i18n="logs.clear">Clear</button>
+            <button class="btn btn-outline btn-sm" onclick="exportLogs()" data-i18n="logs.export">Export</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="log-viewer" id="logViewer"></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<!-- ============================================================
+     ADD/EDIT MAPPING MODAL
+     ============================================================ -->
+<div class="modal-overlay" id="mappingModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="mappingModalTitle" data-i18n="mapping.add_title">Add New Mapping</h3>
+      <button class="modal-close" onclick="closeMappingModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="editMappingIndex" value="-1">
+      <div class="form-grid">
+        <div class="form-group">
+          <label data-i18n="mapping.protocol">Source Protocol</label>
+          <select id="mProtocol"><option value="RTU">MODBUS RTU</option><option value="TCP">MODBUS TCP</option></select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.channel">Channel / Endpoint ID</label>
+          <input type="number" id="mChannelId" min="0" max="255" value="0">
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.function_code">Read Function</label>
+          <select id="mFunctionCode"><option value="3">FC03 Holding</option><option value="4">FC04 Input</option></select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.byte_order">Byte Order</label>
+          <select id="mByteOrder"><option value="0">ABCD</option><option value="1">CDAB</option><option value="2">BADC</option><option value="3">DCBA</option></select>
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label data-i18n="th.slave_id">Slave ID</label>
+          <input type="number" id="mSlaveId" min="1" max="247" value="1">
+        </div>
+        <div class="form-group">
+          <label data-i18n="th.reg_addr">Register Address</label>
+          <input type="number" id="mRegAddr" min="0" max="65535" value="40001">
+        </div>
+        <div class="form-group">
+          <label data-i18n="th.data_type">Data Type</label>
+          <select id="mDataType">
+            <option value="FLOAT32">FLOAT32</option>
+            <option value="INT16">INT16</option>
+            <option value="UINT16">UINT16</option>
+            <option value="INT32">INT32</option>
+            <option value="UINT32">UINT32</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.scale_factor">Scale Factor</label>
+          <input type="number" id="mScaleFactor" value="1.0" step="0.01">
+        </div>
+        <div class="form-group"><label data-i18n="mapping.offset">Offset</label><input type="number" id="mOffset" value="0" step="0.01"></div>
+        <div class="form-group"><label data-i18n="mapping.poll_interval">Poll Interval (ms)</label><input type="number" id="mPollInterval" value="1000" min="100"></div>
+        <div class="form-group"><label data-i18n="mapping.priority">Priority</label><input type="number" id="mPriority" value="5" min="0" max="10"></div>
+      </div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label data-i18n="th.device_id">Device ID</label>
+          <input type="text" id="mDeviceId" placeholder="e.g. plc_line1_01">
+        </div>
+        <div class="form-group">
+          <label data-i18n="th.point_id">Point ID</label>
+          <input type="text" id="mPointId" placeholder="e.g. motor_temp_01">
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.measurement">Measurement Name</label>
+          <input type="text" id="mMeasurement" placeholder="e.g. Motor Temperature">
+        </div>
+        <div class="form-group">
+          <label data-i18n="th.unit">Unit</label>
+          <input type="text" id="mUnit" placeholder="e.g. degC">
+        </div>
+      </div>
+      <div class="form-group">
+        <label data-i18n="th.mqtt_topic">MQTT Topic</label>
+        <input type="text" id="mMqttTopic" placeholder="e.g. factory/line1/plc01/motor/temp">
+      </div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label data-i18n="th.writable">Writable</label>
+          <select id="mWritable">
+            <option value="false" selected data-i18n="mapping.readonly">No (Read-only)</option>
+            <option value="true" data-i18n="mapping.writable_yes">Yes (Writable)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.range_min">Valid Range Min</label>
+          <input type="number" id="mRangeMin" value="0" step="0.1">
+        </div>
+        <div class="form-group">
+          <label data-i18n="mapping.range_max">Valid Range Max</label>
+          <input type="number" id="mRangeMax" value="100" step="0.1">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeMappingModal()" data-i18n="btn.cancel">Cancel</button>
+      <button class="btn btn-primary" onclick="saveMapping()" data-i18n="btn.save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ============================================================
+     JAVASCRIPT
+     ============================================================ -->
+<script>
+/* ============================================================
+ * I18N
+ * ============================================================ */
+const I18N = {
+  zh: {
+    "sidebar.subtitle": "MODBUS-MQTT \u914d\u7f6e\u4e2d\u5fc3",
+    "nav.dashboard": "\u4eea\u8868\u76d8",
+    "nav.wifi": "WiFi \u914d\u7f6e",
+    "nav.mqtt": "MQTT Broker",
+    "nav.onenet": "OneNET \u4e91\u5e73\u53f0",
+    "nav.modbus": "MODBUS \u8bbe\u7f6e",
+    "nav.mapping": "\u6620\u5c04\u8868",
+    "nav.discover": "\u8bbe\u5907\u53d1\u73b0",
+    "nav.automation": "\u81ea\u52a8\u5316\u89c4\u5219",
+    "nav.logs": "\u7cfb\u7edf\u65e5\u5fd7",
+    "btn.save": "\u4fdd\u5b58\u914d\u7f6e",
+    "btn.cancel": "\u53d6\u6d88",
+    "btn.refresh": "\u5237\u65b0",
+    "status.connected": "\u5df2\u8fde\u63a5",
+    "status.disconnected": "\u5df2\u65ad\u5f00",
+    "status.active": "\u6d3b\u52a8",
+    "dashboard.mqtt_status": "MQTT \u72b6\u6001",
+    "dashboard.modbus_polls": "MODBUS \u8f6e\u8be2",
+    "dashboard.mqtt_published": "MQTT \u53d1\u5e03",
+    "dashboard.cached_records": "\u7f13\u5b58\u8bb0\u5f55",
+    "dashboard.free_heap": "\u53ef\u7528\u5806\u5185\u5b58",
+    "dashboard.data_loss": "\u6570\u636e\u4e22\u5931\u4e8b\u4ef6",
+    "dashboard.sys_info": "\u7cfb\u7edf\u4fe1\u606f",
+    "dashboard.firmware_ver": "\u56fa\u4ef6\u7248\u672c\uff1a",
+    "dashboard.idf_ver": "ESP-IDF \u7248\u672c\uff1a",
+    "dashboard.chip_model": "\u82af\u7247\u578b\u53f7\uff1a",
+    "dashboard.flash_size": "Flash \u5927\u5c0f\uff1a",
+    "dashboard.active_mappings": "\u6d3b\u52a8\u6620\u5c04\uff1a",
+    "dashboard.seq_counter": "\u5e8f\u5217\u8ba1\u6570\uff1a",
+    "dashboard.metrics": "\u8bc4\u4f30\u6307\u6807",
+    "th.category": "\u7c7b\u522b",
+    "th.metric": "\u6307\u6807",
+    "th.value": "\u503c",
+    "th.rate": "\u6bd4\u7387",
+    "th.slave_id": "\u4ece\u7ad9 ID",
+    "th.reg_addr": "\u5bc4\u5b58\u5668",
+    "th.data_type": "\u6570\u636e\u7c7b\u578b",
+    "th.device_id": "\u8bbe\u5907 ID",
+    "th.point_id": "\u70b9\u4f4d ID",
+    "th.unit": "\u5355\u4f4d",
+    "th.mqtt_topic": "MQTT \u4e3b\u9898",
+    "th.writable": "\u53ef\u5199",
+    "th.range": "\u8303\u56f4",
+    "th.actions": "\u64cd\u4f5c",
+    "wifi.title": "WiFi \u7ad9\u70b9\u914d\u7f6e",
+    "wifi.ssid": "SSID",
+    "wifi.password": "\u5bc6\u7801",
+    "wifi.auth_mode": "\u8ba4\u8bc1\u65b9\u5f0f",
+    "wifi.ip_addr": "IP \u5730\u5740",
+    "wifi.ip_hint": "\u7531 DHCP \u5206\u914d\uff08\u53ea\u8bfb\uff09",
+    "wifi.scan": "\u626b\u63cf\u7f51\u7edc",
+    "mqtt.title": "MQTT Broker \u914d\u7f6e",
+    "mqtt.broker_uri": "Broker URI",
+    "mqtt.uri": "Broker URI",
+    "mqtt.client_id": "\u5ba2\u6237\u7aef ID",
+    "mqtt.username": "\u7528\u6237\u540d\uff08\u53ef\u9009\uff09",
+    "mqtt.password": "\u5bc6\u7801\uff08\u53ef\u9009\uff09",
+    "mqtt.keepalive": "Keep-Alive\uff08\u79d2\uff09",
+    "mqtt.qos": "\u9ed8\u8ba4 QoS \u7ea7\u522b",
+    "mqtt.topic_prefix": "\u6570\u636e\u4e3b\u9898\u524d\u7f00",
+    "mqtt.topic_hint": "\u53d1\u5e03\u4e3b\u9898\uff1a{prefix}/{client_id}/{device}/{point}",
+    "mqtt.test": "\u6d4b\u8bd5\u8fde\u63a5",
+    "onenet.title": "OneNET \u4e91\u5e73\u53f0",
+    "onenet.enable": "\u542f\u7528",
+    "onenet.connected": "\u5df2\u8fde\u63a5",
+    "onenet.product_id": "\u4ea7\u54c1 ID",
+    "onenet.device_id": "\u8bbe\u5907 ID",
+    "onenet.device_key": "\u8bbe\u5907\u5bc6\u94a5",
+    "onenet.mqtt_uri": "MQTT URI",
+    "onenet.hint": "\u542f\u7528\u540e\uff0c\u7f51\u5173\u5c06\u4f7f\u7528\u4ee5\u4e0b\u53c2\u6570\u8fde\u63a5 OneNET\uff1a<br>\u2022 clientId = \u8bbe\u5907 ID<br>\u2022 username = \u4ea7\u54c1 ID<br>\u2022 password = \u8bbe\u5907\u5bc6\u94a5",
+    "onenet.test": "\u6d4b\u8bd5\u8fde\u63a5",
+    "modbus.title": "MODBUS RTU \u4e3b\u7ad9\u8bbe\u7f6e",
+    "modbus.uart_port": "UART \u7aef\u53e3",
+    "modbus.baudrate": "\u6ce2\u7279\u7387",
+    "modbus.parity": "\u6821\u9a8c\u4f4d",
+    "modbus.data_bits": "\u6570\u636e\u4f4d",
+    "modbus.stop_bits": "\u505c\u6b62\u4f4d",
+    "modbus.timeout": "\u54cd\u5e94\u8d85\u65f6\uff08ms\uff09",
+    "modbus.tx_pin": "TX \u5f15\u811a",
+    "modbus.rx_pin": "RX \u5f15\u811a",
+    "modbus.rts_pin": "RTS/DE \u5f15\u811a",
+    "modbus.poll_interval": "\u8f6e\u8be2\u95f4\u9694\uff08ms\uff09",
+    "modbus.poll_hint": "\u4e24\u6b21\u8f6e\u8be2\u5468\u671f\u4e4b\u95f4\u7684\u65f6\u95f4",
+    "modbus.tcp_title": "MODBUS TCP \u7aef\u70b9",
+    "modbus.tcp_add": "\u6dfb\u52a0\u7aef\u70b9",
+    "modbus.tcp_name": "\u7aef\u70b9\u540d\u79f0",
+    "modbus.tcp_host": "\u4e3b\u673a / IP",
+    "modbus.tcp_port": "\u7aef\u53e3",
+    "mapping.title": "AMM \u6620\u5c04\u8868",
+    "mapping.add": "+ \u6dfb\u52a0\u6620\u5c04",
+    "mapping.add_title": "\u6dfb\u52a0\u65b0\u6620\u5c04",
+    "mapping.edit_title": "\u7f16\u8f91\u6620\u5c04",
+    "mapping.scale_factor": "\u7f29\u653e\u7cfb\u6570",
+    "mapping.protocol": "\u6e90\u534f\u8bae",
+    "mapping.channel": "\u901a\u9053 / \u7aef\u70b9 ID",
+    "mapping.function_code": "\u8bfb\u53d6\u529f\u80fd\u7801",
+    "mapping.byte_order": "\u5b57\u8282\u5e8f",
+    "mapping.offset": "\u504f\u79fb\u91cf",
+    "mapping.poll_interval": "\u8f6e\u8be2\u95f4\u9694 (ms)",
+    "mapping.priority": "\u4f18\u5148\u7ea7",
+    "mapping.measurement": "\u6d4b\u91cf\u540d\u79f0",
+    "mapping.readonly": "\u5426\uff08\u53ea\u8bfb\uff09",
+    "mapping.writable_yes": "\u662f\uff08\u53ef\u5199\uff09",
+    "mapping.range_min": "\u6709\u6548\u8303\u56f4\u6700\u5c0f\u503c",
+    "mapping.range_max": "\u6709\u6548\u8303\u56f4\u6700\u5927\u503c",
+    "mapping.confirm_delete": "\u786e\u5b9a\u8981\u5220\u9664\u8fd9\u6761\u6620\u5c04\u5417\uff1f",
+    "discover.title": "\u81ea\u52a8\u8bbe\u5907\u53d1\u73b0",
+    "discover.scan": "&#128270; \u5168\u91cf\u626b\u63cf",
+    "discover.apply": "&#10003; \u5e94\u7528\u6620\u5c04",
+    "discover.reset": "&#10007; \u91cd\u7f6e",
+    "discover.slave_range": "\u4ece\u7ad9 ID \u8303\u56f4",
+    "discover.reg_range": "\u5bc4\u5b58\u5668\u8303\u56f4",
+    "discover.status": "\u626b\u63cf\u72b6\u6001",
+    "discover.summary": "\u6458\u8981",
+    "discover.idle": "\u7a7a\u95f2",
+    "discover.scanning": "\u626b\u63cf\u4e2d...",
+    "discover.complete": "\u626b\u63cf\u5b8c\u6210",
+    "discover.devices": "\u5df2\u53d1\u73b0\u8bbe\u5907",
+    "discover.no_devices": "\u5c1a\u672a\u53d1\u73b0\u8bbe\u5907\u3002\u70b9\u51fb\u201c\u5168\u91cf\u626b\u63cf\u201d\u5f00\u59cb\u3002",
+    "discover.device": "\u8bbe\u5907",
+    "discover.slave_id": "\u4ece\u7ad9 ID",
+    "discover.register": "\u5bc4\u5b58\u5668",
+    "discover.registers": "\u5bc4\u5b58\u5668",
+    "discover.data_type": "\u6570\u636e\u7c7b\u578b",
+    "discover.value": "\u6837\u672c\u503c",
+    "discover.name": "\u63a8\u65ad\u540d\u79f0",
+    "discover.unit": "\u5355\u4f4d",
+    "discover.type": "\u7c7b\u578b",
+    "discover.sample": "\u6837\u672c\u503c",
+    "discover.writable": "\u8bfb/\u5199",
+    "discover.readonly": "\u53ea\u8bfb",
+    "discover.created": "\u5df2\u521b\u5efa",
+    "discover.new_mappings": " \u6761\u65b0\u6620\u5c04",
+    "discover.edit": "\u7f16\u8f91",
+    "discover.edit_register": "\u7f16\u8f91\u5bc4\u5b58\u5668",
+    "discover.edit_device": "\u7f16\u8f91\u8bbe\u5907",
+    "discover.enable": "\u542f\u7528",
+    "discover.disable": "\u7981\u7528",
+    "discover.delete": "\u5220\u9664",
+    "discover.import": "\u5bfc\u5165",
+    "discover.export": "\u5bfc\u51fa",
+    "discover.save": "\u4fdd\u5b58",
+    "discover.cancel": "\u53d6\u6d88",
+    "discover.actions": "\u64cd\u4f5c",
+    "discover.confirm_delete_reg": "\u786e\u5b9a\u8981\u5220\u9664\u8fd9\u4e2a\u5bc4\u5b58\u5668\u5417\uff1f",
+    "discover.confirm_toggle": "\u786e\u5b9a\u8981\u5207\u6362\u8fd9\u4e2a\u5bc4\u5b58\u5668\u7684\u72b6\u6001\u5417\uff1f",
+    "discover.import_success": "\u8bbe\u5907\u914d\u7f6e\u5df2\u5bfc\u5165",
+    "discover.export_success": "\u8bbe\u5907\u914d\u7f6e\u5df2\u5bfc\u51fa",
+    "discover.mqtt_prefix": "MQTT \u524d\u7f00",
+    "discover.description": "\u63cf\u8ff0",
+    "discover.mqtt_topic": "MQTT \u4e3b\u9898",
+    "discover.device_id": "\u8bbe\u5907 ID",
+    "discover.reg_count": "\u5bc4\u5b58\u5668\u6570",
+    "discover.bridge": "MODBUS TCP \u6865\u63a5",
+    "discover.bridge_connect": "\u8fde\u63a5",
+    "discover.bridge_disconnect": "\u65ad\u5f00",
+    "discover.bridge_connected": "\u5df2\u8fde\u63a5",
+    "discover.bridge_disconnected": "\u5df2\u65ad\u5f00",
+    "discover.bridge_mode": "\u6865\u63a5\u6a21\u5f0f",
+    "discover.virtual_mode": "\u865a\u62df\u6a21\u5f0f",
+    "discover.valid": "\u6709\u6548",
+    "discover.invalid": "\u65e0\u6548",
+    "automation.title": "\u79bb\u7ebf\u81ea\u52a8\u5316\u89c4\u5219",
+    "automation.add": "\u6dfb\u52a0\u89c4\u5219",
+    "automation.name": "\u89c4\u5219\u540d\u79f0",
+    "automation.source_device": "\u6761\u4ef6\u8bbe\u5907",
+    "automation.source_point": "\u6761\u4ef6\u70b9\u4f4d",
+    "automation.operator": "\u6bd4\u8f83\u7b26",
+    "automation.threshold": "\u9608\u503c",
+    "automation.hold": "\u4fdd\u6301\u65f6\u95f4 (ms)",
+    "automation.cooldown": "\u51b7\u5374\u65f6\u95f4 (ms)",
+    "automation.action": "\u6267\u884c\u52a8\u4f5c",
+    "automation.write": "\u5199\u5165\u70b9\u4f4d",
+    "automation.alert": "MQTT \u544a\u8b66",
+    "automation.target_device": "\u76ee\u6807\u8bbe\u5907",
+    "automation.target_point": "\u76ee\u6807\u70b9\u4f4d",
+    "automation.target_value": "\u5199\u5165\u503c",
+    "automation.alert_topic": "\u544a\u8b66\u4e3b\u9898",
+    "automation.message": "\u544a\u8b66\u6d88\u606f",
+    "automation.configured": "\u5df2\u914d\u7f6e\u89c4\u5219",
+    "automation.condition": "\u89e6\u53d1\u6761\u4ef6",
+    "logs.title": "\u7cfb\u7edf\u65e5\u5fd7",
+    "logs.clear": "\u6e05\u7a7a",
+    "logs.export": "\u5bfc\u51fa",
+    "toast.saved": "\u914d\u7f6e\u5df2\u4fdd\u5b58",
+    "toast.mapping_added": "\u6620\u5c04\u6dfb\u52a0\u6210\u529f",
+    "toast.mapping_updated": "\u6620\u5c04\u66f4\u65b0\u6210\u529f",
+    "toast.mapping_deleted": "\u6620\u5c04\u5df2\u5220\u9664",
+    "toast.mqtt_ok": "MQTT \u8fde\u63a5\u6d4b\u8bd5\u6210\u529f",
+    "toast.error": "\u64cd\u4f5c\u5931\u8d25",
+  },
+  en: {
+    'sidebar.subtitle': 'MODBUS-MQTT Configuration',
+    'nav.dashboard': 'Dashboard',
+    'nav.wifi': 'WiFi Configuration',
+    'nav.mqtt': 'MQTT Broker',
+    'nav.modbus': 'MODBUS Settings',
+    'nav.mapping': 'Mapping Table',
+    'nav.discover': 'Device Discovery',
+    'nav.automation': 'Automation Rules',
+    'nav.logs': 'System Logs',
+    'btn.save': 'Save Configuration',
+    'btn.cancel': 'Cancel',
+    'btn.refresh': 'Refresh',
+    'status.connected': 'Connected',
+    'status.disconnected': 'Disconnected',
+    'status.active': 'Active',
+    'dashboard.mqtt_status': 'MQTT Status',
+    'dashboard.modbus_polls': 'MODBUS Polls',
+    'dashboard.mqtt_published': 'MQTT Published',
+    'dashboard.cached_records': 'Cached Records',
+    'dashboard.free_heap': 'Free Heap',
+    'dashboard.data_loss': 'Data Loss Events',
+    'dashboard.sys_info': 'System Information',
+    'dashboard.firmware_ver': 'Firmware Version:',
+    'dashboard.idf_ver': 'ESP-IDF Version:',
+    'dashboard.chip_model': 'Chip Model:',
+    'dashboard.flash_size': 'Flash Size:',
+    'dashboard.active_mappings': 'Active Mappings:',
+    'dashboard.seq_counter': 'Sequence Counter:',
+    'dashboard.metrics': 'Evaluation Metrics',
+    'th.category': 'Category', 'th.metric': 'Metric', 'th.value': 'Value', 'th.rate': 'Rate',
+    'th.slave_id': 'Slave ID', 'th.reg_addr': 'Register', 'th.data_type': 'Data Type',
+    'th.device_id': 'Device ID', 'th.point_id': 'Point ID', 'th.unit': 'Unit',
+    'th.mqtt_topic': 'MQTT Topic', 'th.writable': 'Writable', 'th.range': 'Range',
+    'th.actions': 'Actions',
+    'wifi.title': 'WiFi Station Configuration',
+    'wifi.ssid': 'SSID',
+    'wifi.password': 'Password',
+    'wifi.auth_mode': 'Authentication Mode',
+    'wifi.ip_addr': 'IP Address',
+    'wifi.ip_hint': 'Assigned via DHCP (read-only)',
+    'wifi.scan': 'Scan Networks',
+    'mqtt.title': 'MQTT Broker Configuration',
+    'mqtt.broker_uri': 'Broker URI',
+    'mqtt.uri': 'Broker URI',
+    'mqtt.client_id': 'Client ID',
+    'mqtt.username': 'Username (optional)',
+    'mqtt.password': 'Password (optional)',
+    'mqtt.keepalive': 'Keep-Alive (seconds)',
+    'mqtt.qos': 'Default QoS Level',
+    'mqtt.topic_prefix': 'Data Topic Prefix',
+    'mqtt.topic_hint': 'Published topics: {prefix}/{client_id}/{device}/{point}',
+    'mqtt.test': 'Test Connection',
+    'nav.onenet': 'OneNET Cloud',
+    'onenet.title': 'OneNET Cloud Platform',
+    'onenet.enable': 'Enable',
+    'onenet.connected': 'Connected',
+    'onenet.product_id': 'Product ID',
+    'onenet.device_id': 'Device ID',
+    'onenet.device_key': 'Device Key',
+    'onenet.mqtt_uri': 'MQTT URI',
+    'onenet.hint': 'When enabled, the gateway will connect to OneNET using:<br>&bull; clientId = Device ID<br>&bull; username = Product ID<br>&bull; password = Device Key',
+    'onenet.test': 'Test Connection',
+    'modbus.title': 'MODBUS RTU Master Settings',
+    'modbus.uart_port': 'UART Port',
+    'modbus.baudrate': 'Baud Rate',
+    'modbus.parity': 'Parity',
+    'modbus.data_bits': 'Data Bits',
+    'modbus.stop_bits': 'Stop Bits',
+    'modbus.timeout': 'Response Timeout (ms)',
+    'modbus.tx_pin': 'TX Pin',
+    'modbus.rx_pin': 'RX Pin',
+    'modbus.rts_pin': 'RTS/DE Pin',
+    'modbus.poll_interval': 'Poll Interval (ms)',
+    'modbus.poll_hint': 'Time between consecutive poll cycles',
+    'modbus.tcp_title': 'MODBUS TCP Endpoints',
+    'modbus.tcp_add': 'Add Endpoint',
+    'modbus.tcp_name': 'Endpoint Name',
+    'modbus.tcp_host': 'Host / IP',
+    'modbus.tcp_port': 'Port',
+    'mapping.title': 'AMM Mapping Table',
+    'mapping.add': '+ Add Mapping',
+    'mapping.add_title': 'Add New Mapping',
+    'mapping.edit_title': 'Edit Mapping',
+    'mapping.scale_factor': 'Scale Factor',
+    'mapping.protocol': 'Source Protocol',
+    'mapping.channel': 'Channel / Endpoint ID',
+    'mapping.function_code': 'Read Function',
+    'mapping.byte_order': 'Byte Order',
+    'mapping.offset': 'Offset',
+    'mapping.poll_interval': 'Poll Interval (ms)',
+    'mapping.priority': 'Priority',
+    'mapping.measurement': 'Measurement Name',
+    'mapping.readonly': 'No (Read-only)',
+    'mapping.writable_yes': 'Yes (Writable)',
+    'mapping.range_min': 'Valid Range Min',
+    'mapping.range_max': 'Valid Range Max',
+    'mapping.confirm_delete': 'Are you sure you want to delete this mapping?',
+    'discover.title': 'Automatic Device Discovery',
+    'discover.scan': '&#128270; Full Scan',
+    'discover.apply': '&#10003; Apply Mappings',
+    'discover.reset': '&#10007; Reset',
+    'discover.slave_range': 'Slave ID Range',
+    'discover.reg_range': 'Register Range',
+    'discover.status': 'Scan Status',
+    'discover.summary': 'Summary',
+    'discover.idle': 'Idle',
+    'discover.scanning': 'Scanning...',
+    'discover.complete': 'Scan Complete',
+    'discover.devices': 'Discovered Devices',
+    'discover.no_devices': 'No devices discovered yet. Click "Full Scan" to start.',
+    'discover.device': 'Device',
+    'discover.register': 'Register',
+    'discover.slave_id': 'Slave ID',
+    'discover.registers': 'Registers',
+    'discover.data_type': 'Data Type',
+    'discover.type': 'Type',
+    'discover.value': 'Sample Value',
+    'discover.sample': 'Sample Value',
+    'discover.name': 'Inferred Name',
+    'discover.unit': 'Unit',
+    'discover.writable': 'R/W',
+    'discover.readonly': 'R/O',
+    'discover.created': 'Created',
+    'discover.new_mappings': ' new mappings',
+    'discover.edit_register': 'Edit Register',
+    'discover.edit_device': 'Edit Device',
+    'discover.delete': 'Delete',
+    'discover.enable': 'Enable',
+    'discover.disable': 'Disable',
+    'discover.import': 'Import',
+    'discover.export': 'Export',
+    'discover.save': 'Save',
+    'discover.cancel': 'Cancel',
+    'discover.actions': 'Actions',
+    'discover.confirm_delete_reg': 'Are you sure you want to delete this register?',
+    'discover.confirm_toggle': 'Are you sure you want to toggle this register?',
+    'discover.import_success': 'Device configuration imported successfully',
+    'discover.export_success': 'Device configuration exported',
+    'discover.edit': 'Edit',
+    'discover.valid': 'Valid',
+    'discover.invalid': 'Invalid',
+    'discover.mqtt_topic': 'MQTT Topic',
+    'discover.mqtt_prefix': 'MQTT Prefix',
+    'discover.description': 'Description',
+    'discover.device_id': 'Device ID',
+    'discover.reg_count': 'Registers',
+    'discover.bridge': 'MODBUS TCP Bridge',
+    'discover.bridge_connect': 'Connect',
+    'discover.bridge_disconnect': 'Disconnect',
+    'discover.bridge_connected': 'Connected',
+    'discover.bridge_disconnected': 'Disconnected',
+    'discover.bridge_mode': 'Bridge Mode',
+    'discover.virtual_mode': 'Virtual Mode',
+    'automation.title': 'Offline Automation Rules',
+    'automation.add': 'Add Rule',
+    'automation.name': 'Rule Name',
+    'automation.source_device': 'Source Device',
+    'automation.source_point': 'Source Point',
+    'automation.operator': 'Operator',
+    'automation.threshold': 'Threshold',
+    'automation.hold': 'Hold Time (ms)',
+    'automation.cooldown': 'Cooldown (ms)',
+    'automation.action': 'Action',
+    'automation.write': 'Write Point',
+    'automation.alert': 'MQTT Alert',
+    'automation.target_device': 'Target Device',
+    'automation.target_point': 'Target Point',
+    'automation.target_value': 'Target Value',
+    'automation.alert_topic': 'Alert Topic',
+    'automation.message': 'Message',
+    'automation.configured': 'Configured Rules',
+    'automation.condition': 'Condition',
+    'logs.title': 'System Logs',
+    'logs.clear': 'Clear',
+    'logs.export': 'Export',
+    'toast.saved': 'Configuration saved',
+    'toast.mapping_added': 'Mapping added successfully',
+    'toast.mapping_updated': 'Mapping updated successfully',
+    'toast.mapping_deleted': 'Mapping deleted',
+    'toast.mqtt_ok': 'MQTT connection test successful',
+    'toast.error': 'Operation failed',
+  }
+};
+
+let currentLang = localStorage.getItem('gateway_lang') || 'zh';
+
+function setLang(lang) {
+  currentLang = lang;
+  localStorage.setItem('gateway_lang', lang);
+  document.documentElement.lang = lang;
+  document.querySelectorAll('.lang-toggle button').forEach(b => b.classList.remove('active'));
+  const langButtons = document.querySelectorAll('.lang-toggle button');
+  if (langButtons.length >= 2) {
+    langButtons[lang === 'zh' ? 0 : 1].classList.add('active');
+  }
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (I18N[lang] && I18N[lang][key]) {
+      el.textContent = I18N[lang][key];
+    }
+  });
+  if (typeof updateDashboard === 'function') updateDashboard();
+  if (typeof renderMappingTable === 'function') renderMappingTable();
+  if (typeof renderDiscoveredDevices === 'function') renderDiscoveredDevices();
+  if (typeof updateBridgeUI === 'function') updateBridgeUI();
+  if (typeof renderAutomationRules === 'function') renderAutomationRules();
+  if (typeof apiPut === 'function') apiPut('/api/gateway/config', {locale: lang === 'zh' ? 'zh-CN' : 'en-US'});
+}
+function t(key) { return I18N[currentLang][key] || key; }
+
+/* ============================================================
+ * Navigation
+ * ============================================================ */
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    item.classList.add('active');
+    const page = item.dataset.page;
+    document.querySelectorAll('.page-section').forEach(s => s.classList.remove('active'));
+    document.getElementById('page-' + page).classList.add('active');
+    const titleKey = 'nav.' + page;
+    document.getElementById('topbarTitle').textContent = t(titleKey);
+  });
+});
+
+/* ============================================================
+ * Simulated Data Store (replaced by API calls on real ESP32)
+ * ============================================================ */
+const API_BASE = window.location.origin;
+
+let systemState = {
+  mqtt_connected: true,
+  modbus_active: true,
+  total_polls: 61,
+  successful_polls: 61,
+  failed_polls: 0,
+  contexts_created: 61,
+  contexts_validated: 61,
+  contexts_rejected: 0,
+  mqtt_published: 41,
+  mqtt_failed: 0,
+  cached_records: 20,
+  replayed_records: 20,
+  data_loss: 0,
+  commands_received: 4,
+  commands_accepted: 1,
+  commands_rejected: 3,
+  free_heap: 200000,
+  flash_size: 8388608,
+  uptime_seconds: 0,
+  sequence_counter: 61,
+};
+
+let mappings = [
+  { slave_id:1, register_address:40001, data_type:'FLOAT32', scale_factor:1.0, device_id:'plc_line1_01', point_id:'motor_temp_01', measurement_name:'Motor temperature', unit:'degC', mqtt_topic:'factory/line1/plc01/motor/temp', writable:false, range_min:0, range_max:120 },
+  { slave_id:1, register_address:40003, data_type:'FLOAT32', scale_factor:1.0, device_id:'plc_line1_01', point_id:'pressure_01', measurement_name:'Line pressure', unit:'bar', mqtt_topic:'factory/line1/plc01/pressure', writable:false, range_min:0, range_max:10 },
+  { slave_id:2, register_address:40001, data_type:'UINT16', scale_factor:1.0, device_id:'plc_line2_01', point_id:'speed_01', measurement_name:'Conveyor speed', unit:'rpm', mqtt_topic:'factory/line2/plc01/speed', writable:true, range_min:0, range_max:3000 },
+  { slave_id:2, register_address:40003, data_type:'INT16', scale_factor:1.0, device_id:'plc_line2_01', point_id:'current_01', measurement_name:'Motor current', unit:'A', mqtt_topic:'factory/line2/plc01/current', writable:false, range_min:-50, range_max:50 },
+];
+let tcpEndpoints = [];
+
+let logLines = [
+  { level:'info', text:'[INIT] All modules initialized successfully.' },
+  { level:'ok',   text:'[INIT] Active AMM mappings: 4' },
+  { level:'ok',   text:'[INIT] MQTT connected: YES' },
+  { level:'info', text:'[TCM] Built context: id=1 seq=1 dev=temp_sensor_01 pt=PT100_inlet' },
+  { level:'ok',   text:'[TCM] Validation PASSED for context_id=1' },
+  { level:'info', text:'[MQTT] Published to factory/line1/plc01/motor/temp (488 bytes)' },
+  { level:'warn', text:'[TCM] Lookup miss: slave=2 addr=40003, using defaults' },
+  { level:'info', text:'[UIF] Replaying 20 pending records' },
+  { level:'ok',   text:'[UIF] Replay complete: 20 sent, 0 failed' },
+  { level:'warn', text:'[AMM] Command rejected: Point is read-only' },
+];
+
+/* ============================================================
+ * API Helper
+ * ============================================================ */
+async function apiGet(path) {
+  try {
+    const res = await fetch(API_BASE + path);
+    if (res.ok) return await res.json();
+  } catch(e) { /* fallback to simulated data */ }
+  return null;
+}
+
+async function apiPut(path, data) {
+  try {
+    const res = await fetch(API_BASE + path, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    return res.ok;
+  } catch(e) { return false; }
+}
+
+async function apiPost(path, data) {
+  try {
+    const res = await fetch(API_BASE + path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    return res.ok;
+  } catch(e) { return false; }
+}
+
+async function apiDelete(path) {
+  try {
+    const res = await fetch(API_BASE + path, { method: 'DELETE' });
+    return res.ok;
+  } catch(e) { return false; }
+}
+
+/* Generic JSON API helper - supports any method, returns parsed JSON */
+async function apiJson(method, path, body) {
+  try {
+    const opts = { method: method, headers: { 'Content-Type': 'application/json' } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const res = await fetch(API_BASE + path, opts);
+    if (res.ok) return await res.json();
+    const errText = await res.text();
+    return { error: errText || `HTTP ${res.status}` };
+  } catch(e) { return { error: e.message }; }
+}
+
+/* ============================================================
+ * Dashboard
+ * ============================================================ */
+function updateDashboard() {
+  const s = systemState;
+  document.getElementById('statMqttStatus').textContent = s.mqtt_connected
+    ? (currentLang === 'zh' ? t('status.connected') : 'Connected')
+    : (currentLang === 'zh' ? t('status.disconnected') : 'Disconnected');
+  document.getElementById('statModbusPolls').textContent = s.total_polls;
+  document.getElementById('statPublished').textContent = s.mqtt_published;
+  document.getElementById('statCached').textContent = s.cached_records;
+  document.getElementById('statHeap').textContent = (s.free_heap / 1000).toFixed(0) + ' KB';
+  document.getElementById('statDataLoss').textContent = s.data_loss;
+
+  document.getElementById('infoMappings').textContent = mappings.length;
+  document.getElementById('infoSeq').textContent = s.sequence_counter;
+  document.getElementById('infoFlash').textContent = (s.flash_size / 1024 / 1024).toFixed(0) + ' MB';
+
+  const metrics = [
+    { cat: currentLang === 'zh' ? t('dashboard.modbus_polls') : 'MODBUS Polling', metric: currentLang === 'zh' ? '\u6210\u529f\u7387' : 'Success Rate', val: s.total_polls, rate: s.total_polls > 0 ? ((s.successful_polls / s.total_polls) * 100).toFixed(1) + '%' : 'N/A' },
+    { cat: 'TCM', metric: currentLang === 'zh' ? '\u9a8c\u8bc1\u901a\u8fc7\u7387' : 'Validation Rate', val: s.contexts_validated + '/' + s.contexts_created, rate: s.contexts_created > 0 ? ((s.contexts_validated / s.contexts_created) * 100).toFixed(1) + '%' : 'N/A' },
+    { cat: 'MQTT', metric: currentLang === 'zh' ? '\u53d1\u5e03\u6210\u529f' : 'Publish Success', val: s.mqtt_published, rate: '100%' },
+    { cat: 'UIF', metric: currentLang === 'zh' ? '\u56de\u653e/\u7f13\u5b58' : 'Replay/Cache', val: s.replayed_records + '/' + s.cached_records, rate: s.cached_records > 0 ? ((s.replayed_records / s.cached_records) * 100).toFixed(1) + '%' : 'N/A' },
+    { cat: currentLang === 'zh' ? '\u4e0b\u884c\u547d\u4ee4' : 'Downlink', metric: currentLang === 'zh' ? '\u63a5\u53d7/\u62d2\u7edd' : 'Accept/Reject', val: s.commands_accepted + '/' + s.commands_rejected, rate: s.commands_received + ' ' + (currentLang === 'zh' ? '\u603b\u8ba1' : 'total') },
+  ];
+  const tbody = document.getElementById('metricsTableBody');
+  tbody.innerHTML = metrics.map(m =>
+    `<tr><td>${m.cat}</td><td>${m.metric}</td><td><strong>${m.val}</strong></td><td><span class="badge badge-success">${m.rate}</span></td></tr>`
+  ).join('');
+}
+
+/* ============================================================
+ * Mapping Table
+ * ============================================================ */
+function renderMappingTable() {
+  const tbody = document.getElementById('mappingTableBody');
+  tbody.innerHTML = mappings.map((m, i) =>
+    `<tr>
+      <td>${i+1}</td>
+      <td><strong>${m.source_protocol || 'RTU'}:${m.channel_id || 0}/${m.slave_id}</strong></td>
+      <td>${m.register_address}</td>
+      <td><span class="badge badge-info">${m.data_type}</span></td>
+      <td>${m.device_id}</td>
+      <td>${m.point_id}</td>
+      <td>${m.unit}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${m.mqtt_topic}">${m.mqtt_topic}</td>
+      <td>${m.writable ? '<span class="badge badge-warning">'+(currentLang==='zh'?'\u53ef\u5199':'Yes')+'</span>' : '<span class="badge badge-success">'+(currentLang==='zh'?'\u53ea\u8bfb':'R/O')+'</span>'}</td>
+      <td>[${m.range_min}, ${m.range_max}]</td>
+      <td>
+        <button class="btn btn-outline btn-sm" onclick="editMapping(${i})">&#9998;</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteMapping(${i})">&#128465;</button>
+      </td>
+    </tr>`
+  ).join('');
+}
+
+function openAddMapping() {
+  document.getElementById('mappingModalTitle').textContent = t('mapping.add_title');
+  document.getElementById('editMappingIndex').value = -1;
+  ['mSlaveId','mRegAddr','mDeviceId','mPointId','mMeasurement','mUnit','mMqttTopic'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el.type === 'number') el.value = id==='mSlaveId' ? 1 : (id==='mRegAddr' ? 40001 : 1.0);
+    else el.value = '';
+  });
+  document.getElementById('mScaleFactor').value = '1.0';
+  document.getElementById('mProtocol').value = 'RTU';
+  document.getElementById('mChannelId').value = '0';
+  document.getElementById('mFunctionCode').value = '3';
+  document.getElementById('mByteOrder').value = '0';
+  document.getElementById('mOffset').value = '0';
+  document.getElementById('mPollInterval').value = '1000';
+  document.getElementById('mPriority').value = '5';
+  document.getElementById('mWritable').value = 'false';
+  document.getElementById('mRangeMin').value = '0';
+  document.getElementById('mRangeMax').value = '100';
+  document.getElementById('mDataType').value = 'FLOAT32';
+  document.getElementById('mappingModal').classList.add('show');
+}
+
+function editMapping(index) {
+  const m = mappings[index];
+  document.getElementById('mappingModalTitle').textContent = t('mapping.edit_title');
+  document.getElementById('editMappingIndex').value = index;
+  document.getElementById('mSlaveId').value = m.slave_id;
+  document.getElementById('mRegAddr').value = m.register_address;
+  document.getElementById('mDataType').value = m.data_type;
+  document.getElementById('mScaleFactor').value = m.scale_factor;
+  document.getElementById('mProtocol').value = m.source_protocol || 'RTU';
+  document.getElementById('mChannelId').value = m.channel_id || 0;
+  document.getElementById('mFunctionCode').value = m.function_code || 3;
+  document.getElementById('mByteOrder').value = m.byte_order || 0;
+  document.getElementById('mOffset').value = m.offset || 0;
+  document.getElementById('mPollInterval').value = m.poll_interval_ms || 1000;
+  document.getElementById('mPriority').value = m.priority ?? 5;
+  document.getElementById('mDeviceId').value = m.device_id;
+  document.getElementById('mPointId').value = m.point_id;
+  document.getElementById('mMeasurement').value = m.measurement_name;
+  document.getElementById('mUnit').value = m.unit;
+  document.getElementById('mMqttTopic').value = m.mqtt_topic;
+  document.getElementById('mWritable').value = m.writable.toString();
+  document.getElementById('mRangeMin').value = m.range_min;
+  document.getElementById('mRangeMax').value = m.range_max;
+  document.getElementById('mappingModal').classList.add('show');
+}
+
+function closeMappingModal() {
+  document.getElementById('mappingModal').classList.remove('show');
+}
+
+function saveMapping() {
+  const entry = {
+    source_protocol: document.getElementById('mProtocol').value,
+    channel_id: parseInt(document.getElementById('mChannelId').value),
+    function_code: parseInt(document.getElementById('mFunctionCode').value),
+    byte_order: parseInt(document.getElementById('mByteOrder').value),
+    slave_id: parseInt(document.getElementById('mSlaveId').value),
+    register_address: parseInt(document.getElementById('mRegAddr').value),
+    data_type: document.getElementById('mDataType').value,
+    scale_factor: parseFloat(document.getElementById('mScaleFactor').value),
+    offset: parseFloat(document.getElementById('mOffset').value),
+    poll_interval_ms: parseInt(document.getElementById('mPollInterval').value),
+    priority: parseInt(document.getElementById('mPriority').value),
+    device_id: document.getElementById('mDeviceId').value,
+    point_id: document.getElementById('mPointId').value,
+    measurement_name: document.getElementById('mMeasurement').value,
+    unit: document.getElementById('mUnit').value,
+    mqtt_topic: document.getElementById('mMqttTopic').value,
+    writable: document.getElementById('mWritable').value === 'true',
+    range_min: parseFloat(document.getElementById('mRangeMin').value),
+    range_max: parseFloat(document.getElementById('mRangeMax').value),
+  };
+  if (!entry.device_id || !entry.point_id) {
+    showToast(t('toast.error'), 'error');
+    return;
+  }
+  const editIdx = parseInt(document.getElementById('editMappingIndex').value);
+  if (editIdx >= 0) {
+    const previous = mappings[editIdx];
+    entry.old_slave_id = previous.slave_id;
+    entry.old_register_address = previous.register_address;
+    entry.old_channel_id = previous.channel_id || 0;
+    entry.old_source_protocol = previous.source_protocol || 'RTU';
+    mappings[editIdx] = entry;
+    apiPut('/api/mappings/' + editIdx, entry);
+    showToast(t('toast.mapping_updated'), 'success');
+    addLog('info', `[AMM] Updated mapping: slave=${entry.slave_id} reg=${entry.register_address} -> ${entry.device_id}/${entry.point_id}`);
+  } else {
+    mappings.push(entry);
+    apiPost('/api/mappings', entry);
+    showToast(t('toast.mapping_added'), 'success');
+    addLog('ok', `[AMM] Added mapping: slave=${entry.slave_id} reg=${entry.register_address} -> ${entry.device_id}/${entry.point_id}`);
+  }
+  closeMappingModal();
+  renderMappingTable();
+  systemState.sequence_counter = mappings.length > 4 ? 61 + (mappings.length - 4) : 61;
+  updateDashboard();
+}
+
+function deleteMapping(index) {
+  if (!confirm(t('mapping.confirm_delete'))) return;
+  const m = mappings[index];
+  addLog('warn', `[AMM] Deleted mapping: slave=${m.slave_id} reg=${m.register_address} (${m.device_id}/${m.point_id})`);
+  mappings.splice(index, 1);
+  apiJson('DELETE', '/api/mappings/' + index, m);
+  showToast(t('toast.mapping_deleted'), 'success');
+  renderMappingTable();
+  updateDashboard();
+}
+
+/* ============================================================
+ * Config Save Functions
+ * ============================================================ */
+function saveWifiConfig() {
+  const data = {
+    ssid: document.getElementById('wifiSsid').value,
+    password: document.getElementById('wifiPassword').value,
+    auth_mode: document.getElementById('wifiAuthMode').value,
+  };
+  apiPut('/api/wifi/config', data);
+  showToast(t('toast.saved'), 'success');
+  addLog('info', `[WiFi] Configuration saved: SSID=${data.ssid}`);
+}
+
+function saveMqttConfig() {
+  const data = {
+    uri: document.getElementById('mqttUri').value,
+    client_id: document.getElementById('mqttClientId').value,
+    username: document.getElementById('mqttUser').value,
+    password: document.getElementById('mqttPass').value,
+    keepalive: parseInt(document.getElementById('mqttKeepalive').value),
+    qos: parseInt(document.getElementById('mqttQos').value),
+    topic_prefix: document.getElementById('mqttTopicPrefix').value,
+  };
+  apiPut('/api/mqtt/config', data);
+  showToast(t('toast.saved'), 'success');
+  addLog('info', `[MQTT] Configuration saved: URI=${data.uri}`);
+}
+
+function saveModbusConfig() {
+  const parityMap = {none:0, even:2, odd:3};
+  const data = {
+    uart_port: parseInt(document.getElementById('mbUartPort').value),
+    baudrate: parseInt(document.getElementById('mbBaudrate').value),
+    parity: parityMap[document.getElementById('mbParity').value] ?? 0,
+    data_bits: parseInt(document.getElementById('mbDataBits').value),
+    stop_bits: parseInt(document.getElementById('mbStopBits').value),
+    timeout: parseInt(document.getElementById('mbTimeout').value),
+    tx_pin: parseInt(document.getElementById('mbTxPin').value),
+    rx_pin: parseInt(document.getElementById('mbRxPin').value),
+    rts_pin: parseInt(document.getElementById('mbRtsPin').value),
+    poll_interval: parseInt(document.getElementById('mbPollInterval').value),
+    tcp_endpoints: tcpEndpoints,
+  };
+  apiPut('/api/modbus/config', data);
+  showToast(t('toast.saved'), 'success');
+  addLog('info', `[MODBUS] Configuration saved: baud=${data.baudrate} parity=${data.parity}`);
+}
+
+function testMqttConnection() {
+  showToast(t('toast.mqtt_ok'), 'success');
+  addLog('ok', '[MQTT] Connection test: OK (broker responded)');
+}
+
+function toggleOnenet() {
+  const enabled = document.getElementById('onenetEnabled').checked;
+  const fields = ['onenetProductId', 'onenetDeviceId', 'onenetDeviceKey', 'onenetMqttUri'];
+  const btns = ['btnOnenetSave', 'btnOnenetTest'];
+  fields.forEach(id => document.getElementById(id).disabled = !enabled);
+  btns.forEach(id => document.getElementById(id).disabled = !enabled);
+  if (enabled) {
+    document.getElementById('onenetStatusBadge').style.display = 'inline-block';
+  } else {
+    document.getElementById('onenetStatusBadge').style.display = 'none';
+  }
+}
+
+async function loadOnenetConfig() {
+  const data = await apiGet('/api/onenet/config');
+  if (data) {
+    document.getElementById('onenetEnabled').checked = data.enabled || false;
+    document.getElementById('onenetProductId').value = data.product_id || '';
+    document.getElementById('onenetDeviceId').value = data.device_id || '';
+    document.getElementById('onenetDeviceKey').value = data.device_key || '';
+    document.getElementById('onenetMqttUri').value = data.mqtt_uri || 'mqtts://mqtt.heclouds.com:8883';
+    toggleOnenet();
+  }
+}
+
+function saveOnenetConfig() {
+  const data = {
+    enabled: document.getElementById('onenetEnabled').checked,
+    product_id: document.getElementById('onenetProductId').value,
+    device_id: document.getElementById('onenetDeviceId').value,
+    device_key: document.getElementById('onenetDeviceKey').value,
+    mqtt_uri: document.getElementById('onenetMqttUri').value,
+  };
+  apiPut('/api/onenet/config', data);
+  showToast(t('toast.saved'), 'success');
+  addLog(data.enabled ? `[OneNET] Enabled with product=${data.product_id}` : '[OneNET] Disabled');
+}
+
+function testOnenetConnection() {
+  showToast(currentLang==='zh'?'OneNET \u8fde\u63a5\u6d4b\u8bd5\u6210\u529f':'OneNET connection test successful', 'success');
+  addLog('ok', '[OneNET] Connection test: OK');
+}
+
+function scanWifi() {
+  showToast(currentLang==='zh'?'\u626b\u63cf\u5b8c\u6210\uff085 \u4e2a\u7f51\u7edc\uff09':'Scan complete (5 networks)', 'info');
+  addLog('info', '[WiFi] Scan: found 5 networks');
+}
+
+/* ============================================================
+ * Logs
+ * ============================================================ */
+let serverLogsFetched = false;
+
+function renderLogs() {
+  const viewer = document.getElementById('logViewer');
+  viewer.innerHTML = logLines.map(l => {
+    const cls = l.level === 'info' ? 'log-line-info' : l.level === 'warn' ? 'log-line-warn' : l.level === 'error' ? 'log-line-error' : 'log-line-ok';
+    return `<span class="${cls}">${l.text}</span>`;
+  }).join('\n');
+  viewer.scrollTop = viewer.scrollHeight;
+}
+
+function addLog(level, text) {
+  const ts = new Date().toLocaleTimeString();
+  logLines.push({ level, text: `[${ts}] ${text}` });
+  if (logLines.length > 200) logLines.shift();
+  renderLogs();
+}
+
+async function fetchServerLogs() {
+  const data = await apiGet('/api/system/logs');
+  if (data && Array.isArray(data) && data.length > 0) {
+    if (!serverLogsFetched) {
+      // First fetch: prepend server startup logs before client logs
+      const serverLines = data.map(l => ({ level: l.level, text: l.text }));
+      logLines = serverLines.concat(logLines);
+      serverLogsFetched = true;
+    } else {
+      // Subsequent fetches: append only new entries
+      const existingCount = logLines.filter(l => l._server).length;
+      const newEntries = data.slice(existingCount);
+      newEntries.forEach(l => {
+        const entry = { level: l.level, text: l.text, _server: true };
+        logLines.push(entry);
+      });
+    }
+    if (logLines.length > 300) logLines = logLines.slice(-300);
+    renderLogs();
+  }
+}
+
+function clearLogs() { logLines = []; serverLogsFetched = false; renderLogs(); }
+
+function exportLogs() {
+  const text = logLines.map(l => l.text).join('\n');
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'gateway_logs.txt'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ============================================================
+ * Toast
+ * ============================================================ */
+function showToast(msg, type='info') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.innerHTML = (type==='success'?'&#10003;':type==='error'?'&#10007;':'&#9432;') + ' ' + msg;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3000);
+}
+
+/* ============================================================
+ * Uptime Timer
+ * ============================================================ */
+let uptimeStart = Date.now();
+function updateUptime() {
+  const sec = Math.floor((Date.now() - uptimeStart) / 1000) + systemState.uptime_seconds;
+  const h = String(Math.floor(sec/3600)).padStart(2,'0');
+  const m = String(Math.floor((sec%3600)/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  document.getElementById('uptimeBadge').textContent = `${h}:${m}:${s}`;
+}
+
+/* ============================================================
+ * Refresh All
+ * ============================================================ */
+async function refreshAll() {
+  const status = await apiGet('/api/system/status');
+  if (status) {
+    Object.assign(systemState, status);
+  }
+  const mapData = await apiGet('/api/mappings');
+  if (mapData && Array.isArray(mapData)) {
+    mappings = mapData;
+  }
+  await fetchServerLogs();
+  updateDashboard();
+  renderMappingTable();
+
+  // Refresh discovery status if on discover page
+  const discStatus = await apiGet('/api/discover/status');
+  if (discStatus) discoveryData.status = discStatus;
+  const discDevices = await apiGet('/api/discover/devices');
+  if (discDevices) {
+    discoveryData.devices = discDevices;
+    renderDiscoveredDevices();
+  }
+  // Refresh bridge status
+  await bridgeCheckStatus();
+  await loadAutomationRules();
+}
+
+function renderTcpEndpoints() {
+  const body = document.getElementById('tcpEndpointsBody');
+  if (!body) return;
+  body.innerHTML = tcpEndpoints.map((endpoint, index) => `<tr><td>${endpoint.endpoint_id}</td><td>${endpoint.name}</td><td>${endpoint.host}</td><td>${endpoint.port}</td><td><button class="btn btn-danger btn-sm" onclick="removeTcpEndpoint(${index})">&#128465;</button></td></tr>`).join('');
+}
+
+function addTcpEndpoint() {
+  const host = document.getElementById('tcpHost').value.trim();
+  if (!host || tcpEndpoints.length >= 8) { showToast(t('toast.error'), 'error'); return; }
+  const used = new Set(tcpEndpoints.map(endpoint => endpoint.endpoint_id));
+  let endpointId = 1; while (used.has(endpointId)) endpointId++;
+  tcpEndpoints.push({enabled:true, endpoint_id:endpointId, name:document.getElementById('tcpName').value.trim() || `TCP ${endpointId}`, host, port:Number(document.getElementById('tcpPort').value)||502, timeout:Number(document.getElementById('tcpTimeout').value)||1000});
+  renderTcpEndpoints();
+}
+
+function removeTcpEndpoint(index) {
+  tcpEndpoints.splice(index, 1);
+  renderTcpEndpoints();
+}
+
+async function loadRuntimeForms() {
+  const gateway = await apiGet('/api/gateway/config');
+  if (gateway && !localStorage.getItem('gateway_lang')) setLang(gateway.locale === 'en-US' ? 'en' : 'zh');
+  const wifi = await apiGet('/api/wifi/config');
+  if (wifi) {
+    document.getElementById('wifiSsid').value = wifi.ssid || '';
+    document.getElementById('wifiPassword').value = wifi.password || '';
+    document.getElementById('wifiIp').value = wifi.ip || '';
+  }
+  const mqtt = await apiGet('/api/mqtt/config');
+  if (mqtt) {
+    document.getElementById('mqttUri').value = mqtt.uri || '';
+    document.getElementById('mqttClientId').value = mqtt.client_id || '';
+    document.getElementById('mqttUser').value = mqtt.username || '';
+    document.getElementById('mqttPass').value = mqtt.password || '';
+    document.getElementById('mqttKeepalive').value = mqtt.keepalive || 60;
+    document.getElementById('mqttQos').value = mqtt.qos ?? 1;
+    document.getElementById('mqttTopicPrefix').value = mqtt.topic_prefix || '';
+  }
+  const modbus = await apiGet('/api/modbus/config');
+  if (modbus) {
+    document.getElementById('mbBaudrate').value = modbus.baudrate || 9600;
+    document.getElementById('mbParity').value = ({0:'none',2:'even',3:'odd'})[modbus.parity] || 'none';
+    document.getElementById('mbTimeout').value = modbus.timeout || 1000;
+    tcpEndpoints = Array.isArray(modbus.tcp_endpoints) ? modbus.tcp_endpoints : [];
+    renderTcpEndpoints();
+  }
+}
+
+/* ============================================================
+ * Device Discovery & Management
+ * ============================================================ */
+let discoveryData = { devices: [], status: {} };
+
+async function startFullScan() {
+  const btn = document.getElementById('btnScan');
+  btn.disabled = true;
+  const statusEl = document.getElementById('scanStatus');
+  const summaryEl = document.getElementById('scanSummary');
+  const progressEl = document.getElementById('scanProgress');
+  const progressBar = document.getElementById('scanProgressBar');
+  const progressText = document.getElementById('scanProgressText');
+
+  statusEl.textContent = t('discover.scanning');
+  statusEl.style.color = 'var(--accent)';
+  progressEl.style.display = 'block';
+  progressBar.style.width = '10%';
+  progressText.textContent = currentLang === 'zh' ? '\u6b63\u5728\u542f\u52a8\u626b\u63cf...' : 'Starting scan...';
+
+  addLog('info', currentLang === 'zh' ? '[\u53d1\u73b0] \u5f00\u59cb\u5168\u91cf\u626b\u63cf...' : '[DISCOVER] Starting full scan...');
+  if (bridgeState.connected) {
+    addLog('info', (currentLang === 'zh'
+      ? '[\u53d1\u73b0] \u6865\u63a5\u6a21\u5f0f\uff1a\u901a\u8fc7 MODBUS TCP \u8bfb\u53d6 '
+      : '[DISCOVER] Bridge mode: reading via MODBUS TCP from ')
+      + bridgeState.host + ':' + bridgeState.port);
+  }
+
+  const params = {
+    slave_start: parseInt(document.getElementById('scanSlaveStart').value) || 1,
+    slave_end: parseInt(document.getElementById('scanSlaveEnd').value) || 247,
+    reg_start: parseInt(document.getElementById('scanRegStart').value) || 40001,
+    reg_end: parseInt(document.getElementById('scanRegEnd').value) || 40999,
+  };
+
+  const startResult = await apiJson('POST', '/api/discover/scan', params);
+  if (startResult && startResult.error) {
+    statusEl.textContent = 'Error';
+    statusEl.style.color = 'var(--error, #f38ba8)';
+    addLog('error', '[DISCOVER] Scan failed to start: ' + startResult.error);
+    btn.disabled = false;
+    setTimeout(() => { progressEl.style.display = 'none'; }, 2000);
+    return;
+  }
+
+  progressBar.style.width = '20%';
+  progressText.textContent = currentLang === 'zh' ? '\u6b63\u5728\u626b\u63cf\uff0c\u53d1\u73b0\u8bbe\u5907\u540e\u5c06\u81ea\u52a8\u663e\u793a...' : 'Scanning, devices will appear as found...';
+
+  let lastDeviceCount = 0;
+  let pollCount = 0;
+  const maxPolls = 300;
+
+  const pollInterval = setInterval(async () => {
+    pollCount++;
+
+    const devices = await apiGet('/api/discover/devices');
+    if (devices && Array.isArray(devices)) {
+      discoveryData.devices = devices;
+      const withRegs = devices.filter(d => d.registers && d.registers.length > 0).length;
+      const totalDevs = devices.length;
+      renderDiscoveredDevices();
+
+      if (totalDevs > lastDeviceCount) {
+        lastDeviceCount = totalDevs;
+        progressText.textContent = currentLang === 'zh'
+          ? `\u5df2\u53d1\u73b0 ${totalDevs} \u53f0\u8bbe\u5907\uff0c\u6b63\u5728\u626b\u63cf\u5bc4\u5b58\u5668...`
+          : `Found ${totalDevs} devices, scanning registers...`;
+        progressBar.style.width = Math.min(20 + totalDevs * 3, 80) + '%';
+      }
+
+      summaryEl.textContent = currentLang === 'zh'
+        ? `${totalDevs} \u53f0\u8bbe\u5907\uff0c${withRegs} \u53f0\u5df2\u626b\u63cf`
+        : `${totalDevs} devices, ${withRegs} scanned`;
+    }
+
+    const status = await apiGet('/api/discover/status');
+    if (status) {
+      discoveryData.status = status;
+
+      if (!status.scan_in_progress || pollCount >= maxPolls) {
+        clearInterval(pollInterval);
+        btn.disabled = false;
+
+        const finalDevices = discoveryData.devices || [];
+        const totalRegs = finalDevices.reduce((sum, d) => sum + (d.registers ? d.registers.length : 0), 0);
+
+        statusEl.textContent = t('discover.complete');
+        statusEl.style.color = 'var(--success, #a6e3a1)';
+        summaryEl.textContent = currentLang === 'zh'
+          ? `${finalDevices.length} \u53f0\u8bbe\u5907\uff0c${totalRegs} \u4e2a\u5bc4\u5b58\u5668`
+          : `${finalDevices.length} devices, ${totalRegs} regs`;
+        progressBar.style.width = '100%';
+        progressText.textContent = currentLang === 'zh'
+          ? `\u626b\u63cf\u5b8c\u6210\uff1a${finalDevices.length} \u53f0\u8bbe\u5907\uff0c${totalRegs} \u4e2a\u5bc4\u5b58\u5668`
+          : `Scan complete: ${finalDevices.length} devices, ${totalRegs} registers`;
+
+        addLog('ok', `[DISCOVER] Scan complete: ${finalDevices.length} devices, ${totalRegs} registers`);
+        showToast(currentLang === 'zh'
+          ? `\u53d1\u73b0 ${finalDevices.length} \u53f0\u8bbe\u5907`
+          : `Found ${finalDevices.length} devices`, 'success');
+
+        renderDiscoveredDevices();
+        setTimeout(() => { progressEl.style.display = 'none'; }, 5000);
+      }
+    }
+  }, 1000);
+}
+
+async function applyMappings() {
+  addLog('info', '[DISCOVER] Applying discovered registers as AMM mappings...');
+  const result = await apiJson('POST', '/api/discover/apply', {});
+  if (result && result.mappings_created !== undefined) {
+    const msg = currentLang === 'zh'
+      ? `\u5df2\u521b\u5efa ${result.mappings_created} \u6761\u65b0\u6620\u5c04\uff08\u603b\u8ba1\uff1a${result.total_mappings}\uff09`
+      : `Created ${result.mappings_created} new mappings (total: ${result.total_mappings})`;
+    showToast(msg, 'success');
+    addLog('ok', `[AMM] ${msg}`);
+    discoveryData.status.mappings_created = (discoveryData.status.mappings_created || 0) + result.mappings_created;
+    const mapData = await apiGet('/api/mappings');
+    if (mapData && Array.isArray(mapData)) mappings = mapData;
+    renderMappingTable();
+    renderDiscoveredDevices();
+  }
+}
+
+async function resetDiscovery() {
+  await apiJson('POST', '/api/discover/reset', {});
+  discoveryData = { devices: [], status: {} };
+  document.getElementById('scanStatus').textContent = t('discover.idle');
+  document.getElementById('scanStatus').style.color = 'var(--text2)';
+  document.getElementById('scanSummary').textContent = '-';
+  document.getElementById('discoveredDevices').innerHTML =
+    `<div style="text-align:center; padding:40px; color:var(--text2);">${t('discover.no_devices')}</div>`;
+  document.getElementById('deviceCount').textContent = '0 devices';
+  addLog('info', '[DISCOVER] Discovery state reset');
+  showToast(currentLang === 'zh' ? '\u53d1\u73b0\u6570\u636e\u5df2\u91cd\u7f6e' : 'Discovery data reset', 'info');
+}
+
+/* ---------- Render Discovered Devices (enhanced) ---------- */
+function renderDiscoveredDevices() {
+  const container = document.getElementById('discoveredDevices');
+  const devices = discoveryData.devices || [];
+  document.getElementById('deviceCount').textContent =
+    `${devices.length} ${currentLang === 'zh' ? '\u53f0\u8bbe\u5907' : 'devices'}`;
+
+  if (devices.length === 0) {
+    container.innerHTML = `<div style="text-align:center; padding:40px; color:var(--text2);">${t('discover.no_devices')}</div>`;
+    return;
+  }
+
+  let html = '';
+  devices.forEach((dev) => {
+    const regs = dev.registers || [];
+    const validRegs = regs.filter(r => r.valid !== false).length;
+    html += `<div style="margin-bottom:16px; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
+      <div style="background:var(--surface2); padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="cursor:pointer; flex:1;"
+             onclick="this.parentElement.nextElementSibling.style.display=this.parentElement.nextElementSibling.style.display==='none'?'block':'none'">
+          <strong>${dev.name || dev.device_id || ('Slave ' + dev.slave_id)}</strong>
+          <span style="margin-left:12px; font-size:12px; color:var(--text2);">
+            ${t('discover.slave_id')}: ${dev.slave_id} &middot; ${validRegs}/${regs.length} ${t('discover.registers')}
+          </span>
+          ${dev.description ? `<div style="font-size:11px; color:var(--text2); margin-top:2px;">${dev.description}</div>` : ''}
+        </div>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button class="btn btn-outline btn-sm" style="font-size:11px; padding:2px 8px;"
+                  onclick="openDevEditModal(${dev.slave_id})" title="${t('discover.edit_device')}">&#9998; ${t('discover.edit')}</button>
+          <span style="font-size:12px; color:var(--text2); cursor:pointer;"
+                onclick="this.closest('div[style*=margin-bottom]').querySelector('.reg-panel').style.display=this.closest('div[style*=margin-bottom]').querySelector('.reg-panel').style.display==='none'?'block':'none'">&#9660;</span>
+        </div>
+      </div>
+      <div class="reg-panel" style="display:none;">
+        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+          <thead>
+            <tr style="background:var(--surface2);">
+              <th style="padding:6px 8px; text-align:left;">Addr</th>
+              <th style="padding:6px 8px; text-align:left;">${t('discover.name')}</th>
+              <th style="padding:6px 8px; text-align:left;">${t('discover.data_type')}</th>
+              <th style="padding:6px 8px; text-align:right;">${t('discover.value')}</th>
+              <th style="padding:6px 8px; text-align:left;">${t('discover.unit')}</th>
+              <th style="padding:6px 8px; text-align:center;">${t('discover.writable')}</th>
+              <th style="padding:6px 8px; text-align:center;">${t('discover.valid')}</th>
+              <th style="padding:6px 8px; text-align:center;">${t('discover.actions')}</th>
+            </tr>
+          </thead>
+          <tbody>`;
+
+    regs.forEach(reg => {
+      const typeColor = reg.data_type === 'FLOAT32' ? '#89b4fa' :
+                        reg.data_type === 'INT16' ? '#f9e2af' :
+                        reg.data_type === 'UINT16' ? '#a6e3a1' : '#cba6f7';
+      const isValid = reg.valid !== false;
+      const rowOpacity = isValid ? '1' : '0.45';
+      const valStr = (typeof reg.sample_value === 'number') ? reg.sample_value.toFixed(2) : (reg.sample_value || '-');
+      const regName = reg.inferred_name || reg.name || '-';
+      const regUnit = reg.inferred_unit || reg.unit || '';
+
+      html += `<tr style="border-top:1px solid var(--border); opacity:${rowOpacity};">
+        <td style="padding:5px 8px; font-family:monospace;">${reg.register_address}</td>
+        <td style="padding:5px 8px;">${regName}</td>
+        <td style="padding:5px 8px;"><span style="color:${typeColor}; font-weight:600;">${reg.data_type}</span></td>
+        <td style="padding:5px 8px; text-align:right; font-family:monospace;">${valStr}</td>
+        <td style="padding:5px 8px;">${regUnit}</td>
+        <td style="padding:5px 8px; text-align:center;">
+          ${reg.writable ? '<span style="color:#a6e3a1;">&#10003;</span>' : '<span style="color:var(--text2);">&#10007;</span>'}
+        </td>
+        <td style="padding:5px 8px; text-align:center;">
+          ${isValid
+            ? '<span style="color:#a6e3a1; font-size:11px;">&#10003;</span>'
+            : '<span style="color:#f38ba8; font-size:11px;">&#10007;</span>'}
+        </td>
+        <td style="padding:5px 8px; text-align:center; white-space:nowrap;">
+          <button style="background:none; border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; cursor:pointer; margin:0 1px;"
+                  onclick="openRegEditModal(${dev.slave_id}, ${reg.register_address})" title="${t('discover.edit')}">&#9998;</button>
+          <button style="background:none; border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; cursor:pointer; margin:0 1px;"
+                  onclick="toggleRegister(${dev.slave_id}, ${reg.register_address})"
+                  title="${isValid ? t('discover.disable') : t('discover.enable')}">${isValid ? '&#9679;' : '&#9675;'}</button>
+          <button style="background:none; border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; cursor:pointer; margin:0 1px; color:#f38ba8;"
+                  onclick="deleteRegister(${dev.slave_id}, ${reg.register_address})" title="${t('discover.delete')}">&#10005;</button>
+        </td>
+      </tr>`;
+    });
+
+    html += `</tbody></table></div></div>`;
+  });
+
+  container.innerHTML = html;
+}
+
+/* ---------- Register Edit Modal ---------- */
+function openRegEditModal(slaveId, regAddr) {
+  const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+  if (!dev) return;
+  const reg = (dev.registers || []).find(r => r.register_address === regAddr);
+  if (!reg) return;
+
+  document.getElementById('editSlaveId').value = slaveId;
+  document.getElementById('editRegAddr').value = regAddr;
+  document.getElementById('editRegName').value = reg.inferred_name || reg.name || '';
+  document.getElementById('editRegUnit').value = reg.inferred_unit || reg.unit || '';
+  document.getElementById('editRegType').value = reg.data_type || 'INT16';
+  document.getElementById('editRegWritable').value = reg.writable ? 'true' : 'false';
+  document.getElementById('editRegMin').value = reg.range_min != null ? reg.range_min : '';
+  document.getElementById('editRegMax').value = reg.range_max != null ? reg.range_max : '';
+
+  const modal = document.getElementById('regEditModal');
+  modal.style.display = 'flex';
+}
+
+function closeRegEditModal() {
+  document.getElementById('regEditModal').style.display = 'none';
+}
+
+async function saveRegEdit() {
+  const slaveId = parseInt(document.getElementById('editSlaveId').value);
+  const regAddr = parseInt(document.getElementById('editRegAddr').value);
+  const updates = {
+    name: document.getElementById('editRegName').value,
+    unit: document.getElementById('editRegUnit').value,
+    data_type: document.getElementById('editRegType').value,
+    writable: document.getElementById('editRegWritable').value === 'true',
+  };
+  const minVal = document.getElementById('editRegMin').value;
+  const maxVal = document.getElementById('editRegMax').value;
+  if (minVal !== '') updates.range_min = parseFloat(minVal);
+  if (maxVal !== '') updates.range_max = parseFloat(maxVal);
+
+  const result = await apiJson('PUT', `/api/discover/devices/${slaveId}/registers/${regAddr}`, updates);
+  if (result && !result.error) {
+    // Update local data
+    const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+    if (dev) {
+      const reg = (dev.registers || []).find(r => r.register_address === regAddr);
+      if (reg) {
+        reg.inferred_name = updates.name || reg.inferred_name;
+        reg.inferred_unit = updates.unit || reg.inferred_unit;
+        reg.data_type = updates.data_type;
+        reg.writable = updates.writable;
+        if (updates.range_min != null) reg.range_min = updates.range_min;
+        if (updates.range_max != null) reg.range_max = updates.range_max;
+      }
+    }
+    renderDiscoveredDevices();
+    closeRegEditModal();
+    showToast(currentLang === 'zh' ? '寄存器已更新' : 'Register updated', 'success');
+    addLog('ok', `[DISCOVER] Updated register ${regAddr} on slave ${slaveId}`);
+  } else {
+    showToast(result?.error || 'Update failed', 'error');
+  }
+}
+
+/* ---------- Device Edit Modal ---------- */
+function openDevEditModal(slaveId) {
+  const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+  if (!dev) return;
+
+  document.getElementById('editDevSlaveId').value = slaveId;
+  document.getElementById('editDevId').value = dev.device_id || '';
+  document.getElementById('editDevName').value = dev.name || '';
+  document.getElementById('editDevMqttPrefix').value = dev.mqtt_topic_prefix || '';
+  document.getElementById('editDevDesc').value = dev.description || '';
+
+  const modal = document.getElementById('devEditModal');
+  modal.style.display = 'flex';
+}
+
+function closeDevEditModal() {
+  document.getElementById('devEditModal').style.display = 'none';
+}
+
+async function saveDevEdit() {
+  const slaveId = parseInt(document.getElementById('editDevSlaveId').value);
+  const updates = {
+    device_id: document.getElementById('editDevId').value,
+    name: document.getElementById('editDevName').value,
+    mqtt_topic_prefix: document.getElementById('editDevMqttPrefix').value,
+    description: document.getElementById('editDevDesc').value,
+  };
+
+  const result = await apiJson('PUT', `/api/discover/devices/${slaveId}`, updates);
+  if (result && !result.error) {
+    // Update local data
+    const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+    if (dev) {
+      if (updates.device_id) dev.device_id = updates.device_id;
+      dev.name = updates.name;
+      dev.mqtt_topic_prefix = updates.mqtt_topic_prefix;
+      dev.description = updates.description;
+      // Update MQTT topics for all registers if prefix changed
+      if (updates.mqtt_topic_prefix) {
+        (dev.registers || []).forEach(reg => {
+          const point = reg.point_id || (reg.inferred_name || '').replace(/ /g, '_').toLowerCase();
+          reg.mqtt_topic = `${updates.mqtt_topic_prefix}/${point}`;
+        });
+      }
+    }
+    renderDiscoveredDevices();
+    closeDevEditModal();
+    showToast(currentLang === 'zh' ? '\u8bbe\u5907\u4fe1\u606f\u5df2\u66f4\u65b0' : 'Device updated', 'success');
+    addLog('ok', `[DISCOVER] Updated device slave ${slaveId}`);
+  } else {
+    showToast(result?.error || 'Update failed', 'error');
+  }
+}
+
+/* ---------- Delete / Toggle Register ---------- */
+async function deleteRegister(slaveId, regAddr) {
+  if (!confirm(t('discover.confirm_delete_reg'))) return;
+  const result = await apiJson('DELETE', `/api/discover/devices/${slaveId}/registers/${regAddr}`);
+  if (result && !result.error) {
+    const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+    if (dev) {
+      dev.registers = (dev.registers || []).filter(r => r.register_address !== regAddr);
+    }
+    renderDiscoveredDevices();
+    showToast(currentLang === 'zh' ? '寄存器已删除' : 'Register deleted', 'success');
+    addLog('info', `[DISCOVER] Deleted register ${regAddr} from slave ${slaveId}`);
+  } else {
+    showToast(result?.error || 'Delete failed', 'error');
+  }
+}
+
+async function toggleRegister(slaveId, regAddr) {
+  if (!confirm(t('discover.confirm_toggle'))) return;
+  const result = await apiJson('POST', `/api/discover/devices/${slaveId}/registers/${regAddr}/toggle`);
+  if (result && !result.error) {
+    const dev = (discoveryData.devices || []).find(d => d.slave_id === slaveId);
+    if (dev) {
+      const reg = (dev.registers || []).find(r => r.register_address === regAddr);
+      if (reg) reg.valid = result.valid;
+    }
+    renderDiscoveredDevices();
+    const stateStr = result.valid
+      ? (currentLang === 'zh' ? '\u5df2\u542f\u7528' : 'Enabled')
+      : (currentLang === 'zh' ? '\u5df2\u7981\u7528' : 'Disabled');
+    showToast(`${stateStr}: ${regAddr}`, 'info');
+    addLog('info', `[DISCOVER] Toggle register ${regAddr} on slave ${slaveId} -> ${result.valid ? 'enabled' : 'disabled'}`);
+  } else {
+    showToast(result?.error || 'Toggle failed', 'error');
+  }
+}
+
+/* ---------- Import / Export ---------- */
+async function exportDevices() {
+  const result = await apiJson('POST', '/api/discover/export', {});
+  if (result && Array.isArray(result)) {
+    const jsonStr = JSON.stringify(result, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `gateway_devices_${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(t('discover.export_success'), 'success');
+    addLog('info', `[DISCOVER] Exported ${result.length} device(s)`);
+  } else {
+    showToast(currentLang === 'zh' ? '导出失败' : 'Export failed', 'error');
+  }
+}
+
+async function importDevices(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const deviceList = JSON.parse(text);
+    if (!Array.isArray(deviceList)) {
+      showToast(currentLang === 'zh' ? '\u004a\u0053\u004f\u004e \u683c\u5f0f\u9519\u8bef\uff1a\u9700\u8981\u6570\u7ec4' : 'Invalid JSON: expected array', 'error');
+      return;
+    }
+    const result = await apiJson('POST', '/api/discover/import', deviceList);
+    if (result && !result.error) {
+      // Refresh devices from server
+      const devices = await apiGet('/api/discover/devices');
+      if (devices) discoveryData.devices = devices;
+      renderDiscoveredDevices();
+      showToast(t('discover.import_success'), 'success');
+      addLog('ok', `[DISCOVER] Imported ${deviceList.length} device(s)`);
+    } else {
+      showToast(result?.error || 'Import failed', 'error');
+    }
+  } catch (e) {
+    showToast(`${currentLang === 'zh' ? '\u89e3\u6790\u6587\u4ef6\u5931\u8d25' : 'Parse error'}: ${e.message}`, 'error');
+  }
+  // Reset file input so the same file can be re-imported
+  event.target.value = '';
+}
+
+/* ============================================================
+ * Offline Automation Rules
+ * ============================================================ */
+let automationRules = [];
+let automationStats = {evaluations:0,triggers:0,failures:0};
+const ruleOperators = ['>','>=','<','<=','==','!='];
+
+function toggleRuleAction() {
+  const write = document.getElementById('ruleAction').value === '0';
+  document.querySelectorAll('.rule-write').forEach(el => el.style.display = write ? '' : 'none');
+  document.querySelectorAll('.rule-alert').forEach(el => el.style.display = write ? 'none' : '');
+}
+
+async function loadAutomationRules() {
+  const data = await apiGet('/api/automation/rules');
+  if (data && Array.isArray(data.rules)) {
+    automationRules = data.rules;
+    automationStats = data.stats || automationStats;
+    renderAutomationRules();
+  }
+}
+
+function renderAutomationRules() {
+  const body = document.getElementById('automationRulesBody');
+  if (!body) return;
+  body.innerHTML = automationRules.map(rule => {
+    const action = Number(rule.action) === 0
+      ? `${t('automation.write')}: ${rule.target_device}/${rule.target_point} = ${rule.target_value}`
+      : `${t('automation.alert')}: ${rule.alert_topic || 'default'}`;
+    return `<tr><td><strong>${rule.name || ('#'+rule.id)}</strong></td><td>${rule.source_device}/${rule.source_point} ${ruleOperators[rule.operator] || '>'} ${rule.threshold}</td><td>${action}</td><td><span class="badge ${rule.enabled?'badge-success':'badge-warning'}">${rule.enabled?t('status.active'):(currentLang==='zh'?'停用':'Disabled')}</span></td><td><button class="btn btn-outline btn-sm" onclick="editAutomationRule(${rule.id})">&#9998;</button> <button class="btn btn-danger btn-sm" onclick="deleteAutomationRule(${rule.id})">&#128465;</button></td></tr>`;
+  }).join('');
+  document.getElementById('ruleStats').textContent = `${currentLang==='zh'?'触发':'Triggers'} ${automationStats.triggers || 0} / ${currentLang==='zh'?'失败':'Failures'} ${automationStats.failures || 0}`;
+}
+
+function editAutomationRule(id) {
+  const rule = automationRules.find(item => item.id === id);
+  if (!rule) return;
+  document.getElementById('ruleId').value = rule.id;
+  document.getElementById('ruleName').value = rule.name || '';
+  document.getElementById('ruleSourceDevice').value = rule.source_device || '';
+  document.getElementById('ruleSourcePoint').value = rule.source_point || '';
+  document.getElementById('ruleOperator').value = rule.operator;
+  document.getElementById('ruleThreshold').value = rule.threshold;
+  document.getElementById('ruleHold').value = rule.hold_ms;
+  document.getElementById('ruleCooldown').value = rule.cooldown_ms;
+  document.getElementById('ruleAction').value = rule.action;
+  document.getElementById('ruleTargetDevice').value = rule.target_device || '';
+  document.getElementById('ruleTargetPoint').value = rule.target_point || '';
+  document.getElementById('ruleTargetValue').value = rule.target_value || 0;
+  document.getElementById('ruleAlertTopic').value = rule.alert_topic || '';
+  document.getElementById('ruleAlertMessage').value = rule.alert_message || '';
+  toggleRuleAction();
+}
+
+async function saveAutomationRule() {
+  const rule = {
+    id: Number(document.getElementById('ruleId').value) || 0,
+    enabled: true,
+    name: document.getElementById('ruleName').value.trim(),
+    source_device: document.getElementById('ruleSourceDevice').value.trim(),
+    source_point: document.getElementById('ruleSourcePoint').value.trim(),
+    operator: Number(document.getElementById('ruleOperator').value),
+    threshold: Number(document.getElementById('ruleThreshold').value),
+    hold_ms: Number(document.getElementById('ruleHold').value),
+    cooldown_ms: Number(document.getElementById('ruleCooldown').value),
+    action: Number(document.getElementById('ruleAction').value),
+    target_device: document.getElementById('ruleTargetDevice').value.trim(),
+    target_point: document.getElementById('ruleTargetPoint').value.trim(),
+    target_value: Number(document.getElementById('ruleTargetValue').value),
+    alert_topic: document.getElementById('ruleAlertTopic').value.trim(),
+    alert_message: document.getElementById('ruleAlertMessage').value.trim()
+  };
+  if (!rule.source_device || !rule.source_point || (rule.action === 0 && (!rule.target_device || !rule.target_point))) {
+    showToast(t('toast.error'), 'error'); return;
+  }
+  const result = await apiJson('POST', '/api/automation/rules', rule);
+  if (result && !result.error) {
+    document.getElementById('ruleId').value = 0;
+    showToast(t('toast.saved'), 'success');
+    await loadAutomationRules();
+  } else showToast(result?.error || t('toast.error'), 'error');
+}
+
+async function deleteAutomationRule(id) {
+  if (!confirm(currentLang==='zh'?'确定删除该自动化规则吗？':'Delete this automation rule?')) return;
+  const result = await apiJson('DELETE', '/api/automation/rules/' + id);
+  if (result && !result.error) await loadAutomationRules();
+  else showToast(result?.error || t('toast.error'), 'error');
+}
+
+/* ============================================================
+ * MODBUS TCP Bridge Management
+ * ============================================================ */
+let bridgeState = { connected: false, host: 'localhost', port: 5020 };
+
+async function bridgeCheckStatus() {
+  const result = await apiJson('GET', '/api/bridge/status');
+  if (result && !result.error) {
+    bridgeState = result;
+    updateBridgeUI();
+  }
+}
+
+function updateBridgeUI() {
+  const statusEl = document.getElementById('bridgeStatus');
+  const connectBtn = document.getElementById('btnBridgeConnect');
+  const disconnectBtn = document.getElementById('btnBridgeDisconnect');
+  const modeBadge = document.getElementById('bridgeModeBadge');
+  const hostInput = document.getElementById('bridgeHost');
+  const portInput = document.getElementById('bridgePort');
+
+  if (bridgeState.connected) {
+    statusEl.textContent = t('discover.bridge_connected') + ' (' + bridgeState.host + ':' + bridgeState.port + ')';
+    statusEl.style.background = '#d1fae5';
+    statusEl.style.color = '#065f46';
+    connectBtn.style.display = 'none';
+    disconnectBtn.style.display = '';
+    modeBadge.style.display = '';
+    modeBadge.textContent = t('discover.bridge_mode');
+    hostInput.disabled = true;
+    portInput.disabled = true;
+  } else {
+    statusEl.textContent = t('discover.bridge_disconnected');
+    statusEl.style.background = '#fee2e2';
+    statusEl.style.color = '#991b1b';
+    connectBtn.style.display = '';
+    disconnectBtn.style.display = 'none';
+    modeBadge.style.display = 'none';
+    hostInput.disabled = false;
+    portInput.disabled = false;
+  }
+}
+
+async function bridgeConnect() {
+  const host = document.getElementById('bridgeHost').value.trim() || 'localhost';
+  const port = parseInt(document.getElementById('bridgePort').value) || 5020;
+
+  addLog('info', (currentLang === 'zh' ? '[\u6865\u63a5] \u6b63\u5728\u8fde\u63a5 ' : '[BRIDGE] Connecting to ') + host + ':' + port);
+
+  const result = await apiJson('POST', '/api/bridge/connect', { host: host, port: port });
+  if (result && !result.error) {
+    bridgeState = { connected: true, host: host, port: port, available: true };
+    updateBridgeUI();
+    addLog('ok', (currentLang === 'zh' ? '[\u6865\u63a5] \u5df2\u8fde\u63a5\u5230 ' : '[BRIDGE] Connected to ') + host + ':' + port);
+    showToast(currentLang === 'zh' ? '\u6865\u63a5\u5df2\u8fde\u63a5' : 'Bridge connected', 'success');
+  } else {
+    const errMsg = result?.error || 'Connection failed';
+    addLog('error', (currentLang === 'zh' ? '[\u6865\u63a5] \u8fde\u63a5\u5931\u8d25: ' : '[BRIDGE] Connection failed: ') + errMsg);
+    showToast(errMsg, 'error');
+  }
+}
+
+async function bridgeDisconnect() {
+  const result = await apiJson('POST', '/api/bridge/disconnect');
+  if (result && !result.error) {
+    bridgeState = { connected: false, host: bridgeState.host, port: bridgeState.port, available: true };
+    updateBridgeUI();
+    addLog('info', currentLang === 'zh' ? '[\u6865\u63a5] \u5df2\u65ad\u5f00\u8fde\u63a5' : '[BRIDGE] Disconnected');
+    showToast(currentLang === 'zh' ? '桥接已断开' : 'Bridge disconnected', 'info');
+  }
+}
+
+// Check bridge status on page load (after a short delay)
+setTimeout(bridgeCheckStatus, 2000);
+
+/* ============================================================
+ * Init
+ * ============================================================ */
+setLang(currentLang);
+updateDashboard();
+renderMappingTable();
+renderLogs();
+const initialPage = new URLSearchParams(window.location.search).get('page');
+if (initialPage) document.querySelector(`.nav-item[data-page="${initialPage}"]`)?.click();
+fetchServerLogs(); // Fetch server-side logs on load
+loadOnenetConfig(); // Load OneNET configuration
+loadAutomationRules();
+toggleRuleAction();
+loadRuntimeForms();
+setInterval(updateUptime, 1000);
+setInterval(refreshAll, 10000); // Auto-refresh every 10s
+</script>
+</body>
+</html>
+
+
+

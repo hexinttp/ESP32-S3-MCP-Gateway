@@ -1,0 +1,16 @@
+# ESP-IDF build output and downloaded managed components
+build/
+managed_components/
+sdkconfig.old
+
+# Python caches and local service output
+__pycache__/
+*.py[cod]
+*.log
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

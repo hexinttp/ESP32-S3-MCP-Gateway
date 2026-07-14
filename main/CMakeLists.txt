@@ -1,0 +1,30 @@
+﻿idf_component_register(
+    SRCS "main.c"
+         "board/board.c"
+         "board/ethernet_w5500.c"
+         "board/lcd_st7735.c"
+         "board/tf_storage.c"
+         "config/runtime_config.c"
+         "network/network_manager.c"
+         "storage/offline_store.c"
+         "storage/history_store.c"
+         "tcm/tcm_context.c"
+         "tcm/tcm_state_pool.c"
+         "modbus/modbus_access.c"
+         "modbus/modbus_discover.c"
+         "amm/amm_mapping.c"
+         "mqtt_comm/mqtt_handler.c"
+         "uif/uif_persistence.c"
+         "scheduler/scheduler.c"
+         "eval/eval_logger.c"
+         "services/control_service.c"
+         "automation/automation_engine.c"
+         "automation/automation_web.c"
+         "mcp/mcp_http.c"
+         "web/web_server.c"
+    INCLUDE_DIRS "." "web"
+    REQUIRES driver esp_wifi esp_event esp_netif esp_eth lwip nvs_flash mqtt esp-modbus esp_timer
+             fatfs wear_levelling sdmmc esp_driver_sdmmc esp_http_server json
+    EMBED_FILES "../web/web_config.html"
+)
+
