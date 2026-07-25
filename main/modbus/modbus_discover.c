@@ -9,6 +9,7 @@
 #include "modbus_discover.h"
 #include "modbus_access.h"
 #include "amm/amm_mapping.h"
+#include "scheduler/scheduler.h"
 #include "gateway_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,6 +83,15 @@ static uint8_t append_unique_u8(uint8_t *values, uint8_t count, uint8_t value)
     return count;
 }
 
+static uint8_t append_unique_u16(uint16_t *values, uint8_t count, uint16_t value)
+{
+    for (uint8_t i = 0; i < count; ++i) {
+        if (values[i] == value) return count;
+    }
+    values[count++] = value;
+    return count;
+}
+
 static uint8_t build_count_order(uint8_t preferred, uint8_t *counts)
 {
     uint8_t count = 0;
@@ -143,16 +153,64 @@ static esp_err_t discover_probe_address(const discover_scan_params_t *params,
 static esp_err_t discover_probe_device(const discover_scan_params_t *params,
                                        uint8_t slave_id, discover_probe_t *probe)
 {
-    uint16_t addresses[3];
+    static const uint16_t common_register_entries[] = {
+        40001, /* Generic holding register offset 0 */
+        40002, /* Common meters, including PAC3200 */
+        43000, /* Schneider iEM series */
+        43202, /* Variable-frequency drives */
+        48193, /* Omron E5 series */
+        59001, /* Power-quality meters */
+        30001, /* Generic input register offset 0 */
+    };
+    uint16_t addresses[12];
     uint8_t address_count = 0;
-    addresses[address_count++] = params->reg_start;
-    if (params->reg_start != 1) addresses[address_count++] = 1;
-    if (params->reg_start != 0) addresses[address_count++] = 0;
+    address_count = append_unique_u16(addresses, address_count, params->reg_start);
+    address_count = append_unique_u16(addresses, address_count, 1);
+    address_count = append_unique_u16(addresses, address_count, 0);
+    for (size_t i = 0;
+         i < sizeof(common_register_entries) / sizeof(common_register_entries[0]);
+         ++i) {
+        address_count = append_unique_u16(
+            addresses, address_count, common_register_entries[i]);
+    }
+
+    uint8_t functions[2];
+    uint8_t function_count = build_function_order(params, 0, functions);
+    uint8_t invalid_responses = 0;
 
     for (uint8_t i = 0; i < address_count; ++i) {
-        esp_err_t err = discover_probe_address(params, slave_id, addresses[i],
-                                               0, 0, probe);
-        if (err == ESP_OK) return ESP_OK;
+        for (uint8_t fi = 0; fi < function_count; ++fi) {
+            memset(probe, 0, sizeof(*probe));
+            esp_err_t err = discover_read_registers(
+                params->source_protocol, params->channel_id, slave_id,
+                functions[fi], addresses[i], 1, probe->values);
+            if (err == ESP_OK) {
+                probe->function_code = functions[fi];
+                probe->address = addresses[i];
+                probe->register_count = 1;
+                return ESP_OK;
+            }
+            if (err == ESP_ERR_INVALID_RESPONSE) {
+                ++invalid_responses;
+            }
+        }
+
+        /*
+         * An absent RTU slave times out for both functions. Avoid probing every
+         * profile address in that case. A present device normally returns data
+         * or a Modbus exception (reported by esp-modbus as INVALID_RESPONSE).
+         */
+        if (i == 0 && invalid_responses == 0) {
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    if (invalid_responses >= 2) {
+        memset(probe, 0, sizeof(*probe));
+        probe->function_code = functions[0];
+        probe->address = params->reg_start;
+        probe->register_count = 0;
+        return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
 }
@@ -386,7 +444,9 @@ static void bus_scan_task(void *argument)
         .fc_count = 2,
         .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
     };
+    scheduler_pause_modbus_polling(true);
     scan_bus_sync(&params);
+    scheduler_pause_modbus_polling(false);
     s_scan_task = NULL;
     vTaskDelete(NULL);
 }
@@ -554,6 +614,7 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
 {
     uint16_t r_start = params->reg_start;
     uint16_t r_end = params->reg_end;
+    uint32_t scan_span = (uint32_t)r_end - r_start;
     s_result.registers_found = 0;
     s_result.mappings_created = 0;
 
@@ -564,7 +625,18 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
     /* Phase 2: Register scan for each discovered device */
     for (int i = 0; i < s_device_count; i++) {
         if (s_devices[i].active) {
-            modbus_discover_scan_device(s_devices[i].slave_id, r_start, r_end);
+            uint16_t device_start = r_start;
+            uint16_t device_end = r_end;
+            if (s_devices[i].probe_register_count > 0 &&
+                (s_devices[i].probe_address < r_start ||
+                 s_devices[i].probe_address > r_end)) {
+                device_start = s_devices[i].probe_address;
+                uint32_t candidate_end = (uint32_t)device_start + scan_span;
+                device_end = candidate_end > UINT16_MAX
+                    ? UINT16_MAX : (uint16_t)candidate_end;
+            }
+            modbus_discover_scan_device(
+                s_devices[i].slave_id, device_start, device_end);
         }
     }
 
@@ -576,7 +648,9 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
 static void full_scan_task(void *argument)
 {
     (void)argument;
+    scheduler_pause_modbus_polling(true);
     full_scan_sync(&s_full_request);
+    scheduler_pause_modbus_polling(false);
     s_result.scan_in_progress = false;
     s_result.scan_complete = true;
     s_scan_task = NULL;

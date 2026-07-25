@@ -1,8 +1,9 @@
 ﻿<!DOCTYPE html>
 <html lang="zh">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:,">
 <title>ESP32-S3 Gateway Configuration</title>
 <style>
 /* ============================================================
@@ -2122,11 +2123,18 @@ function renderModbusLogs() {
   }).join('');
 }
 
+let modbusLogFetchInProgress = false;
 async function fetchModbusLogs() {
-  const data = await apiGet('/api/modbus/logs');
-  if (Array.isArray(data)) {
-    modbusLogEntries = data;
-    renderModbusLogs();
+  if (modbusLogFetchInProgress) return;
+  modbusLogFetchInProgress = true;
+  try {
+    const data = await apiGet('/api/modbus/logs');
+    if (Array.isArray(data)) {
+      modbusLogEntries = data;
+      renderModbusLogs();
+    }
+  } finally {
+    modbusLogFetchInProgress = false;
   }
 }
 
@@ -2196,30 +2204,43 @@ async function refreshAll() {
   if (refreshInProgress || document.hidden) return;
   refreshInProgress = true;
   try {
+    const activePage = document.querySelector('.page-section.active')?.id || 'page-dashboard';
     const status = await apiGet('/api/system/status');
     if (status) {
       Object.assign(systemState, status);
     }
-    const mapData = await apiGet('/api/mappings');
-    if (Array.isArray(mapData)) {
-      mappings = mapData;
+
+    if (activePage === 'page-dashboard' || activePage === 'page-mapping') {
+      const mapData = await apiGet('/api/mappings');
+      if (Array.isArray(mapData)) {
+        mappings = mapData;
+      }
     }
-    await fetchServerLogs();
-    if (document.getElementById('page-logs')?.classList.contains('active')) {
+
+    if (activePage === 'page-logs') {
+      await fetchServerLogs();
       await fetchModbusLogs();
     }
+
     updateDashboard();
     renderMappingTable();
 
-    const discStatus = await apiGet('/api/discover/status');
-    if (discStatus) discoveryData.status = discStatus;
-    const discDevices = await apiGet('/api/discover/devices');
-    if (discDevices) {
-      discoveryData.devices = discDevices;
-      renderDiscoveredDevices();
+    if (activePage === 'page-discover') {
+      const discStatus = await apiGet('/api/discover/status');
+      if (discStatus) discoveryData.status = discStatus;
+      const discDevices = await apiGet('/api/discover/devices');
+      if (discDevices) {
+        discoveryData.devices = discDevices;
+        renderDiscoveredDevices();
+      }
     }
-    await bridgeCheckStatus();
-    await loadAutomationRules();
+
+    if (activePage === 'page-modbus') {
+      await bridgeCheckStatus();
+    }
+    if (activePage === 'page-automation') {
+      await loadAutomationRules();
+    }
   } finally {
     refreshInProgress = false;
   }

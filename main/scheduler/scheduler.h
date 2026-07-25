@@ -6,6 +6,7 @@
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -49,6 +50,14 @@ void scheduler_start(void);
  * @brief Stop and delete all scheduler tasks
  */
 void scheduler_stop(void);
+
+/**
+ * @brief Pause or resume periodic MODBUS polling.
+ *
+ * Discovery uses this to get exclusive logical access to the bus without
+ * stopping context, persistence, replay, or resource-monitor tasks.
+ */
+void scheduler_pause_modbus_polling(bool paused);
 
 /**
  * @brief Get current network state

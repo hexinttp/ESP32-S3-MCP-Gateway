@@ -49,6 +49,7 @@ static volatile network_state_t s_network_state = NET_OFFLINE;
 static SemaphoreHandle_t s_network_state_mutex  = NULL;
 
 static volatile bool s_running = false;
+static volatile bool s_modbus_poll_paused = false;
 
 /* ======================== Helper: Thread-safe network state ======================== */
 
@@ -90,6 +91,11 @@ static void modbus_poll_task(void *arg)
     }
 
     while (s_running) {
+        if (s_modbus_poll_paused) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         int mapping_count = amm_get_entries(mappings, AMM_MAX_MAPPING_ENTRIES);
         uint32_t model_version = amm_get_model_version();
         if (model_version != observed_model_version) {
@@ -551,6 +557,7 @@ void scheduler_stop(void)
 {
     ESP_LOGI(TAG, "Stopping scheduler tasks");
     s_running = false;
+    s_modbus_poll_paused = false;
 
     /* Give tasks time to exit their loops cleanly */
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -588,6 +595,13 @@ void scheduler_stop(void)
     }
 
     ESP_LOGI(TAG, "Scheduler stopped");
+}
+
+void scheduler_pause_modbus_polling(bool paused)
+{
+    s_modbus_poll_paused = paused;
+    ESP_LOGI(TAG, "MODBUS polling %s for device discovery",
+             paused ? "paused" : "resumed");
 }
 
 network_state_t scheduler_get_network_state(void)
