@@ -5,7 +5,6 @@
 
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 
 #include "modbus_discover.h"
 #include "modbus_access.h"
@@ -23,6 +22,140 @@ static discovered_device_t s_devices[DISCOVER_MAX_SLAVES];
 static uint16_t            s_device_count = 0;
 static discover_result_t   s_result;
 static TaskHandle_t        s_scan_task;
+
+static uint16_t discover_register_offset(uint8_t function_code, uint16_t configured_address)
+{
+    if ((function_code == 3 || function_code == 6 || function_code == 16) &&
+        configured_address >= 40001) {
+        return configured_address - 40001;
+    }
+    if (function_code == 4 && configured_address >= 30001 &&
+        configured_address < 40001) {
+        return configured_address - 30001;
+    }
+    return configured_address;
+}
+
+static esp_err_t discover_read_registers(source_protocol_t protocol, uint8_t channel_id,
+                                         uint8_t slave_id, uint8_t function_code,
+                                         uint16_t configured_address,
+                                         uint16_t reg_count, uint16_t *raw_regs)
+{
+    uint16_t offset = discover_register_offset(function_code, configured_address);
+    return modbus_read_channel(protocol, channel_id, slave_id, function_code,
+                               offset, reg_count, raw_regs);
+}
+
+static void discover_default_functions(discover_scan_params_t *params)
+{
+    if (params->fc_count == 0) {
+        params->function_codes[0] = 3;
+        params->function_codes[1] = 4;
+        params->fc_count = 2;
+    }
+    if (params->fc_count > 2) {
+        params->fc_count = 2;
+    }
+    for (uint8_t i = 0; i < params->fc_count; ++i) {
+        if (params->function_codes[i] != 3 && params->function_codes[i] != 4) {
+            params->function_codes[i] = i == 0 ? 3 : 4;
+        }
+    }
+    if (params->max_empty_gap == 0) {
+        params->max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP;
+    }
+}
+
+typedef struct {
+    uint8_t function_code;
+    uint16_t address;
+    uint8_t register_count;
+    uint16_t values[DISCOVER_MAX_BLOCK_REGS];
+} discover_probe_t;
+
+static uint8_t append_unique_u8(uint8_t *values, uint8_t count, uint8_t value)
+{
+    for (uint8_t i = 0; i < count; ++i) {
+        if (values[i] == value) return count;
+    }
+    values[count++] = value;
+    return count;
+}
+
+static uint8_t build_count_order(uint8_t preferred, uint8_t *counts)
+{
+    uint8_t count = 0;
+    if (preferred > 0 && preferred <= DISCOVER_MAX_BLOCK_REGS) {
+        count = append_unique_u8(counts, count, preferred);
+    }
+    count = append_unique_u8(counts, count, 1);
+    count = append_unique_u8(counts, count, 2);
+    count = append_unique_u8(counts, count, 4);
+    count = append_unique_u8(counts, count, 8);
+    return count;
+}
+
+static uint8_t build_function_order(const discover_scan_params_t *params,
+                                    uint8_t preferred, uint8_t *functions)
+{
+    uint8_t count = 0;
+    if (preferred == 3 || preferred == 4) {
+        count = append_unique_u8(functions, count, preferred);
+    }
+    for (uint8_t i = 0; i < params->fc_count; ++i) {
+        count = append_unique_u8(functions, count, params->function_codes[i]);
+    }
+    return count;
+}
+
+static esp_err_t discover_probe_address(const discover_scan_params_t *params,
+                                        uint8_t slave_id, uint16_t address,
+                                        uint8_t preferred_function,
+                                        uint8_t preferred_count,
+                                        discover_probe_t *probe)
+{
+    uint8_t counts[5];
+    uint8_t functions[2];
+    uint8_t count_count = build_count_order(preferred_count, counts);
+    uint8_t function_count = build_function_order(params, preferred_function, functions);
+
+    for (uint8_t ci = 0; ci < count_count; ++ci) {
+        uint8_t reg_count = counts[ci];
+        if ((uint32_t)address + reg_count > 65536U) continue;
+        for (uint8_t fi = 0; fi < function_count; ++fi) {
+            memset(probe, 0, sizeof(*probe));
+            esp_err_t err = discover_read_registers(params->source_protocol,
+                                                    params->channel_id,
+                                                    slave_id, functions[fi],
+                                                    address, reg_count,
+                                                    probe->values);
+            if (err == ESP_OK) {
+                probe->function_code = functions[fi];
+                probe->address = address;
+                probe->register_count = reg_count;
+                return ESP_OK;
+            }
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t discover_probe_device(const discover_scan_params_t *params,
+                                       uint8_t slave_id, discover_probe_t *probe)
+{
+    uint16_t addresses[3];
+    uint8_t address_count = 0;
+    addresses[address_count++] = params->reg_start;
+    if (params->reg_start != 1) addresses[address_count++] = 1;
+    if (params->reg_start != 0) addresses[address_count++] = 0;
+
+    for (uint8_t i = 0; i < address_count; ++i) {
+        esp_err_t err = discover_probe_address(params, slave_id, addresses[i],
+                                               0, 0, probe);
+        if (err == ESP_OK) return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
 
 /* ======================== Semantic Profile Database ======================== */
 
@@ -96,26 +229,6 @@ static const value_hint_t s_pressure_hints[] = {
  * Returns DT_FLOAT32 if the two registers form a valid IEEE 754 float
  * in a reasonable range; otherwise DT_UINT16 for single registers.
  */
-static data_type_t infer_data_type(uint16_t *raw_regs, uint16_t reg_addr)
-{
-    /* Try FLOAT32 interpretation (2 registers, big-endian word order) */
-    union { uint32_t u; float f; } conv;
-    conv.u = ((uint32_t)raw_regs[0] << 16) | raw_regs[1];
-
-    if (!isnan(conv.f) && isfinite(conv.f) &&
-        fabsf(conv.f) > 0.001f && fabsf(conv.f) < 1e8f) {
-        return DT_FLOAT32;
-    }
-
-    /* Check if value looks like signed 16-bit */
-    int16_t sv = (int16_t)raw_regs[0];
-    if (sv < 0) {
-        return DT_INT16;
-    }
-
-    return DT_UINT16;
-}
-
 /* ======================== Semantic Inference ======================== */
 
 void modbus_discover_infer_semantics(uint16_t reg_addr, float value,
@@ -189,13 +302,17 @@ void modbus_discover_reset(void)
 
 /* ======================== Broadcast Scan ======================== */
 
-static esp_err_t scan_bus_sync(uint8_t start, uint8_t end)
+static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
 {
+    uint8_t start = params->slave_start;
+    uint8_t end = params->slave_end;
     if (start < 1) start = 1;
     if (end > 247) end = 247;
     if (start > end) return ESP_ERR_INVALID_ARG;
 
-    ESP_LOGI(TAG, "Broadcast scan: slave IDs %u .. %u", start, end);
+    ESP_LOGI(TAG, "%s scan: channel=%u slave IDs %u .. %u",
+             params->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+             params->channel_id, start, end);
     s_result.scan_in_progress = true;
     s_result.total_scanned = end - start + 1;
 
@@ -203,25 +320,36 @@ static esp_err_t scan_bus_sync(uint8_t start, uint8_t end)
     memset(s_devices, 0, sizeof(s_devices));
     s_device_count = 0;
 
-    uint16_t raw_reg;
-    for (uint8_t sid = start; sid <= end; sid++) {
+    for (uint16_t sid = start; sid <= end; ++sid) {
+        discover_probe_t probe;
         /* Probe with FC03, address 0, count 1 — quick liveness check */
-        esp_err_t err = modbus_read_holding_register(sid, 0, 1, &raw_reg);
+        esp_err_t err = discover_probe_device(params, (uint8_t)sid, &probe);
         if (err == ESP_OK) {
             if (s_device_count < DISCOVER_MAX_SLAVES) {
                 discovered_device_t *dev = &s_devices[s_device_count];
-                dev->slave_id = sid;
+                dev->slave_id = (uint8_t)sid;
+                dev->source_protocol = params->source_protocol;
+                dev->channel_id = params->channel_id;
                 snprintf(dev->device_id, sizeof(dev->device_id),
-                         "device_slave_%02u", sid);
+                         "%s_ch%u_slave_%02u",
+                         params->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
+                         params->channel_id, (unsigned)sid);
                 dev->name[0] = '\0';  /* Empty — uses device_id as display name */
                 dev->description[0] = '\0';
                 snprintf(dev->mqtt_topic_prefix, sizeof(dev->mqtt_topic_prefix),
-                         "factory/data/device_slave_%02u", sid);
+                         "factory/data/%s_ch%u_slave_%02u",
+                         params->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
+                         params->channel_id, (unsigned)sid);
+                dev->probe_function_code = probe.function_code;
+                dev->probe_address = probe.address;
+                dev->probe_register_count = probe.register_count;
                 dev->active = true;
                 dev->reg_count = 0;
                 s_device_count++;
 
-                ESP_LOGI(TAG, "  Found slave %u (responded to probe)", sid);
+                ESP_LOGI(TAG, "  Found slave %u: FC%02u addr=%u count=%u",
+                         (unsigned)sid, probe.function_code, probe.address,
+                         probe.register_count);
             }
         }
     }
@@ -230,19 +358,35 @@ static esp_err_t scan_bus_sync(uint8_t start, uint8_t end)
     s_result.scan_in_progress = false;
     s_result.scan_complete = true;
 
-    ESP_LOGI(TAG, "Broadcast scan complete: %u devices found out of %u probed",
+    ESP_LOGI(TAG, "Bus scan complete: %u devices found out of %u probed",
              s_device_count, s_result.total_scanned);
     return ESP_OK;
 }
 
-typedef struct { uint8_t start; uint8_t end; } bus_scan_request_t;
+typedef struct {
+    source_protocol_t protocol;
+    uint8_t channel_id;
+    uint8_t start;
+    uint8_t end;
+} bus_scan_request_t;
 static bus_scan_request_t s_bus_request;
 static discover_scan_params_t s_full_request;
 
 static void bus_scan_task(void *argument)
 {
     (void)argument;
-    scan_bus_sync(s_bus_request.start, s_bus_request.end);
+    discover_scan_params_t params = {
+        .slave_start = s_bus_request.start,
+        .slave_end = s_bus_request.end,
+        .reg_start = 0,
+        .reg_end = 100,
+        .source_protocol = s_bus_request.protocol,
+        .channel_id = s_bus_request.channel_id,
+        .function_codes = {3, 4},
+        .fc_count = 2,
+        .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
+    };
+    scan_bus_sync(&params);
     s_scan_task = NULL;
     vTaskDelete(NULL);
 }
@@ -251,7 +395,12 @@ esp_err_t modbus_discover_scan_bus(uint8_t start, uint8_t end)
 {
     if (s_scan_task != NULL || s_result.scan_in_progress) return ESP_ERR_INVALID_STATE;
     if (start < 1 || end > 247 || start > end) return ESP_ERR_INVALID_ARG;
-    s_bus_request = (bus_scan_request_t){.start = start, .end = end};
+    s_bus_request = (bus_scan_request_t){
+        .protocol = SRC_MODBUS_RTU,
+        .channel_id = 0,
+        .start = start,
+        .end = end
+    };
     s_result.scan_in_progress = true;
     if (xTaskCreate(bus_scan_task, "mb_discover", 4096, NULL, 3, &s_scan_task) != pdPASS) {
         s_result.scan_in_progress = false;
@@ -269,7 +418,10 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
     /* Find or create device entry */
     discovered_device_t *dev = NULL;
     for (int i = 0; i < s_device_count; i++) {
-        if (s_devices[i].slave_id == slave_id && s_devices[i].active) {
+        if (s_devices[i].slave_id == slave_id &&
+            s_devices[i].source_protocol == s_full_request.source_protocol &&
+            s_devices[i].channel_id == s_full_request.channel_id &&
+            s_devices[i].active) {
             dev = &s_devices[i];
             break;
         }
@@ -283,75 +435,109 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
         }
         dev = &s_devices[s_device_count++];
         dev->slave_id = slave_id;
+        dev->source_protocol = s_full_request.source_protocol;
+        dev->channel_id = s_full_request.channel_id;
         snprintf(dev->device_id, sizeof(dev->device_id),
-                 "device_slave_%02u", slave_id);
+                 "%s_ch%u_slave_%02u",
+                 dev->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
+                 dev->channel_id, slave_id);
         dev->name[0] = '\0';
         dev->description[0] = '\0';
         snprintf(dev->mqtt_topic_prefix, sizeof(dev->mqtt_topic_prefix),
-                 "factory/data/device_slave_%02u", slave_id);
+                 "factory/data/%s_ch%u_slave_%02u",
+                 dev->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
+                 dev->channel_id, slave_id);
         dev->active = true;
         dev->reg_count = 0;
     }
 
-    ESP_LOGI(TAG, "Register scan: slave %u, addr %u .. %u",
-             slave_id, reg_start, reg_end);
+    ESP_LOGI(TAG, "Register scan: %s channel=%u slave %u, addr %u .. %u",
+             dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+             dev->channel_id, slave_id, reg_start, reg_end);
 
-    uint16_t raw_regs[2];
+    discover_default_functions(&s_full_request);
+    dev->reg_count = 0;
     s_result.scan_in_progress = true;
 
-    /* Scan with FC03 (holding registers) */
-    for (uint16_t addr = reg_start; addr <= reg_end &&
-         dev->reg_count < DISCOVER_MAX_REGS_PER_SLAVE; addr++) {
+    uint32_t address = reg_start;
+    uint8_t empty_gap = 0;
+    while (address <= reg_end &&
+           dev->reg_count < DISCOVER_MAX_REGS_PER_SLAVE) {
+        discover_probe_t probe;
+        esp_err_t err;
+        uint8_t preferred_count = dev->probe_register_count;
+        uint8_t remaining = (uint8_t)((reg_end - address + 1U) >
+                            DISCOVER_MAX_BLOCK_REGS ? DISCOVER_MAX_BLOCK_REGS :
+                            (reg_end - address + 1U));
 
-        /* Try single register first */
-        esp_err_t err = modbus_read_holding_register(slave_id, addr - 40001, 1, raw_regs);
-        if (err != ESP_OK) continue;
-
-        discovered_register_t *reg = &dev->registers[dev->reg_count];
-        reg->register_address = addr;
-        reg->function_code = 0x03;
-        reg->valid = true;
-
-        /* Try reading 2 registers for FLOAT32 detection */
-        uint16_t raw2[2] = {0};
-        bool is_multi = false;
-        if (addr + 1 <= reg_end) {
-            esp_err_t err2 = modbus_read_holding_register(slave_id,
-                                                           addr - 40001, 2, raw2);
-            if (err2 == ESP_OK) {
-                data_type_t dt = infer_data_type(raw2, addr);
-                if (dt == DT_FLOAT32) {
-                    reg->inferred_type = DT_FLOAT32;
-                    reg->sample_value = modbus_convert_to_float(raw2, DT_FLOAT32);
-                    is_multi = true;
-                    addr++; /* Skip next register (part of 32-bit value) */
-                }
+        if (preferred_count > remaining) preferred_count = remaining;
+        if (dev->reg_count > 0 && preferred_count > 0) {
+            memset(&probe, 0, sizeof(probe));
+            err = discover_read_registers(dev->source_protocol, dev->channel_id,
+                                          slave_id, dev->probe_function_code,
+                                          (uint16_t)address, preferred_count,
+                                          probe.values);
+            if (err == ESP_OK) {
+                probe.function_code = dev->probe_function_code;
+                probe.address = (uint16_t)address;
+                probe.register_count = preferred_count;
             }
+        } else {
+            err = discover_probe_address(&s_full_request, slave_id,
+                                         (uint16_t)address,
+                                         dev->probe_function_code,
+                                         preferred_count, &probe);
         }
 
-        if (!is_multi) {
-            reg->inferred_type = infer_data_type(raw_regs, addr);
-            reg->sample_value = modbus_convert_to_float(raw_regs, reg->inferred_type);
+        if (err != ESP_OK) {
+            ++address;
+            if (dev->reg_count > 0 && ++empty_gap >= s_full_request.max_empty_gap) {
+                ESP_LOGI(TAG, "Stopping register scan after %u empty addresses",
+                         empty_gap);
+                break;
+            }
+            continue;
         }
 
-        /* Discovery is read-only. Write permission must be explicitly granted in AMM. */
-        reg->writable = false;
+        dev->probe_function_code = probe.function_code;
+        dev->probe_address = probe.address;
+        dev->probe_register_count = probe.register_count;
+        empty_gap = 0;
 
-        /* Semantic inference */
-        float rmin, rmax;
-        modbus_discover_infer_semantics(addr, reg->sample_value,
-                                        reg->inferred_name, reg->inferred_unit,
-                                        &rmin, &rmax);
+        for (uint8_t i = 0; i < probe.register_count &&
+             dev->reg_count < DISCOVER_MAX_REGS_PER_SLAVE; ++i) {
+            uint16_t point_address = probe.address + i;
+            if (point_address > reg_end) break;
 
-        ESP_LOGI(TAG, "  [%u] %s = %.2f %s (%s, %s)",
-                 addr, reg->inferred_name, reg->sample_value,
-                 reg->inferred_unit,
-                 reg->inferred_type == DT_FLOAT32 ? "FLOAT32" :
-                 reg->inferred_type == DT_INT16   ? "INT16"   : "UINT16",
-                 reg->writable ? "R/W" : "R/O");
+            discovered_register_t *reg = &dev->registers[dev->reg_count++];
+            memset(reg, 0, sizeof(*reg));
+            reg->register_address = point_address;
+            reg->function_code = probe.function_code;
+            reg->raw_value = probe.values[i];
+            reg->inferred_type = ((int16_t)probe.values[i] < 0) ?
+                                 DT_INT16 : DT_UINT16;
+            reg->sample_value = reg->inferred_type == DT_INT16 ?
+                                (float)(int16_t)probe.values[i] :
+                                (float)probe.values[i];
+            reg->read_start_address = probe.address;
+            reg->read_register_count = probe.register_count;
+            reg->value_register_index = i;
+            reg->writable = false;
+            reg->valid = true;
 
-        dev->reg_count++;
-        s_result.registers_found++;
+            float range_min;
+            float range_max;
+            modbus_discover_infer_semantics(point_address, reg->sample_value,
+                                            reg->inferred_name,
+                                            reg->inferred_unit,
+                                            &range_min, &range_max);
+            ESP_LOGI(TAG, "  FC%02u [%u] raw=%u window=%u+%u index=%u",
+                     reg->function_code, point_address, reg->raw_value,
+                     reg->read_start_address, reg->read_register_count,
+                     reg->value_register_index);
+            ++s_result.registers_found;
+        }
+        address += probe.register_count;
     }
 
     s_result.scan_in_progress = false;
@@ -366,13 +552,13 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
 
 static esp_err_t full_scan_sync(const discover_scan_params_t *params)
 {
-    uint8_t  s_start = params ? params->slave_start : 1;
-    uint8_t  s_end   = params ? params->slave_end   : 247;
-    uint16_t r_start = params ? params->reg_start   : 40001;
-    uint16_t r_end   = params ? params->reg_end     : 40100;
+    uint16_t r_start = params->reg_start;
+    uint16_t r_end = params->reg_end;
+    s_result.registers_found = 0;
+    s_result.mappings_created = 0;
 
-    /* Phase 1: Broadcast scan */
-    esp_err_t err = scan_bus_sync(s_start, s_end);
+    /* Phase 1: bus / endpoint scan */
+    esp_err_t err = scan_bus_sync(params);
     if (err != ESP_OK) return err;
 
     /* Phase 2: Register scan for each discovered device */
@@ -401,12 +587,16 @@ esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
 {
     if (s_scan_task != NULL || s_result.scan_in_progress) return ESP_ERR_INVALID_STATE;
     s_full_request = params != NULL ? *params : (discover_scan_params_t){
-        .slave_start = 1, .slave_end = 247, .reg_start = 40001, .reg_end = 40100,
+        .slave_start = 1, .slave_end = 247, .reg_start = 0, .reg_end = 100,
+        .source_protocol = SRC_MODBUS_RTU, .channel_id = 0,
         .function_codes = {3, 4}, .fc_count = 2,
+        .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
     };
+    discover_default_functions(&s_full_request);
     if (s_full_request.slave_start < 1 || s_full_request.slave_end > 247 ||
         s_full_request.slave_start > s_full_request.slave_end ||
         s_full_request.reg_start > s_full_request.reg_end) return ESP_ERR_INVALID_ARG;
+    if (s_full_request.max_empty_gap > 64) s_full_request.max_empty_gap = 64;
     s_result.scan_in_progress = true;
     s_result.scan_complete = false;
     if (xTaskCreate(full_scan_task, "mb_full_scan", 6144, NULL, 3, &s_scan_task) != pdPASS) {
@@ -448,10 +638,14 @@ int modbus_discover_apply_mappings(void)
             const discovered_register_t *reg = &dev->registers[j];
             if (!reg->valid) continue;
 
-            /* Skip if mapping already exists for this (slave, addr) pair */
-            if (amm_find_mapping(dev->slave_id, reg->register_address)) {
-                ESP_LOGI(TAG, "Mapping already exists for slave %u / addr %u",
-                         dev->slave_id, reg->register_address);
+            /* Skip if mapping already exists for this protocol/channel/slave/address. */
+            amm_mapping_entry_t existing;
+            if (amm_find_mapping_for_channel(dev->source_protocol, dev->channel_id,
+                                             dev->slave_id, reg->register_address,
+                                             &existing) == ESP_OK) {
+                ESP_LOGI(TAG, "Mapping already exists for %s channel %u slave %u / addr %u",
+                         dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+                         dev->channel_id, dev->slave_id, reg->register_address);
                 continue;
             }
 
@@ -459,9 +653,14 @@ int modbus_discover_apply_mappings(void)
             memset(&entry, 0, sizeof(entry));
 
             entry.slave_id = dev->slave_id;
+            entry.source_protocol = dev->source_protocol;
+            entry.channel_id = dev->channel_id;
             entry.function_code = reg->function_code;
             entry.register_address = reg->register_address;
             entry.data_type = reg->inferred_type;
+            entry.read_start_address = reg->read_start_address;
+            entry.read_register_count = reg->read_register_count;
+            entry.value_register_index = reg->value_register_index;
             entry.scale_factor = 1.0f;
 
             /* Device and point IDs */

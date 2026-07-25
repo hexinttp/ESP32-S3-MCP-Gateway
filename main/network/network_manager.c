@@ -89,6 +89,7 @@ esp_err_t network_manager_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "AP config");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta), TAG, "STA config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "disable WiFi power save");
 
     s_status.config_ap_active = true;
     ESP_LOGI(TAG, "Configuration AP active: %s (http://192.168.4.1)", s_status.config_ap_ssid);

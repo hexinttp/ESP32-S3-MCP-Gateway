@@ -132,15 +132,29 @@ static void modbus_poll_task(void *arg)
         result.quality          = QUALITY_INVALID;
         result.valid            = false;
 
-        /* Read raw registers from the MODBUS device */
-        uint16_t raw_regs[4] = {0};  /* Max 4 registers for FLOAT32/INT32/UINT32 */
-        uint16_t offset = modbus_register_offset(cfg->function_code, cfg->register_address);
+        /*
+         * Some sensors only answer fixed-width block reads. The AMM entry keeps
+         * that read window while register_address remains the semantic point.
+         */
+        uint16_t read_start = cfg->read_start_address;
+        uint8_t read_count = cfg->read_register_count;
+        uint8_t value_index = cfg->value_register_index;
+        if (read_count == 0 || read_count > AMM_MAX_READ_REGISTERS ||
+            value_index + result.register_count > read_count) {
+            read_start = cfg->register_address;
+            read_count = result.register_count;
+            value_index = 0;
+        }
+
+        uint16_t raw_regs[AMM_MAX_READ_REGISTERS] = {0};
+        uint16_t offset = modbus_register_offset(cfg->function_code, read_start);
         esp_err_t err = modbus_read_channel(cfg->source_protocol, cfg->channel_id,
                                              cfg->slave_id, cfg->function_code,
-                                             offset, result.register_count, raw_regs);
+                                             offset, read_count, raw_regs);
 
         if (err == ESP_OK) {
-            result.raw_value = modbus_convert_to_float_order(raw_regs, cfg->data_type,
+            result.raw_value = modbus_convert_to_float_order(&raw_regs[value_index],
+                                                              cfg->data_type,
                                                               cfg->byte_order);
             result.quality   = QUALITY_GOOD;
             result.valid     = true;
@@ -148,8 +162,10 @@ static void modbus_poll_task(void *arg)
         } else {
             result.quality = QUALITY_INVALID;
             result.valid   = false;
-            ESP_LOGW(TAG, "MODBUS read failed: slave=%u fc=0x%02X addr=0x%04X err=0x%x",
-                     cfg->slave_id, cfg->function_code, cfg->register_address, err);
+            ESP_LOGW(TAG, "MODBUS read failed: slave=%u fc=0x%02X point=0x%04X "
+                     "window=0x%04X+%u err=0x%x",
+                     cfg->slave_id, cfg->function_code, cfg->register_address,
+                     read_start, read_count, err);
             eval_increment_metric("failed_polls", 1);
         }
 

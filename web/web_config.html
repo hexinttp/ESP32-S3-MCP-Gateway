@@ -420,6 +420,24 @@ tbody tr:last-child td { border-bottom: none; }
 .log-line-warn  { color: #f9e2af; }
 .log-line-error { color: #f38ba8; }
 .log-line-ok    { color: #a6e3a1; }
+.comm-log-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.comm-log-filters .form-group { margin-bottom: 0; }
+.comm-frame {
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.comm-log-table tbody td { padding: 8px 10px; }
+.empty-row {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 28px 12px !important;
+}
 
 /* ============================================================
  * Page Sections (tabs)
@@ -436,6 +454,7 @@ tbody tr:last-child td { border-bottom: none; }
   .main { margin-left: 0; }
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .form-grid { grid-template-columns: 1fr; }
+  .comm-log-filters { grid-template-columns: 1fr 1fr; }
 }
 </style>
 </head>
@@ -461,10 +480,6 @@ tbody tr:last-child td { border-bottom: none; }
     <li class="nav-item" data-page="mqtt">
       <span class="icon">&#9729;</span>
       <span data-i18n="nav.mqtt">MQTT Broker</span>
-    </li>
-    <li class="nav-item" data-page="onenet">
-      <span class="icon">&#128187;</span>
-      <span data-i18n="nav.onenet">OneNET Cloud</span>
     </li>
     <li class="nav-item" data-page="modbus">
       <span class="icon">&#9881;</span>
@@ -687,53 +702,6 @@ tbody tr:last-child td { border-bottom: none; }
       </div>
     </section>
 
-    <!-- ========== OneNET Cloud Platform ========== -->
-    <section class="page-section" id="page-onenet">
-      <div class="card">
-        <div class="card-header">
-          <span data-i18n="onenet.title">OneNET Cloud Platform</span>
-          <div style="display:flex; align-items:center; gap:8px;">
-            <label class="form-group" style="margin-bottom:0;">
-              <input type="checkbox" id="onenetEnabled" onchange="toggleOnenet()">
-              <span data-i18n="onenet.enable">Enable</span>
-            </label>
-            <span class="badge badge-info" id="onenetStatusBadge" style="display:none;"><span class="dot dot-green"></span> <span data-i18n="onenet.connected">Connected</span></span>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="form-grid">
-            <div class="form-group">
-              <label data-i18n="onenet.product_id">Product ID</label>
-              <input type="text" id="onenetProductId" placeholder="Your OneNET Product ID" disabled>
-            </div>
-            <div class="form-group">
-              <label data-i18n="onenet.device_id">Device ID</label>
-              <input type="text" id="onenetDeviceId" placeholder="Your OneNET Device ID" disabled>
-            </div>
-            <div class="form-group">
-              <label data-i18n="onenet.device_key">Device Key</label>
-              <input type="password" id="onenetDeviceKey" placeholder="Your OneNET Device Key" disabled>
-            </div>
-            <div class="form-group">
-              <label data-i18n="onenet.mqtt_uri">MQTT URI</label>
-              <input type="text" id="onenetMqttUri" value="mqtts://mqtt.heclouds.com:8883" disabled>
-            </div>
-          </div>
-          <div class="form-group" style="margin-top: 8px;">
-            <div class="hint" data-i18n="onenet.hint">When enabled, the gateway will connect to OneNET using the following MQTT authentication:<br>
-              &bull; clientId = Device ID<br>
-              &bull; username = Product ID<br>
-              &bull; password = Device Key
-            </div>
-          </div>
-          <div style="margin-top:16px; display:flex; gap:8px;">
-            <button class="btn btn-primary" onclick="saveOnenetConfig()" data-i18n="btn.save" disabled id="btnOnenetSave">Save Configuration</button>
-            <button class="btn btn-outline" onclick="testOnenetConnection()" data-i18n="onenet.test" disabled id="btnOnenetTest">Test Connection</button>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- ========== MODBUS ========== -->
     <section class="page-section" id="page-modbus">
       <div class="card">
@@ -849,6 +817,8 @@ tbody tr:last-child td { border-bottom: none; }
                   <th data-i18n="th.device_id">Device ID</th>
                   <th data-i18n="th.point_id">Point ID</th>
                   <th data-i18n="th.unit">Unit</th>
+                  <th data-i18n="mapping.raw_value">Raw Value</th>
+                  <th data-i18n="mapping.current_value">Engineering Value</th>
                   <th data-i18n="th.mqtt_topic">MQTT Topic</th>
                   <th data-i18n="th.writable">Writable</th>
                   <th data-i18n="th.range">Range</th>
@@ -870,31 +840,42 @@ tbody tr:last-child td { border-bottom: none; }
         <div class="card-header">
           <span data-i18n="discover.title">Device Discovery</span>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-primary btn-sm" onclick="startFullScan()" id="btnScan" data-i18n="discover.scan">&#128270; Full Scan</button>
-            <button class="btn btn-outline btn-sm" onclick="applyMappings()" id="btnApply" data-i18n="discover.apply">&#10003; Apply</button>
+            <button class="btn btn-primary btn-sm" onclick="startFullScan()" id="btnScan" data-i18n="discover.scan">Full Scan</button>
+            <button class="btn btn-outline btn-sm" onclick="applyMappings()" id="btnApply" data-i18n="discover.apply">Apply</button>
             <button class="btn btn-outline btn-sm" onclick="exportDevices()" title="Export">&#128190; Export</button>
             <button class="btn btn-outline btn-sm" onclick="document.getElementById('importFile').click()" title="Import">&#128194; Import</button>
             <input type="file" id="importFile" accept=".json" style="display:none" onchange="importDevices(event)">
-            <button class="btn btn-outline btn-sm" onclick="resetDiscovery()" data-i18n="discover.reset">&#10007; Reset</button>
+            <button class="btn btn-outline btn-sm" onclick="resetDiscovery()" data-i18n="discover.reset">Reset</button>
           </div>
         </div>
         <!-- Scan Parameters -->
-        <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:12px; margin-bottom:12px;">
+        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:12px;">
           <div>
             <label class="form-label" data-i18n="discover.slave_range">Slave ID Range</label>
             <div style="display:flex; gap:4px;">
               <input type="number" id="scanSlaveStart" value="1" min="1" max="247" class="form-input" style="width:60px;">
               <span style="line-height:34px;">~</span>
-              <input type="number" id="scanSlaveEnd" value="247" min="1" max="247" class="form-input" style="width:60px;">
+              <input type="number" id="scanSlaveEnd" value="10" min="1" max="247" class="form-input" style="width:60px;">
             </div>
           </div>
           <div>
             <label class="form-label" data-i18n="discover.reg_range">Register Range</label>
             <div style="display:flex; gap:4px;">
-              <input type="number" id="scanRegStart" value="40001" class="form-input" style="width:70px;">
+              <input type="number" id="scanRegStart" value="1" min="0" max="65535" class="form-input" style="width:70px;">
               <span style="line-height:34px;">~</span>
-              <input type="number" id="scanRegEnd" value="40999" class="form-input" style="width:70px;">
+              <input type="number" id="scanRegEnd" value="16" min="0" max="65535" class="form-input" style="width:70px;">
             </div>
+          </div>
+          <div>
+            <label class="form-label" data-i18n="discover.functions">Function Codes</label>
+            <div style="display:flex; align-items:center; gap:12px; height:34px;">
+              <label><input type="checkbox" id="scanFc03" checked> FC03</label>
+              <label><input type="checkbox" id="scanFc04" checked> FC04</label>
+            </div>
+          </div>
+          <div>
+            <label class="form-label" data-i18n="discover.empty_gap">Empty Address Stop</label>
+            <input type="number" id="scanEmptyGap" value="8" min="1" max="64" class="form-input" style="width:80px;">
           </div>
           <div>
             <label class="form-label" data-i18n="discover.status">Status</label>
@@ -905,16 +886,9 @@ tbody tr:last-child td { border-bottom: none; }
             <div id="scanSummary" style="padding:6px 10px; border-radius:6px; background:var(--surface2); font-size:13px;">-</div>
           </div>
         </div>
-        <!-- MODBUS TCP Bridge Connection -->
+        <!-- MODBUS RTU Discovery Hint -->
         <div style="display:flex; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--border); margin-top:8px; flex-wrap:wrap;">
-          <span style="font-size:13px; font-weight:600; color:var(--text2);" data-i18n="discover.bridge">MODBUS TCP Bridge</span>
-          <input type="text" id="bridgeHost" value="localhost" class="form-input" style="width:130px;" placeholder="Host / IP">
-          <span style="color:var(--text2);">:</span>
-          <input type="number" id="bridgePort" value="5020" min="1" max="65535" class="form-input" style="width:80px;" placeholder="Port">
-          <button class="btn btn-outline btn-sm" onclick="bridgeConnect()" id="btnBridgeConnect" data-i18n="discover.bridge_connect">Connect</button>
-          <button class="btn btn-outline btn-sm" onclick="bridgeDisconnect()" id="btnBridgeDisconnect" style="display:none;" data-i18n="discover.bridge_disconnect">Disconnect</button>
-          <span id="bridgeStatus" style="font-size:12px; padding:3px 8px; border-radius:4px; background:#fee2e2; color:#991b1b;" data-i18n="discover.bridge_disconnected">Disconnected</span>
-          <span id="bridgeModeBadge" style="display:none; font-size:11px; padding:2px 6px; border-radius:3px; background:#dbeafe; color:#1e40af;" data-i18n="discover.bridge_mode">Bridge Mode</span>
+          <span style="font-size:13px; font-weight:600; color:var(--text2);" data-i18n="discover.rtu_hint">RTU discovery scans the RS485 bus configured in MODBUS Settings.</span>
         </div>
         <div id="scanProgress" style="display:none;">
           <div style="background:var(--surface2); border-radius:4px; height:8px; overflow:hidden;">
@@ -1058,6 +1032,65 @@ tbody tr:last-child td { border-bottom: none; }
     <section class="page-section" id="page-logs">
       <div class="card">
         <div class="card-header">
+          <span data-i18n="logs.modbus_title">RS485 Communication Log</span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-outline btn-sm" onclick="clearModbusLogs()" data-i18n="logs.clear">Clear</button>
+            <button class="btn btn-outline btn-sm" onclick="exportModbusLogs()" data-i18n="logs.export_csv">Export CSV</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="comm-log-filters">
+            <div class="form-group">
+              <label data-i18n="logs.direction">Direction</label>
+              <select id="commDirectionFilter" onchange="renderModbusLogs()">
+                <option value="" data-i18n="logs.all">All</option>
+                <option value="TX">TX</option>
+                <option value="RX">RX</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="th.slave_id">Slave ID</label>
+              <input id="commSlaveFilter" type="number" min="1" max="247" placeholder="1" oninput="renderModbusLogs()">
+            </div>
+            <div class="form-group">
+              <label data-i18n="logs.function">Function</label>
+              <select id="commFunctionFilter" onchange="renderModbusLogs()">
+                <option value="" data-i18n="logs.all">All</option>
+                <option value="3">FC03</option>
+                <option value="4">FC04</option>
+                <option value="6">FC06</option>
+                <option value="16">FC16</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="logs.status">Status</label>
+              <select id="commStatusFilter" onchange="renderModbusLogs()">
+                <option value="" data-i18n="logs.all">All</option>
+                <option value="ok" data-i18n="logs.success">Success</option>
+                <option value="error" data-i18n="logs.error">Error</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="comm-log-table">
+              <thead><tr>
+                <th data-i18n="logs.sequence">Sequence</th>
+                <th data-i18n="logs.time">Time</th>
+                <th data-i18n="logs.direction">Direction</th>
+                <th data-i18n="th.slave_id">Slave ID</th>
+                <th data-i18n="logs.function">Function</th>
+                <th data-i18n="th.reg_addr">Register</th>
+                <th data-i18n="logs.raw_registers">Raw Registers</th>
+                <th data-i18n="logs.frame">Frame</th>
+                <th data-i18n="logs.status">Status</th>
+              </tr></thead>
+              <tbody id="modbusLogBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
           <span data-i18n="logs.title">System Logs</span>
           <div style="display:flex; gap:8px;">
             <button class="btn btn-outline btn-sm" onclick="clearLogs()" data-i18n="logs.clear">Clear</button>
@@ -1192,7 +1225,6 @@ const I18N = {
     "nav.dashboard": "\u4eea\u8868\u76d8",
     "nav.wifi": "WiFi \u914d\u7f6e",
     "nav.mqtt": "MQTT Broker",
-    "nav.onenet": "OneNET \u4e91\u5e73\u53f0",
     "nav.modbus": "MODBUS \u8bbe\u7f6e",
     "nav.mapping": "\u6620\u5c04\u8868",
     "nav.discover": "\u8bbe\u5907\u53d1\u73b0",
@@ -1250,15 +1282,6 @@ const I18N = {
     "mqtt.topic_prefix": "\u6570\u636e\u4e3b\u9898\u524d\u7f00",
     "mqtt.topic_hint": "\u53d1\u5e03\u4e3b\u9898\uff1a{prefix}/{client_id}/{device}/{point}",
     "mqtt.test": "\u6d4b\u8bd5\u8fde\u63a5",
-    "onenet.title": "OneNET \u4e91\u5e73\u53f0",
-    "onenet.enable": "\u542f\u7528",
-    "onenet.connected": "\u5df2\u8fde\u63a5",
-    "onenet.product_id": "\u4ea7\u54c1 ID",
-    "onenet.device_id": "\u8bbe\u5907 ID",
-    "onenet.device_key": "\u8bbe\u5907\u5bc6\u94a5",
-    "onenet.mqtt_uri": "MQTT URI",
-    "onenet.hint": "\u542f\u7528\u540e\uff0c\u7f51\u5173\u5c06\u4f7f\u7528\u4ee5\u4e0b\u53c2\u6570\u8fde\u63a5 OneNET\uff1a<br>\u2022 clientId = \u8bbe\u5907 ID<br>\u2022 username = \u4ea7\u54c1 ID<br>\u2022 password = \u8bbe\u5907\u5bc6\u94a5",
-    "onenet.test": "\u6d4b\u8bd5\u8fde\u63a5",
     "modbus.title": "MODBUS RTU \u4e3b\u7ad9\u8bbe\u7f6e",
     "modbus.uart_port": "UART \u7aef\u53e3",
     "modbus.baudrate": "\u6ce2\u7279\u7387",
@@ -1289,17 +1312,23 @@ const I18N = {
     "mapping.poll_interval": "\u8f6e\u8be2\u95f4\u9694 (ms)",
     "mapping.priority": "\u4f18\u5148\u7ea7",
     "mapping.measurement": "\u6d4b\u91cf\u540d\u79f0",
+    "mapping.raw_value": "\u539f\u59cb\u503c",
+    "mapping.current_value": "\u5de5\u7a0b\u503c",
     "mapping.readonly": "\u5426\uff08\u53ea\u8bfb\uff09",
     "mapping.writable_yes": "\u662f\uff08\u53ef\u5199\uff09",
     "mapping.range_min": "\u6709\u6548\u8303\u56f4\u6700\u5c0f\u503c",
     "mapping.range_max": "\u6709\u6548\u8303\u56f4\u6700\u5927\u503c",
     "mapping.confirm_delete": "\u786e\u5b9a\u8981\u5220\u9664\u8fd9\u6761\u6620\u5c04\u5417\uff1f",
     "discover.title": "\u81ea\u52a8\u8bbe\u5907\u53d1\u73b0",
-    "discover.scan": "&#128270; \u5168\u91cf\u626b\u63cf",
-    "discover.apply": "&#10003; \u5e94\u7528\u6620\u5c04",
-    "discover.reset": "&#10007; \u91cd\u7f6e",
+    "discover.scan": "\u5168\u91cf\u626b\u63cf",
+    "discover.apply": "\u5e94\u7528\u6620\u5c04",
+    "discover.reset": "\u91cd\u7f6e",
     "discover.slave_range": "\u4ece\u7ad9 ID \u8303\u56f4",
     "discover.reg_range": "\u5bc4\u5b58\u5668\u8303\u56f4",
+    "discover.functions": "\u529f\u80fd\u7801",
+    "discover.empty_gap": "\u8fde\u7eed\u7a7a\u5730\u5740\u505c\u6b62\u6570",
+    "discover.read_window": "\u8bfb\u53d6\u7a97\u53e3",
+    "discover.raw_value": "\u539f\u59cb\u503c",
     "discover.status": "\u626b\u63cf\u72b6\u6001",
     "discover.summary": "\u6458\u8981",
     "discover.idle": "\u7a7a\u95f2",
@@ -1348,6 +1377,7 @@ const I18N = {
     "discover.bridge_disconnected": "\u5df2\u65ad\u5f00",
     "discover.bridge_mode": "\u6865\u63a5\u6a21\u5f0f",
     "discover.virtual_mode": "\u865a\u62df\u6a21\u5f0f",
+    "discover.rtu_hint": "RTU \u53d1\u73b0\u4f1a\u626b\u63cf MODBUS \u8bbe\u7f6e\u4e2d\u7684 RS485 \u603b\u7ebf\uff1bTCP \u8bbe\u5907\u8bf7\u5728 MODBUS TCP Endpoints \u4e2d\u914d\u7f6e\u3002",
     "discover.valid": "\u6709\u6548",
     "discover.invalid": "\u65e0\u6548",
     "automation.title": "\u79bb\u7ebf\u81ea\u52a8\u5316\u89c4\u5219",
@@ -1370,8 +1400,22 @@ const I18N = {
     "automation.configured": "\u5df2\u914d\u7f6e\u89c4\u5219",
     "automation.condition": "\u89e6\u53d1\u6761\u4ef6",
     "logs.title": "\u7cfb\u7edf\u65e5\u5fd7",
+    "logs.modbus_title": "RS485 \u901a\u4fe1\u65e5\u5fd7",
     "logs.clear": "\u6e05\u7a7a",
     "logs.export": "\u5bfc\u51fa",
+    "logs.export_csv": "\u5bfc\u51fa CSV",
+    "logs.all": "\u5168\u90e8",
+    "logs.direction": "\u65b9\u5411",
+    "logs.function": "\u529f\u80fd\u7801",
+    "logs.status": "\u72b6\u6001",
+    "logs.success": "\u6210\u529f",
+    "logs.error": "\u5931\u8d25",
+    "logs.sequence": "\u5e8f\u53f7",
+    "logs.time": "\u8fd0\u884c\u65f6\u95f4",
+    "logs.raw_registers": "\u539f\u59cb\u5bc4\u5b58\u5668",
+    "logs.frame": "\u539f\u59cb\u5e27",
+    "logs.empty": "\u6682\u65e0\u5339\u914d\u7684\u901a\u4fe1\u8bb0\u5f55",
+    "logs.cleared": "RS485 \u901a\u4fe1\u65e5\u5fd7\u5df2\u6e05\u7a7a",
     "toast.saved": "\u914d\u7f6e\u5df2\u4fdd\u5b58",
     "toast.mapping_added": "\u6620\u5c04\u6dfb\u52a0\u6210\u529f",
     "toast.mapping_updated": "\u6620\u5c04\u66f4\u65b0\u6210\u529f",
@@ -1432,16 +1476,6 @@ const I18N = {
     'mqtt.topic_prefix': 'Data Topic Prefix',
     'mqtt.topic_hint': 'Published topics: {prefix}/{client_id}/{device}/{point}',
     'mqtt.test': 'Test Connection',
-    'nav.onenet': 'OneNET Cloud',
-    'onenet.title': 'OneNET Cloud Platform',
-    'onenet.enable': 'Enable',
-    'onenet.connected': 'Connected',
-    'onenet.product_id': 'Product ID',
-    'onenet.device_id': 'Device ID',
-    'onenet.device_key': 'Device Key',
-    'onenet.mqtt_uri': 'MQTT URI',
-    'onenet.hint': 'When enabled, the gateway will connect to OneNET using:<br>&bull; clientId = Device ID<br>&bull; username = Product ID<br>&bull; password = Device Key',
-    'onenet.test': 'Test Connection',
     'modbus.title': 'MODBUS RTU Master Settings',
     'modbus.uart_port': 'UART Port',
     'modbus.baudrate': 'Baud Rate',
@@ -1472,17 +1506,23 @@ const I18N = {
     'mapping.poll_interval': 'Poll Interval (ms)',
     'mapping.priority': 'Priority',
     'mapping.measurement': 'Measurement Name',
+    'mapping.raw_value': 'Raw Value',
+    'mapping.current_value': 'Engineering Value',
     'mapping.readonly': 'No (Read-only)',
     'mapping.writable_yes': 'Yes (Writable)',
     'mapping.range_min': 'Valid Range Min',
     'mapping.range_max': 'Valid Range Max',
     'mapping.confirm_delete': 'Are you sure you want to delete this mapping?',
     'discover.title': 'Automatic Device Discovery',
-    'discover.scan': '&#128270; Full Scan',
-    'discover.apply': '&#10003; Apply Mappings',
-    'discover.reset': '&#10007; Reset',
+    'discover.scan': 'Full Scan',
+    'discover.apply': 'Apply Mappings',
+    'discover.reset': 'Reset',
     'discover.slave_range': 'Slave ID Range',
     'discover.reg_range': 'Register Range',
+    'discover.functions': 'Function Codes',
+    'discover.empty_gap': 'Empty Address Stop',
+    'discover.read_window': 'Read Window',
+    'discover.raw_value': 'Raw Value',
     'discover.status': 'Scan Status',
     'discover.summary': 'Summary',
     'discover.idle': 'Idle',
@@ -1533,6 +1573,7 @@ const I18N = {
     'discover.bridge_disconnected': 'Disconnected',
     'discover.bridge_mode': 'Bridge Mode',
     'discover.virtual_mode': 'Virtual Mode',
+    'discover.rtu_hint': 'RTU discovery scans the RS485 bus configured in MODBUS Settings; TCP devices are configured under MODBUS TCP Endpoints.',
     'automation.title': 'Offline Automation Rules',
     'automation.add': 'Add Rule',
     'automation.name': 'Rule Name',
@@ -1553,8 +1594,22 @@ const I18N = {
     'automation.configured': 'Configured Rules',
     'automation.condition': 'Condition',
     'logs.title': 'System Logs',
+    'logs.modbus_title': 'RS485 Communication Log',
     'logs.clear': 'Clear',
     'logs.export': 'Export',
+    'logs.export_csv': 'Export CSV',
+    'logs.all': 'All',
+    'logs.direction': 'Direction',
+    'logs.function': 'Function',
+    'logs.status': 'Status',
+    'logs.success': 'Success',
+    'logs.error': 'Error',
+    'logs.sequence': 'Sequence',
+    'logs.time': 'Uptime',
+    'logs.raw_registers': 'Raw Registers',
+    'logs.frame': 'Raw Frame',
+    'logs.empty': 'No matching communication records',
+    'logs.cleared': 'RS485 communication log cleared',
     'toast.saved': 'Configuration saved',
     'toast.mapping_added': 'Mapping added successfully',
     'toast.mapping_updated': 'Mapping updated successfully',
@@ -1566,7 +1621,7 @@ const I18N = {
 
 let currentLang = localStorage.getItem('gateway_lang') || 'zh';
 
-function setLang(lang) {
+function setLang(lang, persist = true) {
   currentLang = lang;
   localStorage.setItem('gateway_lang', lang);
   document.documentElement.lang = lang;
@@ -1586,7 +1641,10 @@ function setLang(lang) {
   if (typeof renderDiscoveredDevices === 'function') renderDiscoveredDevices();
   if (typeof updateBridgeUI === 'function') updateBridgeUI();
   if (typeof renderAutomationRules === 'function') renderAutomationRules();
-  if (typeof apiPut === 'function') apiPut('/api/gateway/config', {locale: lang === 'zh' ? 'zh-CN' : 'en-US'});
+  if (typeof renderModbusLogs === 'function') renderModbusLogs();
+  if (persist && typeof apiPut === 'function') {
+    apiPut('/api/gateway/config', {locale: lang === 'zh' ? 'zh-CN' : 'en-US'});
+  }
 }
 function t(key) { return I18N[currentLang][key] || key; }
 
@@ -1602,72 +1660,73 @@ document.querySelectorAll('.nav-item').forEach(item => {
     document.getElementById('page-' + page).classList.add('active');
     const titleKey = 'nav.' + page;
     document.getElementById('topbarTitle').textContent = t(titleKey);
+    if (page === 'logs') fetchModbusLogs();
   });
 });
 
 /* ============================================================
- * Simulated Data Store (replaced by API calls on real ESP32)
+ * Runtime Data Store
  * ============================================================ */
 const API_BASE = window.location.origin;
+const API_TIMEOUT_MS = 5000;
 
 let systemState = {
-  mqtt_connected: true,
-  modbus_active: true,
-  total_polls: 61,
-  successful_polls: 61,
+  mqtt_connected: false,
+  modbus_active: false,
+  total_polls: 0,
+  successful_polls: 0,
   failed_polls: 0,
-  contexts_created: 61,
-  contexts_validated: 61,
+  contexts_created: 0,
+  contexts_validated: 0,
   contexts_rejected: 0,
-  mqtt_published: 41,
+  mqtt_published: 0,
   mqtt_failed: 0,
-  cached_records: 20,
-  replayed_records: 20,
+  cached_records: 0,
+  replayed_records: 0,
   data_loss: 0,
-  commands_received: 4,
-  commands_accepted: 1,
-  commands_rejected: 3,
-  free_heap: 200000,
-  flash_size: 16777216,
+  commands_received: 0,
+  commands_accepted: 0,
+  commands_rejected: 0,
+  free_heap: 0,
+  flash_size: 0,
   uptime_seconds: 0,
-  sequence_counter: 61,
+  sequence_counter: 0,
 };
 
-let mappings = [
-  { slave_id:1, register_address:40001, data_type:'FLOAT32', scale_factor:1.0, device_id:'plc_line1_01', point_id:'motor_temp_01', measurement_name:'Motor temperature', unit:'degC', mqtt_topic:'factory/line1/plc01/motor/temp', writable:false, range_min:0, range_max:120 },
-  { slave_id:1, register_address:40003, data_type:'FLOAT32', scale_factor:1.0, device_id:'plc_line1_01', point_id:'pressure_01', measurement_name:'Line pressure', unit:'bar', mqtt_topic:'factory/line1/plc01/pressure', writable:false, range_min:0, range_max:10 },
-  { slave_id:2, register_address:40001, data_type:'UINT16', scale_factor:1.0, device_id:'plc_line2_01', point_id:'speed_01', measurement_name:'Conveyor speed', unit:'rpm', mqtt_topic:'factory/line2/plc01/speed', writable:true, range_min:0, range_max:3000 },
-  { slave_id:2, register_address:40003, data_type:'INT16', scale_factor:1.0, device_id:'plc_line2_01', point_id:'current_01', measurement_name:'Motor current', unit:'A', mqtt_topic:'factory/line2/plc01/current', writable:false, range_min:-50, range_max:50 },
-];
+let mappings = [];
 let tcpEndpoints = [];
 
-let logLines = [
-  { level:'info', text:'[INIT] All modules initialized successfully.' },
-  { level:'ok',   text:'[INIT] Active AMM mappings: 4' },
-  { level:'ok',   text:'[INIT] MQTT connected: YES' },
-  { level:'info', text:'[TCM] Built context: id=1 seq=1 dev=temp_sensor_01 pt=PT100_inlet' },
-  { level:'ok',   text:'[TCM] Validation PASSED for context_id=1' },
-  { level:'info', text:'[MQTT] Published to factory/line1/plc01/motor/temp (488 bytes)' },
-  { level:'warn', text:'[TCM] Lookup miss: slave=2 addr=40003, using defaults' },
-  { level:'info', text:'[UIF] Replaying 20 pending records' },
-  { level:'ok',   text:'[UIF] Replay complete: 20 sent, 0 failed' },
-  { level:'warn', text:'[AMM] Command rejected: Point is read-only' },
-];
+let logLines = [];
+let modbusLogEntries = [];
 
 /* ============================================================
  * API Helper
  * ============================================================ */
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    return await fetch(API_BASE + path, {
+      cache: 'no-store',
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function apiGet(path) {
   try {
-    const res = await fetch(API_BASE + path);
+    const res = await fetchWithTimeout(path);
     if (res.ok) return await res.json();
-  } catch(e) { /* fallback to simulated data */ }
+  } catch(e) { /* Keep the last confirmed runtime state. */ }
   return null;
 }
 
 async function apiPut(path, data) {
   try {
-    const res = await fetch(API_BASE + path, {
+    const res = await fetchWithTimeout(path, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(data)
@@ -1678,7 +1737,7 @@ async function apiPut(path, data) {
 
 async function apiPost(path, data) {
   try {
-    const res = await fetch(API_BASE + path, {
+    const res = await fetchWithTimeout(path, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(data)
@@ -1689,7 +1748,7 @@ async function apiPost(path, data) {
 
 async function apiDelete(path) {
   try {
-    const res = await fetch(API_BASE + path, { method: 'DELETE' });
+    const res = await fetchWithTimeout(path, { method: 'DELETE' });
     return res.ok;
   } catch(e) { return false; }
 }
@@ -1699,11 +1758,24 @@ async function apiJson(method, path, body) {
   try {
     const opts = { method: method, headers: { 'Content-Type': 'application/json' } };
     if (body !== undefined) opts.body = JSON.stringify(body);
-    const res = await fetch(API_BASE + path, opts);
+    const res = await fetchWithTimeout(path, opts);
     if (res.ok) return await res.json();
     const errText = await res.text();
     return { error: errText || `HTTP ${res.status}` };
   } catch(e) { return { error: e.message }; }
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[char]);
+}
+
+function formatNumericValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '-';
+  if (Number.isInteger(number)) return String(number);
+  return number.toFixed(3).replace(/\.?0+$/, '');
 }
 
 /* ============================================================
@@ -1751,6 +1823,8 @@ function renderMappingTable() {
       <td>${m.device_id}</td>
       <td>${m.point_id}</td>
       <td>${m.unit}</td>
+      <td><span class="comm-frame">${formatNumericValue(m.current_raw_value)}</span></td>
+      <td><strong>${formatNumericValue(m.current_value)}</strong>${m.current_value === undefined ? '' : ' ' + m.unit}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${m.mqtt_topic}">${m.mqtt_topic}</td>
       <td>${m.writable ? '<span class="badge badge-warning">'+(currentLang==='zh'?'\u53ef\u5199':'Yes')+'</span>' : '<span class="badge badge-success">'+(currentLang==='zh'?'\u53ea\u8bfb':'R/O')+'</span>'}</td>
       <td>[${m.range_min}, ${m.range_max}]</td>
@@ -1844,6 +1918,12 @@ function saveMapping() {
   const editIdx = parseInt(document.getElementById('editMappingIndex').value);
   if (editIdx >= 0) {
     const previous = mappings[editIdx];
+    if (previous.register_address === entry.register_address &&
+        previous.data_type === entry.data_type) {
+      entry.read_start_address = previous.read_start_address;
+      entry.read_register_count = previous.read_register_count;
+      entry.value_register_index = previous.value_register_index;
+    }
     entry.old_slave_id = previous.slave_id;
     entry.old_register_address = previous.register_address;
     entry.old_channel_id = previous.channel_id || 0;
@@ -1853,6 +1933,9 @@ function saveMapping() {
     showToast(t('toast.mapping_updated'), 'success');
     addLog('info', `[AMM] Updated mapping: slave=${entry.slave_id} reg=${entry.register_address} -> ${entry.device_id}/${entry.point_id}`);
   } else {
+    entry.read_start_address = entry.register_address;
+    entry.read_register_count = ['FLOAT32', 'INT32', 'UINT32'].includes(entry.data_type) ? 2 : 1;
+    entry.value_register_index = 0;
     mappings.push(entry);
     apiPost('/api/mappings', entry);
     showToast(t('toast.mapping_added'), 'success');
@@ -1929,49 +2012,6 @@ function testMqttConnection() {
   addLog('ok', '[MQTT] Connection test: OK (broker responded)');
 }
 
-function toggleOnenet() {
-  const enabled = document.getElementById('onenetEnabled').checked;
-  const fields = ['onenetProductId', 'onenetDeviceId', 'onenetDeviceKey', 'onenetMqttUri'];
-  const btns = ['btnOnenetSave', 'btnOnenetTest'];
-  fields.forEach(id => document.getElementById(id).disabled = !enabled);
-  btns.forEach(id => document.getElementById(id).disabled = !enabled);
-  if (enabled) {
-    document.getElementById('onenetStatusBadge').style.display = 'inline-block';
-  } else {
-    document.getElementById('onenetStatusBadge').style.display = 'none';
-  }
-}
-
-async function loadOnenetConfig() {
-  const data = await apiGet('/api/onenet/config');
-  if (data) {
-    document.getElementById('onenetEnabled').checked = data.enabled || false;
-    document.getElementById('onenetProductId').value = data.product_id || '';
-    document.getElementById('onenetDeviceId').value = data.device_id || '';
-    document.getElementById('onenetDeviceKey').value = data.device_key || '';
-    document.getElementById('onenetMqttUri').value = data.mqtt_uri || 'mqtts://mqtt.heclouds.com:8883';
-    toggleOnenet();
-  }
-}
-
-function saveOnenetConfig() {
-  const data = {
-    enabled: document.getElementById('onenetEnabled').checked,
-    product_id: document.getElementById('onenetProductId').value,
-    device_id: document.getElementById('onenetDeviceId').value,
-    device_key: document.getElementById('onenetDeviceKey').value,
-    mqtt_uri: document.getElementById('onenetMqttUri').value,
-  };
-  apiPut('/api/onenet/config', data);
-  showToast(t('toast.saved'), 'success');
-  addLog(data.enabled ? `[OneNET] Enabled with product=${data.product_id}` : '[OneNET] Disabled');
-}
-
-function testOnenetConnection() {
-  showToast(currentLang==='zh'?'OneNET \u8fde\u63a5\u6d4b\u8bd5\u6210\u529f':'OneNET connection test successful', 'success');
-  addLog('ok', '[OneNET] Connection test: OK');
-}
-
 function scanWifi() {
   showToast(currentLang==='zh'?'\u626b\u63cf\u5b8c\u6210\uff085 \u4e2a\u7f51\u7edc\uff09':'Scan complete (5 networks)', 'info');
   addLog('info', '[WiFi] Scan: found 5 networks');
@@ -2003,7 +2043,7 @@ async function fetchServerLogs() {
   if (data && Array.isArray(data) && data.length > 0) {
     if (!serverLogsFetched) {
       // First fetch: prepend server startup logs before client logs
-      const serverLines = data.map(l => ({ level: l.level, text: l.text }));
+      const serverLines = data.map(l => ({ level: l.level, text: l.text, _server: true }));
       logLines = serverLines.concat(logLines);
       serverLogsFetched = true;
     } else {
@@ -2028,6 +2068,99 @@ function exportLogs() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = 'gateway_logs.txt'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function filteredModbusLogs() {
+  const direction = document.getElementById('commDirectionFilter')?.value || '';
+  const slave = document.getElementById('commSlaveFilter')?.value || '';
+  const functionCode = document.getElementById('commFunctionFilter')?.value || '';
+  const status = document.getElementById('commStatusFilter')?.value || '';
+  return modbusLogEntries.filter(entry => {
+    if (direction && entry.direction !== direction) return false;
+    if (slave && Number(entry.slave_id) !== Number(slave)) return false;
+    if (functionCode && Number(entry.function_code) !== Number(functionCode)) return false;
+    if (status === 'ok' && Number(entry.status_code) !== 0) return false;
+    if (status === 'error' && Number(entry.status_code) === 0) return false;
+    return true;
+  });
+}
+
+function formatUptimeMs(timestampMs) {
+  const total = Math.max(0, Number(timestampMs) || 0);
+  const hours = Math.floor(total / 3600000);
+  const minutes = Math.floor((total % 3600000) / 60000);
+  const seconds = Math.floor((total % 60000) / 1000);
+  const milliseconds = Math.floor(total % 1000);
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
+}
+
+function renderModbusLogs() {
+  const tbody = document.getElementById('modbusLogBody');
+  if (!tbody) return;
+  const entries = filteredModbusLogs().slice().reverse();
+  if (entries.length === 0) {
+    tbody.innerHTML = `<tr><td class="empty-row" colspan="9">${t('logs.empty')}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = entries.map(entry => {
+    const ok = Number(entry.status_code) === 0;
+    const rawValues = Array.isArray(entry.register_values) ?
+      entry.register_values.map(formatNumericValue).join(', ') : '-';
+    const directionClass = entry.direction === 'TX' ? 'badge-info' : 'badge-success';
+    return `<tr>
+      <td>${entry.sequence}</td>
+      <td class="comm-frame">${formatUptimeMs(entry.timestamp_ms)}</td>
+      <td><span class="badge ${directionClass}">${entry.direction}</span></td>
+      <td>${entry.slave_id}</td>
+      <td>FC${String(entry.function_code).padStart(2, '0')}</td>
+      <td>${entry.register_address} / ${entry.register_count}</td>
+      <td class="comm-frame">${rawValues}</td>
+      <td class="comm-frame" title="${escapeHtml(entry.frame_hex)}">${escapeHtml(entry.frame_hex || '-')}</td>
+      <td><span class="badge ${ok ? 'badge-success' : 'badge-danger'}">${escapeHtml(ok ? 'OK' : entry.status)}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+async function fetchModbusLogs() {
+  const data = await apiGet('/api/modbus/logs');
+  if (Array.isArray(data)) {
+    modbusLogEntries = data;
+    renderModbusLogs();
+  }
+}
+
+async function clearModbusLogs() {
+  if (await apiDelete('/api/modbus/logs')) {
+    modbusLogEntries = [];
+    renderModbusLogs();
+    showToast(t('logs.cleared'), 'success');
+  } else {
+    showToast(t('toast.error'), 'error');
+  }
+}
+
+function csvCell(value) {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function exportModbusLogs() {
+  const headers = ['sequence', 'uptime_ms', 'direction', 'slave_id',
+    'function_code', 'register_address', 'register_count', 'raw_registers',
+    'frame_hex', 'status'];
+  const rows = filteredModbusLogs().map(entry => [
+    entry.sequence, entry.timestamp_ms, entry.direction, entry.slave_id,
+    entry.function_code, entry.register_address, entry.register_count,
+    Array.isArray(entry.register_values) ? entry.register_values.join('|') : '',
+    entry.frame_hex || '', entry.status || ''
+  ]);
+  const csv = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `modbus_rtu_logs_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+  anchor.click();
   URL.revokeObjectURL(url);
 }
 
@@ -2058,30 +2191,38 @@ function updateUptime() {
 /* ============================================================
  * Refresh All
  * ============================================================ */
+let refreshInProgress = false;
 async function refreshAll() {
-  const status = await apiGet('/api/system/status');
-  if (status) {
-    Object.assign(systemState, status);
-  }
-  const mapData = await apiGet('/api/mappings');
-  if (mapData && Array.isArray(mapData)) {
-    mappings = mapData;
-  }
-  await fetchServerLogs();
-  updateDashboard();
-  renderMappingTable();
+  if (refreshInProgress || document.hidden) return;
+  refreshInProgress = true;
+  try {
+    const status = await apiGet('/api/system/status');
+    if (status) {
+      Object.assign(systemState, status);
+    }
+    const mapData = await apiGet('/api/mappings');
+    if (Array.isArray(mapData)) {
+      mappings = mapData;
+    }
+    await fetchServerLogs();
+    if (document.getElementById('page-logs')?.classList.contains('active')) {
+      await fetchModbusLogs();
+    }
+    updateDashboard();
+    renderMappingTable();
 
-  // Refresh discovery status if on discover page
-  const discStatus = await apiGet('/api/discover/status');
-  if (discStatus) discoveryData.status = discStatus;
-  const discDevices = await apiGet('/api/discover/devices');
-  if (discDevices) {
-    discoveryData.devices = discDevices;
-    renderDiscoveredDevices();
+    const discStatus = await apiGet('/api/discover/status');
+    if (discStatus) discoveryData.status = discStatus;
+    const discDevices = await apiGet('/api/discover/devices');
+    if (discDevices) {
+      discoveryData.devices = discDevices;
+      renderDiscoveredDevices();
+    }
+    await bridgeCheckStatus();
+    await loadAutomationRules();
+  } finally {
+    refreshInProgress = false;
   }
-  // Refresh bridge status
-  await bridgeCheckStatus();
-  await loadAutomationRules();
 }
 
 function renderTcpEndpoints() {
@@ -2106,7 +2247,9 @@ function removeTcpEndpoint(index) {
 
 async function loadRuntimeForms() {
   const gateway = await apiGet('/api/gateway/config');
-  if (gateway && !localStorage.getItem('gateway_lang')) setLang(gateway.locale === 'en-US' ? 'en' : 'zh');
+  if (gateway && !localStorage.getItem('gateway_lang')) {
+    setLang(gateway.locale === 'en-US' ? 'en' : 'zh', false);
+  }
   const wifi = await apiGet('/api/wifi/config');
   if (wifi) {
     document.getElementById('wifiSsid').value = wifi.ssid || '';
@@ -2154,18 +2297,24 @@ async function startFullScan() {
   progressText.textContent = currentLang === 'zh' ? '\u6b63\u5728\u542f\u52a8\u626b\u63cf...' : 'Starting scan...';
 
   addLog('info', currentLang === 'zh' ? '[\u53d1\u73b0] \u5f00\u59cb\u5168\u91cf\u626b\u63cf...' : '[DISCOVER] Starting full scan...');
-  if (bridgeState.connected) {
-    addLog('info', (currentLang === 'zh'
-      ? '[\u53d1\u73b0] \u6865\u63a5\u6a21\u5f0f\uff1a\u901a\u8fc7 MODBUS TCP \u8bfb\u53d6 '
-      : '[DISCOVER] Bridge mode: reading via MODBUS TCP from ')
-      + bridgeState.host + ':' + bridgeState.port);
+  const regStartValue = parseInt(document.getElementById('scanRegStart').value);
+  const regEndValue = parseInt(document.getElementById('scanRegEnd').value);
+  const functionCodes = [];
+  if (document.getElementById('scanFc03').checked) functionCodes.push(3);
+  if (document.getElementById('scanFc04').checked) functionCodes.push(4);
+  if (functionCodes.length === 0) {
+    showToast(currentLang === 'zh' ? '\u8bf7\u81f3\u5c11\u9009\u62e9\u4e00\u4e2a\u529f\u80fd\u7801' : 'Select at least one function code', 'error');
+    btn.disabled = false;
+    progressEl.style.display = 'none';
+    return;
   }
-
   const params = {
     slave_start: parseInt(document.getElementById('scanSlaveStart').value) || 1,
-    slave_end: parseInt(document.getElementById('scanSlaveEnd').value) || 247,
-    reg_start: parseInt(document.getElementById('scanRegStart').value) || 40001,
-    reg_end: parseInt(document.getElementById('scanRegEnd').value) || 40999,
+    slave_end: parseInt(document.getElementById('scanSlaveEnd').value) || 10,
+    reg_start: Number.isFinite(regStartValue) ? regStartValue : 1,
+    reg_end: Number.isFinite(regEndValue) ? regEndValue : 16,
+    function_codes: functionCodes,
+    max_empty_gap: parseInt(document.getElementById('scanEmptyGap').value) || 8,
   };
 
   const startResult = await apiJson('POST', '/api/discover/scan', params);
@@ -2292,9 +2441,16 @@ function renderDiscoveredDevices() {
         <div style="cursor:pointer; flex:1;"
              onclick="this.parentElement.nextElementSibling.style.display=this.parentElement.nextElementSibling.style.display==='none'?'block':'none'">
           <strong>${dev.name || dev.device_id || ('Slave ' + dev.slave_id)}</strong>
+          <span style="margin-left:8px; padding:2px 6px; border-radius:4px; background:#dbeafe; color:#1e40af; font-size:11px;">
+            ${dev.source_protocol || 'RTU'}
+          </span>
           <span style="margin-left:12px; font-size:12px; color:var(--text2);">
             ${t('discover.slave_id')}: ${dev.slave_id} &middot; ${validRegs}/${regs.length} ${t('discover.registers')}
           </span>
+          <div style="font-size:11px; color:var(--text2); margin-top:3px;">
+            FC${String(dev.probe_function_code || 0).padStart(2, '0')}
+            &middot; ${t('discover.read_window')} ${dev.probe_address ?? '-'} + ${dev.probe_register_count || '-'}
+          </div>
           ${dev.description ? `<div style="font-size:11px; color:var(--text2); margin-top:2px;">${dev.description}</div>` : ''}
         </div>
         <div style="display:flex; align-items:center; gap:6px;">
@@ -2304,14 +2460,17 @@ function renderDiscoveredDevices() {
                 onclick="this.closest('div[style*=margin-bottom]').querySelector('.reg-panel').style.display=this.closest('div[style*=margin-bottom]').querySelector('.reg-panel').style.display==='none'?'block':'none'">&#9660;</span>
         </div>
       </div>
-      <div class="reg-panel" style="display:none;">
+      <div class="reg-panel" style="display:block; overflow-x:auto;">
         <table style="width:100%; border-collapse:collapse; font-size:13px;">
           <thead>
             <tr style="background:var(--surface2);">
               <th style="padding:6px 8px; text-align:left;">Addr</th>
+              <th style="padding:6px 8px; text-align:center;">FC</th>
               <th style="padding:6px 8px; text-align:left;">${t('discover.name')}</th>
               <th style="padding:6px 8px; text-align:left;">${t('discover.data_type')}</th>
+              <th style="padding:6px 8px; text-align:right;">${t('discover.raw_value')}</th>
               <th style="padding:6px 8px; text-align:right;">${t('discover.value')}</th>
+              <th style="padding:6px 8px; text-align:left;">${t('discover.read_window')}</th>
               <th style="padding:6px 8px; text-align:left;">${t('discover.unit')}</th>
               <th style="padding:6px 8px; text-align:center;">${t('discover.writable')}</th>
               <th style="padding:6px 8px; text-align:center;">${t('discover.valid')}</th>
@@ -2327,14 +2486,19 @@ function renderDiscoveredDevices() {
       const isValid = reg.valid !== false;
       const rowOpacity = isValid ? '1' : '0.45';
       const valStr = (typeof reg.sample_value === 'number') ? reg.sample_value.toFixed(2) : (reg.sample_value || '-');
+      const rawStr = (typeof reg.raw_value === 'number') ? reg.raw_value : '-';
+      const windowStr = `${reg.read_start_address ?? reg.register_address} + ${reg.read_register_count || 1} [${reg.value_register_index || 0}]`;
       const regName = reg.inferred_name || reg.name || '-';
       const regUnit = reg.inferred_unit || reg.unit || '';
 
       html += `<tr style="border-top:1px solid var(--border); opacity:${rowOpacity};">
         <td style="padding:5px 8px; font-family:monospace;">${reg.register_address}</td>
+        <td style="padding:5px 8px; text-align:center; font-family:monospace;">${String(reg.function_code || 0).padStart(2, '0')}</td>
         <td style="padding:5px 8px;">${regName}</td>
         <td style="padding:5px 8px;"><span style="color:${typeColor}; font-weight:600;">${reg.data_type}</span></td>
+        <td style="padding:5px 8px; text-align:right; font-family:monospace;">${rawStr}</td>
         <td style="padding:5px 8px; text-align:right; font-family:monospace;">${valStr}</td>
+        <td style="padding:5px 8px; font-family:monospace; white-space:nowrap;">${windowStr}</td>
         <td style="padding:5px 8px;">${regUnit}</td>
         <td style="padding:5px 8px; text-align:center;">
           ${reg.writable ? '<span style="color:#a6e3a1;">&#10003;</span>' : '<span style="color:var(--text2);">&#10007;</span>'}
@@ -2660,6 +2824,7 @@ async function deleteAutomationRule(id) {
 let bridgeState = { connected: false, host: 'localhost', port: 5020 };
 
 async function bridgeCheckStatus() {
+  if (!document.getElementById('bridgeStatus')) return;
   const result = await apiJson('GET', '/api/bridge/status');
   if (result && !result.error) {
     bridgeState = result;
@@ -2674,6 +2839,10 @@ function updateBridgeUI() {
   const modeBadge = document.getElementById('bridgeModeBadge');
   const hostInput = document.getElementById('bridgeHost');
   const portInput = document.getElementById('bridgePort');
+
+  if (!statusEl || !connectBtn || !disconnectBtn || !modeBadge || !hostInput || !portInput) {
+    return;
+  }
 
   if (bridgeState.connected) {
     statusEl.textContent = t('discover.bridge_connected') + ' (' + bridgeState.host + ':' + bridgeState.port + ')';
@@ -2726,25 +2895,31 @@ async function bridgeDisconnect() {
   }
 }
 
-// Check bridge status on page load (after a short delay)
-setTimeout(bridgeCheckStatus, 2000);
-
 /* ============================================================
  * Init
  * ============================================================ */
-setLang(currentLang);
+setLang(currentLang, false);
 updateDashboard();
 renderMappingTable();
 renderLogs();
+renderModbusLogs();
 const initialPage = new URLSearchParams(window.location.search).get('page');
 if (initialPage) document.querySelector(`.nav-item[data-page="${initialPage}"]`)?.click();
-fetchServerLogs(); // Fetch server-side logs on load
-loadOnenetConfig(); // Load OneNET configuration
-loadAutomationRules();
 toggleRuleAction();
-loadRuntimeForms();
+
+async function initializePage() {
+  await loadRuntimeForms();
+  await refreshAll();
+}
+initializePage();
 setInterval(updateUptime, 1000);
 setInterval(refreshAll, 10000); // Auto-refresh every 10s
+setInterval(() => {
+  if (!document.hidden &&
+      document.getElementById('page-logs')?.classList.contains('active')) {
+    fetchModbusLogs();
+  }
+}, 1500);
 </script>
 </body>
 </html>

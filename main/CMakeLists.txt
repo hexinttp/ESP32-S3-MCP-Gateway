@@ -11,6 +11,7 @@
          "tcm/tcm_context.c"
          "tcm/tcm_state_pool.c"
          "modbus/modbus_access.c"
+         "modbus/modbus_comm_log.c"
          "modbus/modbus_discover.c"
          "amm/amm_mapping.c"
          "mqtt_comm/mqtt_handler.c"
@@ -25,6 +26,22 @@
     INCLUDE_DIRS "." "web"
     REQUIRES driver esp_wifi esp_event esp_netif esp_eth lwip nvs_flash mqtt esp-modbus esp_timer
              fatfs wear_levelling sdmmc esp_driver_sdmmc esp_http_server json
-    EMBED_FILES "../web/web_config.html"
+)
+
+set(WEB_HTML "${CMAKE_CURRENT_LIST_DIR}/../web/web_config.html")
+set(WEB_HTML_GZIP "${CMAKE_CURRENT_BINARY_DIR}/web_config.html.gz")
+
+add_custom_command(
+    OUTPUT "${WEB_HTML_GZIP}"
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/gzip_asset.py"
+            "${WEB_HTML}" "${WEB_HTML_GZIP}"
+    DEPENDS "${WEB_HTML}" "${CMAKE_CURRENT_LIST_DIR}/gzip_asset.py"
+    COMMENT "Compressing gateway web UI"
+    VERBATIM
+)
+
+target_add_binary_data(
+    ${COMPONENT_LIB} "${WEB_HTML_GZIP}" BINARY
+    DEPENDS "${WEB_HTML}" "${CMAKE_CURRENT_LIST_DIR}/gzip_asset.py"
 )
 

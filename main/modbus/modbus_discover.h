@@ -29,6 +29,8 @@ extern "C" {
 
 #define DISCOVER_MAX_SLAVES           8   /**< Bounded RAM snapshot; rescan for larger buses */
 #define DISCOVER_MAX_REGS_PER_SLAVE  32   /**< Max registers retained per discovered slave */
+#define DISCOVER_MAX_BLOCK_REGS       8   /**< Largest adaptive read block used for discovery */
+#define DISCOVER_DEFAULT_EMPTY_GAP    8   /**< Stop after this many empty addresses after data */
 #define DISCOVER_BROADCAST_TIMEOUT   100  /**< ms, timeout for quick slave probe */
 #define DISCOVER_SCAN_TIMEOUT        500  /**< ms, timeout for register scan */
 
@@ -40,8 +42,12 @@ extern "C" {
 typedef struct {
     uint16_t    register_address;
     uint8_t     function_code;      /**< 03 = holding, 04 = input */
+    uint16_t    raw_value;          /**< Unscaled 16-bit sample */
     data_type_t inferred_type;      /**< Best-guess data type */
     float       sample_value;       /**< Value read during scan */
+    uint16_t    read_start_address; /**< Start of the successful read window */
+    uint8_t     read_register_count;/**< Registers required by the device response */
+    uint8_t     value_register_index;/**< This point's index inside the read window */
     char        inferred_name[32];  /**< e.g. "Motor temperature" */
     char        inferred_unit[16];  /**< e.g. "degC" */
     bool        writable;           /**< true if FC06 write succeeds */
@@ -53,10 +59,15 @@ typedef struct {
  */
 typedef struct {
     uint8_t  slave_id;
+    source_protocol_t source_protocol; /**< RTU bus or TCP endpoint */
+    uint8_t  channel_id;               /**< RTU=0, TCP endpoint_id */
     char     device_id[32];         /**< Auto-generated, e.g. "device_slave_01" */
     char     name[48];              /**< User-editable display name */
     char     description[64];       /**< User-editable description */
     char     mqtt_topic_prefix[64]; /**< MQTT topic prefix for this device */
+    uint8_t  probe_function_code;   /**< Function code that proved device liveness */
+    uint16_t probe_address;         /**< Address used by the successful probe */
+    uint8_t  probe_register_count;  /**< Block size required by the successful probe */
     uint16_t reg_count;             /**< Number of discovered registers */
     discovered_register_t registers[DISCOVER_MAX_REGS_PER_SLAVE];
     bool     active;                /**< true if device responded to probe */
@@ -82,8 +93,11 @@ typedef struct {
     uint8_t  slave_end;             /**< Last slave ID to scan (default: 247) */
     uint16_t reg_start;             /**< First register address (default: 40001) */
     uint16_t reg_end;               /**< Last register address (default: 40100) */
+    source_protocol_t source_protocol; /**< MODBUS RTU or TCP */
+    uint8_t  channel_id;            /**< TCP endpoint id; RTU uses 0 */
     uint8_t  function_codes[2];     /**< FC list: {0x03, 0x04} */
     uint8_t  fc_count;              /**< Number of function codes */
+    uint8_t  max_empty_gap;         /**< Stop after N empty addresses after first data */
 } discover_scan_params_t;
 
 /* ======================== API Functions ======================== */

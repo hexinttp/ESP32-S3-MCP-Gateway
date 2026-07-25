@@ -24,19 +24,34 @@ static wl_handle_t s_wl = WL_INVALID_HANDLE;
 static SemaphoreHandle_t s_mutex;
 static bool s_flash_ready;
 static int s_data_loss;
+static int s_flash_count;
+static int s_tf_count;
+static uint32_t s_flash_oldest;
+static uint32_t s_tf_oldest;
+static bool s_flash_oldest_valid;
+static bool s_tf_oldest_valid;
 
 static void record_path(char *out, size_t size, const char *directory, uint32_t sequence_id)
 {
-    snprintf(out, size, "%s/%010lu.tcm", directory, (unsigned long)sequence_id);
+    /* Eight hexadecimal characters keep the filename compatible with FAT 8.3. */
+    snprintf(out, size, "%s/%08lX.TCM", directory, (unsigned long)sequence_id);
 }
 
 static bool parse_sequence(const char *name, uint32_t *sequence)
 {
     size_t len = strlen(name);
-    if (len < 5 || strcmp(name + len - 4, ".tcm") != 0) return false;
+    if (len != 12 || name[8] != '.' ||
+        (name[9] != 't' && name[9] != 'T') ||
+        (name[10] != 'c' && name[10] != 'C') ||
+        (name[11] != 'm' && name[11] != 'M')) {
+        return false;
+    }
+    char stem[9];
+    memcpy(stem, name, 8);
+    stem[8] = '\0';
     char *end = NULL;
-    unsigned long value = strtoul(name, &end, 10);
-    if (end == name || strcmp(end, ".tcm") != 0) return false;
+    unsigned long value = strtoul(stem, &end, 16);
+    if (end != stem + 8) return false;
     *sequence = (uint32_t)value;
     return true;
 }
@@ -72,13 +87,61 @@ static int count_in(const char *directory)
     return count;
 }
 
+static void load_store_state(const char *directory, int *count,
+                             uint32_t *oldest, bool *oldest_valid)
+{
+    *count = count_in(directory);
+    *oldest = 0;
+    *oldest_valid = find_oldest_in(directory, oldest);
+}
+
+static void advance_oldest(const char *directory, int count,
+                           uint32_t removed_sequence, uint32_t *oldest,
+                           bool *oldest_valid)
+{
+    if (count <= 0) {
+        *oldest = 0;
+        *oldest_valid = false;
+        return;
+    }
+    uint32_t candidate = removed_sequence + 1;
+    char path[64];
+    record_path(path, sizeof(path), directory, candidate);
+    if (access(path, F_OK) == 0) {
+        *oldest = candidate;
+        *oldest_valid = true;
+        return;
+    }
+    *oldest = 0;
+    *oldest_valid = find_oldest_in(directory, oldest);
+}
+
+static bool remove_oldest(const char *directory, int *count,
+                          uint32_t *oldest, bool *oldest_valid)
+{
+    if (*count <= 0 || !*oldest_valid) return false;
+    uint32_t removed = *oldest;
+    char path[64];
+    record_path(path, sizeof(path), directory, removed);
+    if (unlink(path) != 0) {
+        load_store_state(directory, count, oldest, oldest_valid);
+        return false;
+    }
+    --(*count);
+    advance_oldest(directory, *count, removed, oldest, oldest_valid);
+    return true;
+}
+
 static esp_err_t write_record(const char *directory, uint32_t sequence_id,
                               const char *topic, const char *payload)
 {
     char path[64];
     record_path(path, sizeof(path), directory, sequence_id);
     FILE *file = fopen(path, "wb");
-    if (file == NULL) return ESP_FAIL;
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Open %s failed: errno=%d (%s)", path, errno, strerror(errno));
+        return ESP_FAIL;
+    }
     int result = fprintf(file, "%lu\n%s\n%s", (unsigned long)sequence_id, topic, payload);
     if (fflush(file) != 0) result = -1;
     fsync(fileno(file));
@@ -124,8 +187,29 @@ esp_err_t offline_store_init(void)
         ESP_LOGE(TAG, "SPI Flash cache mount failed: %s", esp_err_to_name(err));
         return err;
     }
-    mkdir(FLASH_CACHE_DIR, 0775);
+    if (mkdir(FLASH_CACHE_DIR, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "Create cache directory failed: errno=%d (%s)",
+                 errno, strerror(errno));
+        return ESP_FAIL;
+    }
     s_flash_ready = true;
+    load_store_state(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,
+                     &s_flash_oldest_valid);
+    int pruned = 0;
+    while (s_flash_count > UIF_CACHE_MAX_RECORDS &&
+           remove_oldest(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,
+                         &s_flash_oldest_valid)) {
+        ++pruned;
+        ++s_data_loss;
+    }
+    if (pruned > 0) {
+        ESP_LOGW(TAG, "Pruned %d legacy cache records to capacity %d",
+                 pruned, UIF_CACHE_MAX_RECORDS);
+    }
+    if (tf_storage_is_mounted()) {
+        load_store_state(TF_CACHE_DIR, &s_tf_count, &s_tf_oldest,
+                         &s_tf_oldest_valid);
+    }
     ESP_LOGI(TAG, "Primary SPI Flash cache mounted at %s", FLASH_MOUNT_POINT);
     return ESP_OK;
 }
@@ -135,21 +219,54 @@ esp_err_t offline_store_put(uint32_t sequence_id, const char *topic, const char 
     if (!s_flash_ready || topic == NULL || payload == NULL) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint64_t total = 0, free = 0;
-    esp_vfs_fat_info(FLASH_MOUNT_POINT, &total, &free);
+    esp_err_t info_err = esp_vfs_fat_info(FLASH_MOUNT_POINT, &total, &free);
     esp_err_t err = ESP_FAIL;
-    if (free > FLASH_RESERVE_BYTES + strlen(payload) + strlen(topic) + 64) {
+    if (info_err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI Flash space query failed: %s", esp_err_to_name(info_err));
+    } else if (s_flash_count < UIF_CACHE_MAX_RECORDS &&
+               free > FLASH_RESERVE_BYTES + strlen(payload) + strlen(topic) + 64) {
         err = write_record(FLASH_CACHE_DIR, sequence_id, topic, payload);
+        if (err == ESP_OK) {
+            ++s_flash_count;
+            if (!s_flash_oldest_valid || sequence_id < s_flash_oldest) {
+                s_flash_oldest = sequence_id;
+                s_flash_oldest_valid = true;
+            }
+        }
+    } else {
+        ESP_LOGD(TAG, "SPI Flash cache capacity reached: records=%d free=%llu",
+                 s_flash_count, (unsigned long long)free);
     }
     if (err != ESP_OK && tf_storage_is_mounted()) {
+        if (s_tf_count >= UIF_CACHE_MAX_RECORDS &&
+            remove_oldest(TF_CACHE_DIR, &s_tf_count, &s_tf_oldest,
+                          &s_tf_oldest_valid)) {
+            ++s_data_loss;
+        }
         err = write_record(TF_CACHE_DIR, sequence_id, topic, payload);
-        if (err != ESP_OK) {
-            uint32_t oldest = 0;
-            if (find_oldest_in(TF_CACHE_DIR, &oldest)) {
-                char path[64];
-                record_path(path, sizeof(path), TF_CACHE_DIR, oldest);
-                unlink(path);
-                ++s_data_loss;
-                err = write_record(TF_CACHE_DIR, sequence_id, topic, payload);
+        if (err != ESP_OK &&
+            remove_oldest(TF_CACHE_DIR, &s_tf_count, &s_tf_oldest,
+                          &s_tf_oldest_valid)) {
+            ++s_data_loss;
+            err = write_record(TF_CACHE_DIR, sequence_id, topic, payload);
+        }
+        if (err == ESP_OK) {
+            ++s_tf_count;
+            if (!s_tf_oldest_valid || sequence_id < s_tf_oldest) {
+                s_tf_oldest = sequence_id;
+                s_tf_oldest_valid = true;
+            }
+        }
+    } else if (err != ESP_OK && !tf_storage_is_mounted() &&
+               remove_oldest(FLASH_CACHE_DIR, &s_flash_count,
+                             &s_flash_oldest, &s_flash_oldest_valid)) {
+        ++s_data_loss;
+        err = write_record(FLASH_CACHE_DIR, sequence_id, topic, payload);
+        if (err == ESP_OK) {
+            ++s_flash_count;
+            if (!s_flash_oldest_valid) {
+                s_flash_oldest = sequence_id;
+                s_flash_oldest_valid = true;
             }
         }
     }
@@ -183,6 +300,20 @@ esp_err_t offline_store_remove(uint32_t sequence_id)
     record_path(tf_path, sizeof(tf_path), TF_CACHE_DIR, sequence_id);
     int flash_result = unlink(flash_path);
     int tf_result = unlink(tf_path);
+    if (flash_result == 0 && s_flash_count > 0) {
+        --s_flash_count;
+        if (s_flash_oldest_valid && s_flash_oldest == sequence_id) {
+            advance_oldest(FLASH_CACHE_DIR, s_flash_count, sequence_id,
+                           &s_flash_oldest, &s_flash_oldest_valid);
+        }
+    }
+    if (tf_result == 0 && s_tf_count > 0) {
+        --s_tf_count;
+        if (s_tf_oldest_valid && s_tf_oldest == sequence_id) {
+            advance_oldest(TF_CACHE_DIR, s_tf_count, sequence_id,
+                           &s_tf_oldest, &s_tf_oldest_valid);
+        }
+    }
     xSemaphoreGive(s_mutex);
     return (flash_result == 0 || tf_result == 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
@@ -190,8 +321,7 @@ esp_err_t offline_store_remove(uint32_t sequence_id)
 int offline_store_count(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int count = count_in(FLASH_CACHE_DIR);
-    if (tf_storage_is_mounted()) count += count_in(TF_CACHE_DIR);
+    int count = s_flash_count + (tf_storage_is_mounted() ? s_tf_count : 0);
     xSemaphoreGive(s_mutex);
     return count;
 }

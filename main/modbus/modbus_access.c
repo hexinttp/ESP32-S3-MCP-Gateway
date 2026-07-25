@@ -17,6 +17,7 @@
 #include "config/runtime_config.h"
 
 #include "modbus_access.h"
+#include "modbus/modbus_comm_log.h"
 #include "gateway_config.h"
 
 #include "mbcontroller.h"           /* ESP-IDF freemodbus master API     */
@@ -52,6 +53,100 @@ static void *s_master_handle = NULL;
 static bool s_initialised = false;
 
 static uint16_t s_tcp_transaction_id;
+
+/*
+ * esp-modbus 2.x requires a non-empty descriptor table before start, even
+ * when all transactions use mbc_master_send_request() dynamically.
+ */
+static const mb_parameter_descriptor_t s_dynamic_request_descriptor[] = {
+    {
+        .cid = 0,
+        .param_key = "dynamic_request",
+        .param_units = "",
+        .mb_slave_addr = 1,
+        .mb_param_type = MB_PARAM_HOLDING,
+        .mb_reg_start = 0,
+        .mb_size = 1,
+        .param_offset = 0,
+        .param_type = PARAM_TYPE_U16,
+        .param_size = sizeof(uint16_t),
+        .param_opts = {.opt1 = 0, .opt2 = 0, .opt3 = 0},
+        .access = PAR_PERMS_READ_WRITE,
+    },
+};
+
+static uint16_t modbus_rtu_crc16(const uint8_t *data, size_t length)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1U) ? (uint16_t)((crc >> 1) ^ 0xA001U) :
+                               (uint16_t)(crc >> 1);
+        }
+    }
+    return crc;
+}
+
+static size_t append_rtu_crc(uint8_t *frame, size_t payload_length)
+{
+    uint16_t crc = modbus_rtu_crc16(frame, payload_length);
+    frame[payload_length] = (uint8_t)crc;
+    frame[payload_length + 1] = (uint8_t)(crc >> 8);
+    return payload_length + 2;
+}
+
+static size_t build_rtu_read_request(uint8_t *frame, uint8_t slave_id,
+                                     uint8_t function_code, uint16_t reg_addr,
+                                     uint16_t reg_count)
+{
+    frame[0] = slave_id;
+    frame[1] = function_code;
+    frame[2] = (uint8_t)(reg_addr >> 8);
+    frame[3] = (uint8_t)reg_addr;
+    frame[4] = (uint8_t)(reg_count >> 8);
+    frame[5] = (uint8_t)reg_count;
+    return append_rtu_crc(frame, 6);
+}
+
+static size_t build_rtu_read_response(uint8_t *frame, uint8_t slave_id,
+                                      uint8_t function_code,
+                                      const uint16_t *values,
+                                      uint16_t reg_count)
+{
+    frame[0] = slave_id;
+    frame[1] = function_code;
+    frame[2] = (uint8_t)(reg_count * 2U);
+    for (uint16_t i = 0; i < reg_count; ++i) {
+        frame[3 + i * 2] = (uint8_t)(values[i] >> 8);
+        frame[4 + i * 2] = (uint8_t)values[i];
+    }
+    return append_rtu_crc(frame, 3 + reg_count * 2U);
+}
+
+static size_t build_rtu_write_request(uint8_t *frame, uint8_t slave_id,
+                                      uint8_t function_code, uint16_t reg_addr,
+                                      uint16_t reg_count,
+                                      const uint16_t *values)
+{
+    frame[0] = slave_id;
+    frame[1] = function_code;
+    frame[2] = (uint8_t)(reg_addr >> 8);
+    frame[3] = (uint8_t)reg_addr;
+    if (function_code == 6) {
+        frame[4] = (uint8_t)(values[0] >> 8);
+        frame[5] = (uint8_t)values[0];
+        return append_rtu_crc(frame, 6);
+    }
+    frame[4] = (uint8_t)(reg_count >> 8);
+    frame[5] = (uint8_t)reg_count;
+    frame[6] = (uint8_t)(reg_count * 2U);
+    for (uint16_t i = 0; i < reg_count; ++i) {
+        frame[7 + i * 2] = (uint8_t)(values[i] >> 8);
+        frame[8 + i * 2] = (uint8_t)values[i];
+    }
+    return append_rtu_crc(frame, 7 + reg_count * 2U);
+}
 
 static esp_err_t socket_send_all(int socket_fd, const uint8_t *data, size_t size)
 {
@@ -241,6 +336,10 @@ static esp_err_t modbus_read_registers_internal(uint8_t slave_id,
         .reg_size        = reg_count,
         .command         = (reg_type == MB_PARAM_HOLDING) ? 3 : 4,
     };
+    uint8_t function_code = (reg_type == MB_PARAM_HOLDING) ? 3 : 4;
+    uint8_t tx_frame[8];
+    size_t tx_length = build_rtu_read_request(tx_frame, slave_id, function_code,
+                                              reg_addr, reg_count);
 
     /* ---- Send request (under lock) ---- */
     esp_err_t err = modbus_lock();
@@ -248,9 +347,23 @@ static esp_err_t modbus_read_registers_internal(uint8_t slave_id,
         return err;
     }
 
+    modbus_comm_log_add(MODBUS_COMM_TX, slave_id, function_code, reg_addr,
+                        reg_count, ESP_OK, tx_frame, tx_length);
     esp_err_t mb_err = mbc_master_send_request(s_master_handle, &req, raw_regs);
 
     modbus_unlock();
+
+    if (mb_err == ESP_OK) {
+        uint8_t rx_frame[3 + MODBUS_MAX_REG_COUNT * 2 + 2];
+        size_t rx_length = build_rtu_read_response(rx_frame, slave_id,
+                                                   function_code, raw_regs,
+                                                   reg_count);
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, reg_addr,
+                            reg_count, ESP_OK, rx_frame, rx_length);
+    } else {
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, reg_addr,
+                            reg_count, mb_err, NULL, 0);
+    }
 
     if (mb_err != ESP_OK) {
         ESP_LOGE(TAG, "Read FC%02d slave=%u addr=%u cnt=%u failed: %s",
@@ -296,6 +409,11 @@ static esp_err_t modbus_write_registers_internal(uint8_t slave_id,
         .reg_size        = reg_count,
         .command         = cmd_type,
     };
+    uint8_t function_code = (cmd_type == 6) ? 6 : 16;
+    uint8_t tx_frame[9 + MODBUS_MAX_REG_COUNT * 2];
+    size_t tx_length = build_rtu_write_request(tx_frame, slave_id,
+                                               function_code, reg_addr,
+                                               reg_count, values);
 
     /* ---- Send request (under lock) ---- */
     esp_err_t err = modbus_lock();
@@ -303,9 +421,33 @@ static esp_err_t modbus_write_registers_internal(uint8_t slave_id,
         return err;
     }
 
+    modbus_comm_log_add(MODBUS_COMM_TX, slave_id, function_code, reg_addr,
+                        reg_count, ESP_OK, tx_frame, tx_length);
     esp_err_t mb_err = mbc_master_send_request(s_master_handle, &req, values);
 
     modbus_unlock();
+
+    if (mb_err == ESP_OK) {
+        uint8_t rx_frame[8];
+        size_t rx_length;
+        if (function_code == 6) {
+            memcpy(rx_frame, tx_frame, sizeof(rx_frame));
+            rx_length = sizeof(rx_frame);
+        } else {
+            rx_frame[0] = slave_id;
+            rx_frame[1] = function_code;
+            rx_frame[2] = (uint8_t)(reg_addr >> 8);
+            rx_frame[3] = (uint8_t)reg_addr;
+            rx_frame[4] = (uint8_t)(reg_count >> 8);
+            rx_frame[5] = (uint8_t)reg_count;
+            rx_length = append_rtu_crc(rx_frame, 6);
+        }
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, reg_addr,
+                            reg_count, ESP_OK, rx_frame, rx_length);
+    } else {
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, reg_addr,
+                            reg_count, mb_err, NULL, 0);
+    }
 
     if (mb_err != ESP_OK) {
         ESP_LOGE(TAG, "Write FC%02d slave=%u addr=%u cnt=%u failed: %s",
@@ -326,6 +468,7 @@ static esp_err_t modbus_write_registers_internal(uint8_t slave_id,
 esp_err_t modbus_rtu_init(void)
 {
     esp_err_t err;
+    modbus_comm_log_init();
     runtime_config_t runtime;
     runtime_config_get(&runtime);
 
@@ -373,6 +516,17 @@ esp_err_t modbus_rtu_init(void)
                        UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_set_pin() failed: %s", esp_err_to_name(err));
+        mbc_master_delete(s_master_handle);
+        s_master_handle = NULL;
+        return err;
+    }
+    err = mbc_master_set_descriptor(
+        s_master_handle, s_dynamic_request_descriptor,
+        sizeof(s_dynamic_request_descriptor) /
+            sizeof(s_dynamic_request_descriptor[0]));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mbc_master_set_descriptor() failed: %s",
+                 esp_err_to_name(err));
         mbc_master_delete(s_master_handle);
         s_master_handle = NULL;
         return err;

@@ -291,6 +291,13 @@ void mqtt_init(void)
         ESP_LOGW(TAG, "MQTT is disabled by runtime configuration");
         return;
     }
+    if (runtime.mqtt.uri[0] == '\0' ||
+        (strcmp(runtime.mqtt.uri, MQTT_BROKER_URI) == 0 &&
+         runtime.mqtt.username[0] == '\0' &&
+         runtime.mqtt.password[0] == '\0')) {
+        ESP_LOGW(TAG, "MQTT broker is still the unconfigured placeholder; client not started");
+        return;
+    }
     strlcpy(s_runtime_broker, runtime.mqtt.uri, sizeof(s_runtime_broker));
     strlcpy(s_runtime_client_id, runtime.mqtt.client_id, sizeof(s_runtime_client_id));
     strlcpy(s_runtime_username, runtime.mqtt.username, sizeof(s_runtime_username));

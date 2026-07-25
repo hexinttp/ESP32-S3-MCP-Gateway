@@ -25,6 +25,9 @@ extern "C" {
 #define AMM_NVS_NAMESPACE       "amm_mapping"
 #define AMM_NVS_KEY_COUNT       "entry_cnt"
 #define AMM_NVS_KEY_ENTRY_PREFIX "entry_"
+#define AMM_NVS_KEY_SCHEMA      "schema_ver"
+#define AMM_NVS_SCHEMA_VERSION  3
+#define AMM_MAX_READ_REGISTERS  8
 
 /* ======================== Mapping Entry ======================== */
 
@@ -56,6 +59,9 @@ typedef struct {
     char     mqtt_topic[AMM_MAX_TOPIC_LEN];
     control_constraint_t constraint;
     bool     active;
+    uint16_t read_start_address;  /**< Start of the Modbus read window */
+    uint8_t  read_register_count; /**< Total registers read for this point */
+    uint8_t  value_register_index;/**< Value offset inside the read window */
 } amm_mapping_entry_t;
 
 /* ======================== Validation Result ======================== */
@@ -72,10 +78,10 @@ typedef struct {
 /* ======================== API Functions ======================== */
 
 /**
- * @brief Initialize AMM with default mapping table.
+ * @brief Initialize the AMM mapping table.
  *
  * Creates the internal mutex, attempts to load persisted mappings from NVS,
- * and falls back to built-in default entries when NVS is empty or corrupted.
+ * and starts with an empty table when NVS has no mapping data.
  */
 void amm_init(void);
 

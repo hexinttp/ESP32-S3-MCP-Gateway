@@ -28,6 +28,8 @@
 #include "gateway_config.h"
 #include "amm/amm_mapping.h"
 #include "tcm/tcm_context.h"
+#include "tcm/tcm_state_pool.h"
+#include "modbus/modbus_comm_log.h"
 #include "mqtt_comm/mqtt_handler.h"
 #include "eval/eval_logger.h"
 #include "automation/automation_web.h"
@@ -54,8 +56,8 @@ static esp_err_t httpd_req_get_url_str(httpd_req_t *req, char *buffer, size_t si
 }
 
 /* ---- Embedded HTML page (linked via CMake EMBED_FILES) ---- */
-extern const uint8_t web_config_html_start[] asm("_binary_web_config_html_start");
-extern const uint8_t web_config_html_end[]   asm("_binary_web_config_html_end");
+extern const uint8_t web_config_html_gz_start[] asm("_binary_web_config_html_gz_start");
+extern const uint8_t web_config_html_gz_end[]   asm("_binary_web_config_html_gz_end");
 
 /* ================================================================
  * Helper: send JSON response
@@ -64,6 +66,7 @@ static esp_err_t send_json(httpd_req_t *req, const char *json_str)
 {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json_str, strlen(json_str));
     return ESP_OK;
 }
@@ -102,12 +105,83 @@ static cJSON *parse_request_json(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
-    size_t html_len = (size_t)(web_config_html_end - web_config_html_start);
-    httpd_resp_send(req, (const char *)web_config_html_start, html_len);
-    ESP_LOGI(TAG, "Served web_config.html (%u bytes)", (unsigned)html_len);
+    size_t html_len = (size_t)(web_config_html_gz_end - web_config_html_gz_start);
+    char loader[2048];
+    int loader_len = snprintf(
+        loader, sizeof(loader),
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>ESP32-S3 Gateway</title>"
+        "<style>body{margin:0;display:grid;place-items:center;min-height:100vh;"
+        "font-family:Arial,sans-serif;background:#f2f5f8;color:#102033}"
+        ".box{text-align:center}.bar{width:240px;height:5px;background:#d9e2ec;"
+        "overflow:hidden;margin:18px auto}.fill{height:100%%;width:0;background:#1473e6;"
+        "transition:width .12s}.error{color:#b42318;max-width:520px}</style></head>"
+        "<body><div class=\"box\"><strong>ESP32-S3 Gateway</strong>"
+        "<div class=\"bar\"><div class=\"fill\" id=\"p\"></div></div>"
+        "<div id=\"s\">Loading configuration...</div></div><script>"
+        "(async()=>{try{if(!('DecompressionStream'in window))"
+        "throw new Error('Browser decompression is unavailable');"
+        "const total=%u,size=4096,parts=[];"
+        "for(let offset=0;offset<total;offset+=size){"
+        "const r=await fetch('/ui.bin?offset='+offset,{cache:'no-store'});"
+        "if(!r.ok)throw new Error('UI segment '+offset+' failed: '+r.status);"
+        "parts.push(await r.arrayBuffer());"
+        "document.getElementById('p').style.width="
+        "Math.min(100,Math.round((offset+size)*100/total))+'%%';"
+        "if(offset+size<total)await new Promise(done=>setTimeout(done,250));}"
+        "const stream=new Blob(parts).stream().pipeThrough(new DecompressionStream('gzip'));"
+        "const html=await new Response(stream).text();"
+        "document.open();document.write(html);document.close();"
+        "}catch(e){const s=document.getElementById('s');s.className='error';"
+        "s.textContent='Page load failed / 页面加载失败: '+e.message;}})();"
+        "</script></body></html>",
+        (unsigned)html_len);
+    if (loader_len <= 0 || (size_t)loader_len >= sizeof(loader)) {
+        return ESP_ERR_HTTPD_RESP_HDR;
+    }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t err = httpd_resp_send(req, loader, loader_len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Web UI loader transfer failed: %s", esp_err_to_name(err));
+        return err;
+    }
     return ESP_OK;
+}
+
+/* GET /ui.bin - Serve bounded pieces to stay below the TCP send window. */
+static esp_err_t ui_asset_get_handler(httpd_req_t *req)
+{
+    char query[48] = {0};
+    char offset_text[16] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "offset", offset_text, sizeof(offset_text)) != ESP_OK) {
+        httpd_resp_send_400(req);
+        return ESP_OK;
+    }
+
+    char *end = NULL;
+    unsigned long requested = strtoul(offset_text, &end, 10);
+    size_t html_len = (size_t)(web_config_html_gz_end - web_config_html_gz_start);
+    if (end == offset_text || *end != '\0' || requested >= html_len ||
+        requested % 4096 != 0) {
+        httpd_resp_send_400(req);
+        return ESP_OK;
+    }
+
+    size_t offset = (size_t)requested;
+    size_t part_len = html_len - offset;
+    if (part_len > 4096) part_len = 4096;
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(
+        req, (const char *)web_config_html_gz_start + offset, part_len);
 }
 
 /* ================================================================
@@ -352,12 +426,20 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
 static esp_err_t mappings_get_handler(httpd_req_t *req)
 {
     cJSON *arr = cJSON_CreateArray();
-    amm_mapping_entry_t *entries = calloc(AMM_MAX_MAPPING_ENTRIES, sizeof(*entries));
-    if (entries == NULL) {
+    if (arr == NULL) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+
+    int active_count = amm_get_mapping_count();
+    amm_mapping_entry_t *entries = NULL;
+    if (active_count > 0) {
+        entries = calloc((size_t)active_count, sizeof(*entries));
+    }
+    if (active_count > 0 && entries == NULL) {
         cJSON_Delete(arr);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
     }
-    int entry_count = amm_get_entries(entries, AMM_MAX_MAPPING_ENTRIES);
+    int entry_count = active_count > 0 ? amm_get_entries(entries, active_count) : 0;
 
     for (int i = 0; i < entry_count; i++) {
         amm_mapping_entry_t *e = &entries[i];
@@ -376,6 +458,9 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(obj, "offset", e->offset);
         cJSON_AddNumberToObject(obj, "function_code", e->function_code);
         cJSON_AddNumberToObject(obj, "byte_order", e->byte_order);
+        cJSON_AddNumberToObject(obj, "read_start_address", e->read_start_address);
+        cJSON_AddNumberToObject(obj, "read_register_count", e->read_register_count);
+        cJSON_AddNumberToObject(obj, "value_register_index", e->value_register_index);
         cJSON_AddNumberToObject(obj, "poll_interval_ms", e->poll_interval_ms);
         cJSON_AddNumberToObject(obj, "priority", e->priority);
         cJSON_AddNumberToObject(obj, "mapping_version", e->mapping_version);
@@ -387,6 +472,14 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddBoolToObject(obj, "writable", e->constraint.writable);
         cJSON_AddNumberToObject(obj, "range_min", e->constraint.valid_range_min);
         cJSON_AddNumberToObject(obj, "range_max", e->constraint.valid_range_max);
+        tcm_context_t state;
+        if (tcm_state_pool_get(e->device_id, e->point_id, &state) == ESP_OK) {
+            cJSON_AddNumberToObject(obj, "current_raw_value", state.raw_value);
+            cJSON_AddNumberToObject(obj, "current_value", state.value);
+            cJSON_AddNumberToObject(obj, "current_timestamp_ms",
+                                    (double)state.timestamp_ms);
+            cJSON_AddNumberToObject(obj, "quality_state", state.quality_state);
+        }
         cJSON_AddItemToArray(arr, obj);
     }
 
@@ -441,6 +534,12 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         entry.function_code = (uint8_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "byte_order")) && cJSON_IsNumber(v))
         entry.byte_order = (byte_order_t)v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "read_start_address")) && cJSON_IsNumber(v))
+        entry.read_start_address = (uint16_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "read_register_count")) && cJSON_IsNumber(v))
+        entry.read_register_count = (uint8_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "value_register_index")) && cJSON_IsNumber(v))
+        entry.value_register_index = (uint8_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "poll_interval_ms")) && cJSON_IsNumber(v))
         entry.poll_interval_ms = (uint32_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "priority")) && cJSON_IsNumber(v))
@@ -618,6 +717,78 @@ static esp_err_t system_logs_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t send_err = httpd_resp_send_chunk(req, "[", 1);
+    int count = modbus_comm_log_count();
+    for (int i = 0; i < count; ++i) {
+        modbus_comm_log_entry_t entry;
+        if (!modbus_comm_log_get(i, &entry)) continue;
+
+        char hex[MODBUS_COMM_FRAME_MAX * 3 + 1];
+        size_t used = 0;
+        for (uint8_t j = 0; j < entry.frame_length && used + 4 < sizeof(hex); ++j) {
+            int written = snprintf(hex + used, sizeof(hex) - used,
+                                   j == 0 ? "%02X" : " %02X", entry.frame[j]);
+            if (written < 0) break;
+            used += (size_t)written;
+        }
+        hex[used] = '\0';
+
+        char values[MODBUS_COMM_FRAME_MAX * 3 + 1] = "";
+        if (entry.direction == MODBUS_COMM_RX && entry.status == ESP_OK &&
+            (entry.function_code == 3 || entry.function_code == 4) &&
+            entry.frame_length >= 5) {
+            uint8_t available = (uint8_t)((entry.frame_length - 5) / 2);
+            uint8_t value_count = entry.register_count < available ?
+                                  entry.register_count : available;
+            size_t value_used = 0;
+            for (uint8_t j = 0; j < value_count; ++j) {
+                uint16_t value = ((uint16_t)entry.frame[3 + j * 2] << 8) |
+                                 entry.frame[4 + j * 2];
+                int written = snprintf(values + value_used,
+                                       sizeof(values) - value_used,
+                                       j == 0 ? "%u" : ",%u", value);
+                if (written < 0 || (size_t)written >=
+                    sizeof(values) - value_used) break;
+                value_used += (size_t)written;
+            }
+        }
+        char chunk[640];
+        int length = snprintf(
+            chunk, sizeof(chunk),
+            "%s{\"sequence\":%lu,\"timestamp_ms\":%" PRId64
+            ",\"direction\":\"%s\",\"slave_id\":%u,\"function_code\":%u,"
+            "\"register_address\":%u,\"register_count\":%u,"
+            "\"status_code\":%ld,\"status\":\"%s\",\"truncated\":%s,"
+            "\"frame_hex\":\"%s\",\"register_values\":[%s]}",
+            i == 0 ? "" : ",", (unsigned long)entry.sequence,
+            entry.timestamp_ms,
+            entry.direction == MODBUS_COMM_TX ? "TX" : "RX",
+            entry.slave_id, entry.function_code, entry.register_address,
+            entry.register_count, (long)entry.status,
+            esp_err_to_name(entry.status),
+            entry.truncated ? "true" : "false", hex, values);
+        if (length < 0 || length >= sizeof(chunk) ||
+            httpd_resp_send_chunk(req, chunk, length) != ESP_OK) {
+            send_err = ESP_FAIL;
+            break;
+        }
+    }
+    if (send_err == ESP_OK) send_err = httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return send_err;
+}
+
+static esp_err_t modbus_logs_delete_handler(httpd_req_t *req)
+{
+    modbus_comm_log_clear();
+    return send_ok(req);
+}
+
 /* ================================================================
  * Discovery API Handlers
  * ================================================================ */
@@ -656,6 +827,9 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
 
         cJSON *dobj = cJSON_CreateObject();
         cJSON_AddNumberToObject(dobj, "slave_id", dev->slave_id);
+        cJSON_AddStringToObject(dobj, "source_protocol",
+                                dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU");
+        cJSON_AddNumberToObject(dobj, "channel_id", dev->channel_id);
         cJSON_AddStringToObject(dobj, "device_id", dev->device_id);
         cJSON_AddStringToObject(dobj, "name", dev->name[0] ? dev->name : dev->device_id);
         if (dev->description[0])
@@ -663,6 +837,11 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
         if (dev->mqtt_topic_prefix[0])
             cJSON_AddStringToObject(dobj, "mqtt_topic_prefix", dev->mqtt_topic_prefix);
         cJSON_AddNumberToObject(dobj, "register_count", dev->reg_count);
+        cJSON_AddNumberToObject(dobj, "probe_function_code",
+                                dev->probe_function_code);
+        cJSON_AddNumberToObject(dobj, "probe_address", dev->probe_address);
+        cJSON_AddNumberToObject(dobj, "probe_register_count",
+                                dev->probe_register_count);
 
         cJSON *regs = cJSON_CreateArray();
         for (uint16_t j = 0; j < dev->reg_count; j++) {
@@ -671,6 +850,13 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
             cJSON *robj = cJSON_CreateObject();
             cJSON_AddNumberToObject(robj, "register_address", reg->register_address);
             cJSON_AddNumberToObject(robj, "function_code", reg->function_code);
+            cJSON_AddNumberToObject(robj, "raw_value", reg->raw_value);
+            cJSON_AddNumberToObject(robj, "read_start_address",
+                                    reg->read_start_address);
+            cJSON_AddNumberToObject(robj, "read_register_count",
+                                    reg->read_register_count);
+            cJSON_AddNumberToObject(robj, "value_register_index",
+                                    reg->value_register_index);
             cJSON_AddStringToObject(robj, "data_type",
                 reg->inferred_type == DT_FLOAT32 ? "FLOAT32" :
                 reg->inferred_type == DT_INT16   ? "INT16"   : "UINT16");
@@ -697,34 +883,53 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
 static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 {
     cJSON *body = parse_request_json(req);
+    if (body == NULL) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "A valid JSON scan request is required");
+    }
 
     discover_scan_params_t params;
     memset(&params, 0, sizeof(params));
     params.slave_start = 1;
-    params.slave_end = 247;
-    params.reg_start = 40001;
-    params.reg_end = 40100;
+    params.slave_end = 10;
+    params.reg_start = 1;
+    params.reg_end = 16;
+    params.source_protocol = SRC_MODBUS_RTU;
+    params.channel_id = 0;
+    params.function_codes[0] = 3;
+    params.function_codes[1] = 4;
+    params.fc_count = 2;
+    params.max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP;
 
-    if (body) {
-        cJSON *v;
-        if ((v = cJSON_GetObjectItem(body, "slave_start")) && cJSON_IsNumber(v))
-            params.slave_start = (uint8_t)v->valuedouble;
-        if ((v = cJSON_GetObjectItem(body, "slave_end")) && cJSON_IsNumber(v))
-            params.slave_end = (uint8_t)v->valuedouble;
-        if ((v = cJSON_GetObjectItem(body, "reg_start")) && cJSON_IsNumber(v))
-            params.reg_start = (uint16_t)v->valuedouble;
-        if ((v = cJSON_GetObjectItem(body, "reg_end")) && cJSON_IsNumber(v))
-            params.reg_end = (uint16_t)v->valuedouble;
-        cJSON_Delete(body);
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(body, "slave_start")) && cJSON_IsNumber(v))
+        params.slave_start = (uint8_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "slave_end")) && cJSON_IsNumber(v))
+        params.slave_end = (uint8_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "reg_start")) && cJSON_IsNumber(v))
+        params.reg_start = (uint16_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "reg_end")) && cJSON_IsNumber(v))
+        params.reg_end = (uint16_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "max_empty_gap")) && cJSON_IsNumber(v))
+        params.max_empty_gap = (uint8_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "function_codes")) && cJSON_IsArray(v)) {
+        params.fc_count = 0;
+        cJSON *item;
+        cJSON_ArrayForEach(item, v) {
+            if (params.fc_count >= 2) break;
+            if (cJSON_IsNumber(item) &&
+                (item->valueint == 3 || item->valueint == 4)) {
+                params.function_codes[params.fc_count++] = (uint8_t)item->valueint;
+            }
+        }
     }
+    cJSON_Delete(body);
 
     esp_err_t err = modbus_discover_full_scan(&params);
     if (err == ESP_OK) {
-        discover_result_t r = modbus_discover_get_result();
         cJSON *root = cJSON_CreateObject();
-        cJSON_AddNumberToObject(root, "devices_found", r.devices_found);
-        cJSON_AddNumberToObject(root, "registers_found", r.registers_found);
-        cJSON_AddBoolToObject(root, "scan_complete", true);
+        cJSON_AddBoolToObject(root, "scan_started", true);
+        cJSON_AddBoolToObject(root, "scan_complete", false);
         char *json = cJSON_PrintUnformatted(root);
         send_json(req, json);
         free(json);
@@ -1033,7 +1238,12 @@ esp_err_t web_server_start(uint16_t port)
     config.server_port = port;
     config.stack_size = 8192;
     config.task_priority = 5;
-    config.max_uri_handlers = 40;
+    config.max_uri_handlers = 48;
+    config.max_open_sockets = 7;
+    config.backlog_conn = 5;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 5;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t err = httpd_start(&s_server, &config);
@@ -1045,6 +1255,9 @@ esp_err_t web_server_start(uint16_t port)
     /* Register URI handlers */
     const httpd_uri_t root_get = {
         .uri = "/", .method = HTTP_GET, .handler = root_get_handler,
+    };
+    const httpd_uri_t ui_asset_get = {
+        .uri = "/ui.bin", .method = HTTP_GET, .handler = ui_asset_get_handler,
     };
     const httpd_uri_t sys_status_get = {
         .uri = "/api/system/status", .method = HTTP_GET, .handler = system_status_get_handler,
@@ -1075,6 +1288,12 @@ esp_err_t web_server_start(uint16_t port)
     };
     const httpd_uri_t modbus_put = {
         .uri = "/api/modbus/config", .method = HTTP_PUT, .handler = modbus_config_put_handler,
+    };
+    const httpd_uri_t modbus_logs_get = {
+        .uri = "/api/modbus/logs", .method = HTTP_GET, .handler = modbus_logs_get_handler,
+    };
+    const httpd_uri_t modbus_logs_del = {
+        .uri = "/api/modbus/logs", .method = HTTP_DELETE, .handler = modbus_logs_delete_handler,
     };
     const httpd_uri_t mappings_get = {
         .uri = "/api/mappings", .method = HTTP_GET, .handler = mappings_get_handler,
@@ -1141,6 +1360,7 @@ esp_err_t web_server_start(uint16_t port)
     };
 
     httpd_register_uri_handler(s_server, &root_get);
+    httpd_register_uri_handler(s_server, &ui_asset_get);
     httpd_register_uri_handler(s_server, &sys_status_get);
     httpd_register_uri_handler(s_server, &sys_logs_get);
     httpd_register_uri_handler(s_server, &gateway_get);
@@ -1151,6 +1371,8 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &mqtt_put);
     httpd_register_uri_handler(s_server, &modbus_get);
     httpd_register_uri_handler(s_server, &modbus_put);
+    httpd_register_uri_handler(s_server, &modbus_logs_get);
+    httpd_register_uri_handler(s_server, &modbus_logs_del);
     httpd_register_uri_handler(s_server, &mappings_get);
     httpd_register_uri_handler(s_server, &mappings_post);
     httpd_register_uri_handler(s_server, &mappings_put);

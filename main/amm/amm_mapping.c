@@ -36,10 +36,53 @@ static SemaphoreHandle_t s_amm_mutex = NULL;
 
 /** Flag indicating whether amm_init() has completed. */
 static bool s_amm_initialized = false;
-static uint32_t s_model_version = 1;
+static uint32_t s_model_version = 0;
+static uint32_t s_loaded_schema_version = 0;
+
+/* Binary layout used by AMM schema v2, before grouped-read metadata existed. */
+typedef struct {
+    uint32_t mapping_version;
+    source_protocol_t source_protocol;
+    uint8_t channel_id;
+    uint8_t slave_id;
+    uint8_t function_code;
+    uint16_t register_address;
+    data_type_t data_type;
+    byte_order_t byte_order;
+    float scale_factor;
+    float offset;
+    uint32_t poll_interval_ms;
+    uint8_t priority;
+    bool discovered;
+    char device_id[AMM_MAX_DEVICE_NAME_LEN];
+    char point_id[AMM_MAX_POINT_NAME_LEN];
+    char measurement_name[AMM_MAX_POINT_NAME_LEN];
+    char unit[AMM_MAX_UNIT_LEN];
+    char mqtt_topic[AMM_MAX_TOPIC_LEN];
+    control_constraint_t constraint;
+    bool active;
+} amm_mapping_entry_v2_t;
 
 /* Forward declaration – used by add/remove before its definition below. */
 static esp_err_t amm_save_to_nvs_unlocked(void);
+
+static uint8_t amm_point_register_count(data_type_t data_type)
+{
+    return (data_type == DT_FLOAT32 || data_type == DT_INT32 ||
+            data_type == DT_UINT32) ? 2 : 1;
+}
+
+static void amm_normalize_read_window(amm_mapping_entry_t *entry)
+{
+    uint8_t point_count = amm_point_register_count(entry->data_type);
+    if (entry->read_register_count == 0 ||
+        entry->read_register_count > AMM_MAX_READ_REGISTERS ||
+        entry->value_register_index + point_count > entry->read_register_count) {
+        entry->read_start_address = entry->register_address;
+        entry->read_register_count = point_count;
+        entry->value_register_index = 0;
+    }
+}
 
 /* ======================== Lock Helpers ======================== */
 
@@ -57,109 +100,59 @@ static inline void amm_unlock(void)
     }
 }
 
-/* ======================== Default Entries ======================== */
+/* ======================== Initial State And Migration ======================== */
 
-/**
- * @brief Populate the mapping table with built-in default entries.
- *
- * Called by amm_init() when no NVS data is available, giving the gateway
- * a known-good starting configuration for four representative points.
- */
-static void amm_populate_defaults(void)
+static void amm_initialize_empty(void)
 {
     memset(s_mapping_table, 0, sizeof(s_mapping_table));
     s_mapping_count = 0;
+    s_model_version = 0;
+    ESP_LOGI(TAG, "Initialized empty mapping table");
+}
 
-    /* Entry 0: Motor temperature – read-only float32 */
-    {
-        amm_mapping_entry_t *e = &s_mapping_table[s_mapping_count];
-        e->slave_id          = 1;
-        e->function_code     = 3;   /* Read Holding Registers */
-        e->register_address  = 40001;
-        e->data_type         = DT_FLOAT32;
-        e->scale_factor      = 1.0f;
-        strncpy(e->device_id,        "plc_line1_01",        AMM_MAX_DEVICE_NAME_LEN - 1);
-        strncpy(e->point_id,         "motor_temp_01",       AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->measurement_name, "Motor temperature",   AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->unit,             "degC",                AMM_MAX_UNIT_LEN        - 1);
-        strncpy(e->mqtt_topic,       "factory/line1/plc01/motor/temp", AMM_MAX_TOPIC_LEN - 1);
-        e->constraint.writable          = false;
-        e->constraint.valid_range_min   = 0.0f;
-        e->constraint.valid_range_max   = 120.0f;
-        e->active = true;
-        s_mapping_count++;
+static bool amm_is_legacy_demo_entry(const amm_mapping_entry_t *entry)
+{
+    if (entry == NULL || entry->source_protocol != SRC_MODBUS_RTU ||
+        entry->channel_id != 0) {
+        return false;
     }
 
-    /* Entry 1: Line pressure – read-only float32 */
-    {
-        amm_mapping_entry_t *e = &s_mapping_table[s_mapping_count];
-        e->slave_id          = 1;
-        e->function_code     = 3;
-        e->register_address  = 40003;
-        e->data_type         = DT_FLOAT32;
-        e->scale_factor      = 1.0f;
-        strncpy(e->device_id,        "plc_line1_01",   AMM_MAX_DEVICE_NAME_LEN - 1);
-        strncpy(e->point_id,         "pressure_01",    AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->measurement_name, "Line pressure",  AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->unit,             "bar",            AMM_MAX_UNIT_LEN        - 1);
-        strncpy(e->mqtt_topic,       "factory/line1/plc01/pressure", AMM_MAX_TOPIC_LEN - 1);
-        e->constraint.writable          = false;
-        e->constraint.valid_range_min   = 0.0f;
-        e->constraint.valid_range_max   = 10.0f;
-        e->active = true;
-        s_mapping_count++;
+    return (strcmp(entry->device_id, "plc_line1_01") == 0 &&
+            (strcmp(entry->point_id, "motor_temp_01") == 0 ||
+             strcmp(entry->point_id, "pressure_01") == 0)) ||
+           (strcmp(entry->device_id, "plc_line2_01") == 0 &&
+            (strcmp(entry->point_id, "speed_01") == 0 ||
+             strcmp(entry->point_id, "current_01") == 0));
+}
+
+/**
+ * Remove only the four mappings created by older firmware. The schema marker
+ * makes this a one-time migration and leaves all real/discovered points intact.
+ */
+static int amm_remove_legacy_demo_entries(void)
+{
+    int write_index = 0;
+    int removed = 0;
+
+    for (int read_index = 0; read_index < s_mapping_count; ++read_index) {
+        if (amm_is_legacy_demo_entry(&s_mapping_table[read_index])) {
+            ++removed;
+            continue;
+        }
+        if (write_index != read_index) {
+            s_mapping_table[write_index] = s_mapping_table[read_index];
+        }
+        ++write_index;
     }
 
-    /* Entry 2: Conveyor speed – writable uint16 */
-    {
-        amm_mapping_entry_t *e = &s_mapping_table[s_mapping_count];
-        e->slave_id          = 2;
-        e->function_code     = 3;
-        e->register_address  = 40001;
-        e->data_type         = DT_UINT16;
-        e->scale_factor      = 1.0f;
-        strncpy(e->device_id,        "plc_line2_01",   AMM_MAX_DEVICE_NAME_LEN - 1);
-        strncpy(e->point_id,         "speed_01",       AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->measurement_name, "Conveyor speed", AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->unit,             "rpm",            AMM_MAX_UNIT_LEN        - 1);
-        strncpy(e->mqtt_topic,       "factory/line2/plc01/speed", AMM_MAX_TOPIC_LEN - 1);
-        e->constraint.writable          = true;
-        e->constraint.valid_range_min   = 0.0f;
-        e->constraint.valid_range_max   = 3000.0f;
-        e->active = true;
-        s_mapping_count++;
+    if (removed > 0) {
+        memset(&s_mapping_table[write_index], 0,
+               (size_t)(s_mapping_count - write_index) * sizeof(s_mapping_table[0]));
+        s_mapping_count = write_index;
+        ++s_model_version;
+        ESP_LOGI(TAG, "Removed %d legacy demo mapping entries", removed);
     }
-
-    /* Entry 3: Motor current – read-only int16 */
-    {
-        amm_mapping_entry_t *e = &s_mapping_table[s_mapping_count];
-        e->slave_id          = 2;
-        e->function_code     = 3;
-        e->register_address  = 40003;
-        e->data_type         = DT_INT16;
-        e->scale_factor      = 1.0f;
-        strncpy(e->device_id,        "plc_line2_01",  AMM_MAX_DEVICE_NAME_LEN - 1);
-        strncpy(e->point_id,         "current_01",    AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->measurement_name, "Motor current", AMM_MAX_POINT_NAME_LEN  - 1);
-        strncpy(e->unit,             "A",             AMM_MAX_UNIT_LEN        - 1);
-        strncpy(e->mqtt_topic,       "factory/line2/plc01/current", AMM_MAX_TOPIC_LEN - 1);
-        e->constraint.writable          = false;
-        e->constraint.valid_range_min   = -50.0f;
-        e->constraint.valid_range_max   = 50.0f;
-        e->active = true;
-        s_mapping_count++;
-    }
-
-    for (int i = 0; i < s_mapping_count; ++i) {
-        s_mapping_table[i].source_protocol = SRC_MODBUS_RTU;
-        s_mapping_table[i].channel_id = 0;
-        s_mapping_table[i].byte_order = BYTE_ORDER_ABCD;
-        s_mapping_table[i].poll_interval_ms = POLL_INTERVAL_MS;
-        s_mapping_table[i].priority = 5;
-        s_mapping_table[i].mapping_version = (uint32_t)i + 1;
-    }
-    s_model_version = (uint32_t)s_mapping_count;
-    ESP_LOGI(TAG, "Populated %d default mapping entries", s_mapping_count);
+    return removed;
 }
 
 /* ======================== Public API ======================== */
@@ -184,18 +177,29 @@ void amm_init(void)
     /* Try to load persisted mappings from NVS */
     esp_err_t ret = amm_load_from_nvs();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "NVS load failed (%s) – using built-in defaults",
+        ESP_LOGW(TAG, "NVS load failed (%s) - starting with no mappings",
                  esp_err_to_name(ret));
-        amm_populate_defaults();
+        amm_initialize_empty();
 
-        /* Persist the defaults so they survive a reboot */
+        /* Persist the empty state so a reboot remains deterministic. */
         esp_err_t save_ret = amm_save_to_nvs();
         if (save_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to persist default mappings to NVS: %s",
+            ESP_LOGW(TAG, "Failed to persist empty mapping table to NVS: %s",
                      esp_err_to_name(save_ret));
         }
     } else {
         ESP_LOGI(TAG, "Loaded %d mapping entries from NVS", s_mapping_count);
+        if (s_loaded_schema_version < AMM_NVS_SCHEMA_VERSION) {
+            int removed = amm_remove_legacy_demo_entries();
+            esp_err_t save_ret = amm_save_to_nvs();
+            if (save_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to persist AMM schema migration: %s",
+                         esp_err_to_name(save_ret));
+            } else {
+                ESP_LOGI(TAG, "AMM schema migrated to version %d (%d demo entries removed)",
+                         AMM_NVS_SCHEMA_VERSION, removed);
+            }
+        }
     }
 
     s_amm_initialized = true;
@@ -232,6 +236,7 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
                      "slave=%u reg=%u", entry->slave_id, entry->register_address);
             memcpy(&s_mapping_table[i], entry, sizeof(amm_mapping_entry_t));
             s_mapping_table[i].active = true;
+            amm_normalize_read_window(&s_mapping_table[i]);
             s_mapping_table[i].mapping_version = ++s_model_version;
             esp_err_t ret = amm_save_to_nvs_unlocked();
             amm_unlock();
@@ -242,6 +247,7 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
     /* Append to the end of the table */
     memcpy(&s_mapping_table[s_mapping_count], entry, sizeof(amm_mapping_entry_t));
     s_mapping_table[s_mapping_count].active = true;
+    amm_normalize_read_window(&s_mapping_table[s_mapping_count]);
     s_mapping_table[s_mapping_count].mapping_version = ++s_model_version;
     if (s_mapping_table[s_mapping_count].poll_interval_ms == 0) {
         s_mapping_table[s_mapping_count].poll_interval_ms = POLL_INTERVAL_MS;
@@ -345,6 +351,7 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry)
     }
     s_mapping_table[index] = *entry;
     s_mapping_table[index].active = true;
+    amm_normalize_read_window(&s_mapping_table[index]);
     s_mapping_table[index].mapping_version = ++s_model_version;
     if (s_mapping_table[index].poll_interval_ms == 0) {
         s_mapping_table[index].poll_interval_ms = POLL_INTERVAL_MS;
@@ -593,6 +600,13 @@ static esp_err_t amm_save_to_nvs_unlocked(void)
         return ret;
     }
 
+    ret = nvs_set_u32(handle, AMM_NVS_KEY_SCHEMA, AMM_NVS_SCHEMA_VERSION);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS set schema version failed: %s", esp_err_to_name(ret));
+        nvs_close(handle);
+        return ret;
+    }
+
     /* Persist each entry as a binary blob */
     char key[20];
     for (int i = 0; i < s_mapping_count; i++) {
@@ -636,6 +650,14 @@ esp_err_t amm_load_from_nvs(void)
     }
 
     int32_t stored_count = 0;
+    s_loaded_schema_version = 0;
+    esp_err_t schema_ret = nvs_get_u32(handle, AMM_NVS_KEY_SCHEMA,
+                                       &s_loaded_schema_version);
+    if (schema_ret != ESP_OK && schema_ret != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "NVS schema version read failed: %s",
+                 esp_err_to_name(schema_ret));
+    }
+
     ret = nvs_get_i32(handle, AMM_NVS_KEY_COUNT, &stored_count);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS key '%s' not found: %s",
@@ -657,23 +679,38 @@ esp_err_t amm_load_from_nvs(void)
     for (int i = 0; i < stored_count; i++) {
         amm_nvs_entry_key(i, key, sizeof(key));
 
-        size_t blob_len = sizeof(amm_mapping_entry_t);
-        ret = nvs_get_blob(handle, key, &s_mapping_table[i], &blob_len);
+        size_t blob_len = 0;
+        ret = nvs_get_blob(handle, key, NULL, &blob_len);
+        if (ret == ESP_OK && blob_len == sizeof(amm_mapping_entry_t)) {
+            ret = nvs_get_blob(handle, key, &s_mapping_table[i], &blob_len);
+        } else if (ret == ESP_OK &&
+                   blob_len == sizeof(amm_mapping_entry_v2_t) &&
+                   s_loaded_schema_version < AMM_NVS_SCHEMA_VERSION) {
+            amm_mapping_entry_v2_t legacy;
+            size_t legacy_len = sizeof(legacy);
+            ret = nvs_get_blob(handle, key, &legacy, &legacy_len);
+            if (ret == ESP_OK) {
+                memset(&s_mapping_table[i], 0, sizeof(s_mapping_table[i]));
+                memcpy(&s_mapping_table[i], &legacy, sizeof(legacy));
+                s_mapping_table[i].read_start_address =
+                    s_mapping_table[i].register_address;
+                s_mapping_table[i].read_register_count =
+                    amm_point_register_count(s_mapping_table[i].data_type);
+                s_mapping_table[i].value_register_index = 0;
+                amm_normalize_read_window(&s_mapping_table[i]);
+            }
+        } else if (ret == ESP_OK) {
+            ESP_LOGE(TAG, "NVS blob[%d] size mismatch: got %u expected %u",
+                     i, (unsigned)blob_len, (unsigned)sizeof(amm_mapping_entry_t));
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "NVS get blob[%d] failed: %s", i, esp_err_to_name(ret));
             memset(s_mapping_table, 0, sizeof(s_mapping_table));
             s_mapping_count = 0;
             nvs_close(handle);
             return ret;
-        }
-
-        if (blob_len != sizeof(amm_mapping_entry_t)) {
-            ESP_LOGE(TAG, "NVS blob[%d] size mismatch: got %u expected %u",
-                     i, (unsigned)blob_len, (unsigned)sizeof(amm_mapping_entry_t));
-            memset(s_mapping_table, 0, sizeof(s_mapping_table));
-            s_mapping_count = 0;
-            nvs_close(handle);
-            return ESP_ERR_INVALID_SIZE;
         }
     }
 
@@ -686,6 +723,7 @@ esp_err_t amm_load_from_nvs(void)
         if (s_mapping_table[i].scale_factor == 0.0f) {
             s_mapping_table[i].scale_factor = 1.0f;
         }
+        amm_normalize_read_window(&s_mapping_table[i]);
         if (s_mapping_table[i].mapping_version > s_model_version) {
             s_model_version = s_mapping_table[i].mapping_version;
         }
