@@ -1,0 +1,44 @@
+{
+  "profile_version": 1,
+  "devices": [
+    {
+      "slave_id": 1,
+      "name": "Modbus RTU SHT20",
+      "model": "SHT20",
+      "manufacturer": "Generic",
+      "device_type": "temperature_humidity_sensor",
+      "protocols": [
+        "RTU"
+      ],
+      "enabled": true,
+      "registers": [
+        {
+          "address": 1,
+          "function_code": 4,
+          "name": "Temperature",
+          "data_type": "INT16",
+          "byte_order": "ABCD",
+          "scale": 0.1,
+          "offset": 0,
+          "unit": "degC",
+          "minimum": -40,
+          "maximum": 125,
+          "writable": false
+        },
+        {
+          "address": 2,
+          "function_code": 4,
+          "name": "Relative Humidity",
+          "data_type": "UINT16",
+          "byte_order": "ABCD",
+          "scale": 0.1,
+          "offset": 0,
+          "unit": "%RH",
+          "minimum": 0,
+          "maximum": 100,
+          "writable": false
+        }
+      ]
+    }
+  ]
+}

@@ -26,7 +26,7 @@ extern "C" {
 #define AMM_NVS_KEY_COUNT       "entry_cnt"
 #define AMM_NVS_KEY_ENTRY_PREFIX "entry_"
 #define AMM_NVS_KEY_SCHEMA      "schema_ver"
-#define AMM_NVS_SCHEMA_VERSION  3
+#define AMM_NVS_SCHEMA_VERSION  4
 #define AMM_MAX_READ_REGISTERS  8
 
 /* ======================== Mapping Entry ======================== */
@@ -85,6 +85,9 @@ typedef struct {
  */
 void amm_init(void);
 
+/** Runtime capacity: 1000 with PSRAM, 64 in internal-memory fallback mode. */
+int amm_get_capacity(void);
+
 /**
  * @brief Add a mapping entry to the registry.
  *
@@ -103,11 +106,23 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry);
 /** Copy active entries into a caller-owned snapshot. */
 int amm_get_entries(amm_mapping_entry_t *out, int max_entries);
 
+/**
+ * Import a semantic mapping profile as one flash transaction.
+ *
+ * When replace_devices is true, existing mappings for every
+ * protocol/channel/slave tuple present in entries are removed first.
+ */
+esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
+                              bool replace_devices, int *imported_count);
+
 /** Copy one active entry by its zero-based active-list index. */
 esp_err_t amm_get_entry_at(int active_index, amm_mapping_entry_t *out);
 
 /** Current monotonically increasing AMM model version. */
 uint32_t amm_get_model_version(void);
+
+/** Remove every mapping and persist the empty table in one NVS transaction. */
+esp_err_t amm_clear_mappings(void);
 
 /** Channel-aware lookup used for mixed RTU/TCP gateways. */
 esp_err_t amm_find_mapping_for_channel(source_protocol_t protocol, uint8_t channel_id,

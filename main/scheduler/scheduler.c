@@ -80,11 +80,15 @@ static void modbus_poll_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "modbus_poll_task started");
 
-    int64_t last_poll_ms[AMM_MAX_MAPPING_ENTRIES] = {0};
+    int mapping_capacity = amm_get_capacity();
     uint32_t observed_model_version = 0;
-    amm_mapping_entry_t *mappings = calloc(AMM_MAX_MAPPING_ENTRIES, sizeof(*mappings));
-    if (mappings == NULL) {
+    int64_t *last_poll_ms = calloc((size_t)mapping_capacity, sizeof(*last_poll_ms));
+    amm_mapping_entry_t *mappings =
+        calloc((size_t)mapping_capacity, sizeof(*mappings));
+    if (mapping_capacity <= 0 || mappings == NULL || last_poll_ms == NULL) {
         ESP_LOGE(TAG, "Unable to allocate AMM poll snapshot");
+        free(last_poll_ms);
+        free(mappings);
         s_task_modbus_poll = NULL;
         vTaskDelete(NULL);
         return;
@@ -96,10 +100,11 @@ static void modbus_poll_task(void *arg)
             continue;
         }
 
-        int mapping_count = amm_get_entries(mappings, AMM_MAX_MAPPING_ENTRIES);
+        int mapping_count = amm_get_entries(mappings, mapping_capacity);
         uint32_t model_version = amm_get_model_version();
         if (model_version != observed_model_version) {
-            memset(last_poll_ms, 0, sizeof(last_poll_ms));
+            memset(last_poll_ms, 0,
+                   (size_t)mapping_capacity * sizeof(last_poll_ms[0]));
             observed_model_version = model_version;
             ESP_LOGI(TAG, "AMM poll plan updated: version=%lu entries=%d",
                      (unsigned long)model_version, mapping_count);
@@ -113,8 +118,20 @@ static void modbus_poll_task(void *arg)
         int selected = -1;
         for (int i = 0; i < mapping_count; ++i) {
             uint32_t interval = mappings[i].poll_interval_ms ?: POLL_INTERVAL_MS;
-            if (now_ms - last_poll_ms[i] >= interval &&
-                (selected < 0 || mappings[i].priority > mappings[selected].priority)) {
+            if (now_ms - last_poll_ms[i] < interval) {
+                continue;
+            }
+
+            /*
+             * Oldest-first selection guarantees that every mapping receives a
+             * poll even when a full bus sweep takes longer than its interval.
+             * Priority only breaks ties, so high-priority or RTU entries cannot
+             * permanently starve later RTU/TCP points.
+             */
+            if (selected < 0 ||
+                last_poll_ms[i] < last_poll_ms[selected] ||
+                (last_poll_ms[i] == last_poll_ms[selected] &&
+                 mappings[i].priority > mappings[selected].priority)) {
                 selected = i;
             }
         }
@@ -168,6 +185,30 @@ static void modbus_poll_task(void *arg)
         } else {
             result.quality = QUALITY_INVALID;
             result.valid   = false;
+            tcm_context_t failed_state;
+            memset(&failed_state, 0, sizeof(failed_state));
+            strlcpy(failed_state.device_id, cfg->device_id,
+                    sizeof(failed_state.device_id));
+            strlcpy(failed_state.point_id, cfg->point_id,
+                    sizeof(failed_state.point_id));
+            strlcpy(failed_state.measurement_name, cfg->measurement_name,
+                    sizeof(failed_state.measurement_name));
+            strlcpy(failed_state.unit, cfg->unit, sizeof(failed_state.unit));
+            failed_state.source_protocol = cfg->source_protocol;
+            failed_state.channel_id = cfg->channel_id;
+            failed_state.slave_id = cfg->slave_id;
+            failed_state.function_code = cfg->function_code;
+            failed_state.register_address = cfg->register_address;
+            failed_state.data_type = cfg->data_type;
+            failed_state.byte_order = cfg->byte_order;
+            failed_state.scale_factor = cfg->scale_factor;
+            failed_state.offset = cfg->offset;
+            failed_state.mapping_version = cfg->mapping_version;
+            failed_state.timestamp_ms = now_ms;
+            failed_state.quality_state = QUALITY_INVALID;
+            failed_state.network_state = get_network_state_locked();
+            failed_state.validated = false;
+            tcm_state_pool_update(&failed_state);
             ESP_LOGW(TAG, "MODBUS read failed: slave=%u fc=0x%02X point=0x%04X "
                      "window=0x%04X+%u err=0x%x",
                      cfg->slave_id, cfg->function_code, cfg->register_address,
@@ -186,6 +227,7 @@ static void modbus_poll_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
+    free(last_poll_ms);
     free(mappings);
     s_task_modbus_poll = NULL;
     vTaskDelete(NULL);
@@ -293,9 +335,23 @@ static void publish_task(void *arg)
             continue;
         }
 
-        network_state_t net_state = get_network_state_locked();
+        runtime_config_t runtime;
+        runtime_config_get(&runtime);
+        bool mqtt_configured = runtime.mqtt.enabled &&
+            runtime.mqtt.uri[0] != '\0' &&
+            !(strcmp(runtime.mqtt.uri, MQTT_BROKER_URI) == 0 &&
+              runtime.mqtt.username[0] == '\0' &&
+              runtime.mqtt.password[0] == '\0');
+        if (!mqtt_configured) {
+            /*
+             * A gateway that has never been configured for MQTT is operating
+             * locally, not experiencing a recoverable broker outage. Keep the
+             * TCM state/history but do not flood the UIF replay queue.
+             */
+            continue;
+        }
 
-        if (net_state == NET_ONLINE) {
+        if (mqtt_is_connected()) {
             /* Build MQTT output message with topic and serialized payload */
             mqtt_out_msg_t out_msg;
             memset(&out_msg, 0, sizeof(out_msg));
@@ -305,8 +361,6 @@ static void publish_task(void *arg)
                                     ctx.register_address, out_msg.topic,
                                     sizeof(out_msg.topic)) == ESP_OK) {
             } else {
-                runtime_config_t runtime;
-                runtime_config_get(&runtime);
                 strlcpy(out_msg.topic, runtime.mqtt.data_prefix, sizeof(out_msg.topic));
                 strlcat(out_msg.topic, ctx.device_id, sizeof(out_msg.topic));
                 strlcat(out_msg.topic, "/", sizeof(out_msg.topic));
@@ -338,8 +392,8 @@ static void publish_task(void *arg)
             esp_err_t cache_err = uif_cache_record(&ctx);
             if (cache_err == ESP_OK) {
                 eval_increment_metric("cached_records", 1);
-                ESP_LOGD(TAG, "Cached record seq=%lu (net_state=%d)",
-                         (unsigned long)ctx.sequence_id, net_state);
+                ESP_LOGD(TAG, "Cached record seq=%lu while MQTT is offline",
+                         (unsigned long)ctx.sequence_id);
             } else {
                 ESP_LOGE(TAG, "Cache write failed for seq=%lu (err=0x%x)",
                          (unsigned long)ctx.sequence_id, cache_err);

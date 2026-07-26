@@ -16,6 +16,8 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
 
 #include "amm/amm_mapping.h"
 #include "gateway_config.h"
@@ -25,8 +27,9 @@ static const char *TAG = "AMM";
 
 /* ======================== Private State ======================== */
 
-/** Internal mapping table (static allocation – no heap dependency). */
-static amm_mapping_entry_t s_mapping_table[AMM_MAX_MAPPING_ENTRIES];
+/** Mapping table lives in PSRAM on the target board. */
+static amm_mapping_entry_t *s_mapping_table = NULL;
+static int s_mapping_capacity = 0;
 
 /** Number of entries currently loaded (active + inactive slots). */
 static int s_mapping_count = 0;
@@ -38,6 +41,7 @@ static SemaphoreHandle_t s_amm_mutex = NULL;
 static bool s_amm_initialized = false;
 static uint32_t s_model_version = 0;
 static uint32_t s_loaded_schema_version = 0;
+static const char *s_nvs_partition = AMM_NVS_PARTITION;
 
 /* Binary layout used by AMM schema v2, before grouped-read metadata existed. */
 typedef struct {
@@ -65,6 +69,7 @@ typedef struct {
 
 /* Forward declaration – used by add/remove before its definition below. */
 static esp_err_t amm_save_to_nvs_unlocked(void);
+static esp_err_t amm_save_entry_to_nvs_unlocked(int index);
 
 static uint8_t amm_point_register_count(data_type_t data_type)
 {
@@ -104,7 +109,10 @@ static inline void amm_unlock(void)
 
 static void amm_initialize_empty(void)
 {
-    memset(s_mapping_table, 0, sizeof(s_mapping_table));
+    if (s_mapping_table != NULL) {
+        memset(s_mapping_table, 0,
+               (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
+    }
     s_mapping_count = 0;
     s_model_version = 0;
     ESP_LOGI(TAG, "Initialized empty mapping table");
@@ -171,11 +179,56 @@ void amm_init(void)
         return;
     }
 
-    memset(s_mapping_table, 0, sizeof(s_mapping_table));
+    if (esp_psram_is_initialized()) {
+        s_mapping_table = heap_caps_calloc(
+            AMM_MAX_MAPPING_ENTRIES, sizeof(s_mapping_table[0]),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_mapping_table != NULL) {
+            s_mapping_capacity = AMM_MAX_MAPPING_ENTRIES;
+        }
+    }
+    if (s_mapping_table == NULL) {
+        s_mapping_table = heap_caps_calloc(
+            AMM_FALLBACK_MAPPING_ENTRIES, sizeof(s_mapping_table[0]),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_mapping_table != NULL) {
+            s_mapping_capacity = AMM_FALLBACK_MAPPING_ENTRIES;
+            ESP_LOGW(TAG, "PSRAM unavailable; AMM capacity reduced to %d",
+                     s_mapping_capacity);
+        }
+    }
+    if (s_mapping_table == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate AMM mapping table");
+        return;
+    }
+
+    esp_err_t partition_err = nvs_flash_init_partition(AMM_NVS_PARTITION);
+    if (partition_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        partition_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            nvs_flash_erase_partition(AMM_NVS_PARTITION));
+        partition_err = nvs_flash_init_partition(AMM_NVS_PARTITION);
+    }
+    if (partition_err != ESP_OK) {
+        ESP_LOGE(TAG, "AMM NVS partition init failed: %s",
+                 esp_err_to_name(partition_err));
+    }
+
+    memset(s_mapping_table, 0,
+           (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
     s_mapping_count = 0;
 
-    /* Try to load persisted mappings from NVS */
-    esp_err_t ret = amm_load_from_nvs();
+    /* Load the dedicated AMM partition, then migrate the legacy default NVS. */
+    esp_err_t ret = partition_err == ESP_OK ? amm_load_from_nvs() : partition_err;
+    if (ret != ESP_OK && partition_err == ESP_OK) {
+        s_nvs_partition = "nvs";
+        esp_err_t legacy_ret = amm_load_from_nvs();
+        s_nvs_partition = AMM_NVS_PARTITION;
+        if (legacy_ret == ESP_OK) {
+            ESP_LOGI(TAG, "Migrating legacy AMM mappings to %s", AMM_NVS_PARTITION);
+            ret = amm_save_to_nvs();
+        }
+    }
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS load failed (%s) - starting with no mappings",
                  esp_err_to_name(ret));
@@ -203,7 +256,13 @@ void amm_init(void)
     }
 
     s_amm_initialized = true;
-    ESP_LOGI(TAG, "AMM initialized (%d active entries)", amm_get_mapping_count());
+    ESP_LOGI(TAG, "AMM initialized (%d active entries, capacity=%d)",
+             amm_get_mapping_count(), s_mapping_capacity);
+}
+
+int amm_get_capacity(void)
+{
+    return s_mapping_capacity;
 }
 
 esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
@@ -215,10 +274,8 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
 
     amm_lock();
 
-    if (s_mapping_count >= AMM_MAX_MAPPING_ENTRIES) {
+    if (s_mapping_table == NULL) {
         amm_unlock();
-        ESP_LOGE(TAG, "amm_add_mapping: table full (%d/%d)",
-                 s_mapping_count, AMM_MAX_MAPPING_ENTRIES);
         return ESP_ERR_NO_MEM;
     }
 
@@ -238,23 +295,38 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
             s_mapping_table[i].active = true;
             amm_normalize_read_window(&s_mapping_table[i]);
             s_mapping_table[i].mapping_version = ++s_model_version;
-            esp_err_t ret = amm_save_to_nvs_unlocked();
+            esp_err_t ret = amm_save_entry_to_nvs_unlocked(i);
             amm_unlock();
             return ret;
         }
     }
 
-    /* Append to the end of the table */
-    memcpy(&s_mapping_table[s_mapping_count], entry, sizeof(amm_mapping_entry_t));
-    s_mapping_table[s_mapping_count].active = true;
-    amm_normalize_read_window(&s_mapping_table[s_mapping_count]);
-    s_mapping_table[s_mapping_count].mapping_version = ++s_model_version;
-    if (s_mapping_table[s_mapping_count].poll_interval_ms == 0) {
-        s_mapping_table[s_mapping_count].poll_interval_ms = POLL_INTERVAL_MS;
+    int target = -1;
+    for (int i = 0; i < s_mapping_count; ++i) {
+        if (!s_mapping_table[i].active) {
+            target = i;
+            break;
+        }
     }
-    s_mapping_count++;
+    if (target < 0) {
+        if (s_mapping_count >= s_mapping_capacity) {
+            amm_unlock();
+            ESP_LOGE(TAG, "amm_add_mapping: table full (%d/%d)",
+                     s_mapping_count, s_mapping_capacity);
+            return ESP_ERR_NO_MEM;
+        }
+        target = s_mapping_count++;
+    }
 
-    esp_err_t ret = amm_save_to_nvs_unlocked();
+    memcpy(&s_mapping_table[target], entry, sizeof(amm_mapping_entry_t));
+    s_mapping_table[target].active = true;
+    amm_normalize_read_window(&s_mapping_table[target]);
+    s_mapping_table[target].mapping_version = ++s_model_version;
+    if (s_mapping_table[target].poll_interval_ms == 0) {
+        s_mapping_table[target].poll_interval_ms = POLL_INTERVAL_MS;
+    }
+
+    esp_err_t ret = amm_save_entry_to_nvs_unlocked(target);
     amm_unlock();
 
     if (ret == ESP_OK) {
@@ -277,7 +349,7 @@ esp_err_t amm_remove_mapping(uint8_t slave_id, uint16_t reg_addr)
             s_mapping_table[i].active = false;
             ESP_LOGI(TAG, "Deactivated mapping: slave=%u reg=%u", slave_id, reg_addr);
 
-            esp_err_t ret = amm_save_to_nvs_unlocked();
+            esp_err_t ret = amm_save_entry_to_nvs_unlocked(i);
             amm_unlock();
             return ret;
         }
@@ -300,7 +372,7 @@ esp_err_t amm_remove_mapping_for_channel(source_protocol_t protocol, uint8_t cha
             entry->register_address == reg_addr) {
             entry->active = false;
             ++s_model_version;
-            esp_err_t err = amm_save_to_nvs_unlocked();
+            esp_err_t err = amm_save_entry_to_nvs_unlocked(i);
             amm_unlock();
             return err;
         }
@@ -341,9 +413,44 @@ int amm_get_mapping_count(void)
     return count;
 }
 
+esp_err_t amm_clear_mappings(void)
+{
+    amm_lock();
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = nvs_open_from_partition(
+        s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret == ESP_OK) {
+        ret = nvs_erase_all(handle);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_i32(handle, AMM_NVS_KEY_COUNT, 0);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u32(handle, AMM_NVS_KEY_SCHEMA, AMM_NVS_SCHEMA_VERSION);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+
+    if (ret == ESP_OK) {
+        memset(s_mapping_table, 0,
+               (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
+        s_mapping_count = 0;
+        ++s_model_version;
+        ESP_LOGI(TAG, "Cleared all AMM mappings");
+    }
+
+    amm_unlock();
+    return ret;
+}
+
 esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry)
 {
-    if (entry == NULL || index < 0 || index >= AMM_MAX_MAPPING_ENTRIES) return ESP_ERR_INVALID_ARG;
+    if (entry == NULL || index < 0 || index >= s_mapping_capacity) return ESP_ERR_INVALID_ARG;
     amm_lock();
     if (index >= s_mapping_count || !s_mapping_table[index].active) {
         amm_unlock();
@@ -356,7 +463,7 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry)
     if (s_mapping_table[index].poll_interval_ms == 0) {
         s_mapping_table[index].poll_interval_ms = POLL_INTERVAL_MS;
     }
-    esp_err_t err = amm_save_to_nvs_unlocked();
+    esp_err_t err = amm_save_entry_to_nvs_unlocked(index);
     amm_unlock();
     return err;
 }
@@ -371,6 +478,110 @@ int amm_get_entries(amm_mapping_entry_t *out, int max_entries)
     }
     amm_unlock();
     return copied;
+}
+
+static bool amm_import_contains_device(const amm_mapping_entry_t *entries, int count,
+                                       const amm_mapping_entry_t *candidate)
+{
+    for (int i = 0; i < count; ++i) {
+        if (entries[i].source_protocol == candidate->source_protocol &&
+            entries[i].channel_id == candidate->channel_id &&
+            entries[i].slave_id == candidate->slave_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
+                              bool replace_devices, int *imported_count)
+{
+    if (entries == NULL || count <= 0 || s_mapping_table == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    amm_mapping_entry_t *staging = heap_caps_calloc(
+        (size_t)s_mapping_capacity, sizeof(staging[0]),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (staging == NULL) {
+        staging = heap_caps_calloc(
+            (size_t)s_mapping_capacity, sizeof(staging[0]),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (staging == NULL) return ESP_ERR_NO_MEM;
+
+    int staged_count = 0;
+    int imported = 0;
+    esp_err_t result = ESP_OK;
+
+    amm_lock();
+    for (int i = 0; i < s_mapping_count; ++i) {
+        const amm_mapping_entry_t *current = &s_mapping_table[i];
+        if (!current->active) continue;
+        if (replace_devices &&
+            amm_import_contains_device(entries, count, current)) {
+            continue;
+        }
+        if (staged_count >= s_mapping_capacity) {
+            result = ESP_ERR_NO_MEM;
+            break;
+        }
+        staging[staged_count++] = *current;
+    }
+
+    for (int i = 0; result == ESP_OK && i < count; ++i) {
+        amm_mapping_entry_t entry = entries[i];
+        if (entry.slave_id < 1 || entry.function_code < 3 ||
+            entry.device_id[0] == '\0' || entry.point_id[0] == '\0') {
+            result = ESP_ERR_INVALID_ARG;
+            break;
+        }
+
+        entry.active = true;
+        entry.discovered = false;
+        entry.mapping_version = ++s_model_version;
+        if (entry.poll_interval_ms == 0) entry.poll_interval_ms = POLL_INTERVAL_MS;
+        if (entry.scale_factor == 0.0f) entry.scale_factor = 1.0f;
+        amm_normalize_read_window(&entry);
+
+        int duplicate = -1;
+        for (int j = 0; j < staged_count; ++j) {
+            if (staging[j].source_protocol == entry.source_protocol &&
+                staging[j].channel_id == entry.channel_id &&
+                staging[j].slave_id == entry.slave_id &&
+                staging[j].register_address == entry.register_address) {
+                duplicate = j;
+                break;
+            }
+        }
+        if (duplicate >= 0) {
+            staging[duplicate] = entry;
+        } else if (staged_count < s_mapping_capacity) {
+            staging[staged_count++] = entry;
+        } else {
+            result = ESP_ERR_NO_MEM;
+            break;
+        }
+        ++imported;
+    }
+
+    if (result == ESP_OK) {
+        memset(s_mapping_table, 0,
+               (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
+        memcpy(s_mapping_table, staging,
+               (size_t)staged_count * sizeof(s_mapping_table[0]));
+        s_mapping_count = staged_count;
+        result = amm_save_to_nvs_unlocked();
+    }
+    amm_unlock();
+    free(staging);
+
+    if (imported_count != NULL) *imported_count = result == ESP_OK ? imported : 0;
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "Imported %d semantic mappings (%d active total)",
+                 imported, s_mapping_count);
+    }
+    return result;
 }
 
 esp_err_t amm_get_entry_at(int active_index, amm_mapping_entry_t *out)
@@ -595,6 +806,30 @@ static void amm_nvs_entry_key(int index, char *key_buf, size_t buf_len)
     snprintf(key_buf, buf_len, "%s%d", AMM_NVS_KEY_ENTRY_PREFIX, index);
 }
 
+static esp_err_t amm_save_entry_to_nvs_unlocked(int index)
+{
+    if (index < 0 || index >= s_mapping_count) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open_from_partition(
+        s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) return ret;
+
+    char key[20];
+    amm_nvs_entry_key(index, key, sizeof(key));
+    ret = nvs_set_i32(handle, AMM_NVS_KEY_COUNT, (int32_t)s_mapping_count);
+    if (ret == ESP_OK) {
+        ret = nvs_set_u32(handle, AMM_NVS_KEY_SCHEMA, AMM_NVS_SCHEMA_VERSION);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_blob(handle, key, &s_mapping_table[index],
+                           sizeof(s_mapping_table[index]));
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
 /**
  * @brief Internal save helper – caller must already hold s_amm_mutex.
  *
@@ -604,7 +839,8 @@ static void amm_nvs_entry_key(int index, char *key_buf, size_t buf_len)
 static esp_err_t amm_save_to_nvs_unlocked(void)
 {
     nvs_handle_t handle;
-    esp_err_t ret = nvs_open(AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    esp_err_t ret = nvs_open_from_partition(
+        s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS open failed for save: %s", esp_err_to_name(ret));
         return ret;
@@ -660,7 +896,8 @@ esp_err_t amm_save_to_nvs(void)
 esp_err_t amm_load_from_nvs(void)
 {
     nvs_handle_t handle;
-    esp_err_t ret = nvs_open(AMM_NVS_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t ret = nvs_open_from_partition(
+        s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS namespace '%s' not found: %s",
                  AMM_NVS_NAMESPACE, esp_err_to_name(ret));
@@ -684,15 +921,16 @@ esp_err_t amm_load_from_nvs(void)
         return (ret == ESP_ERR_NVS_NOT_FOUND) ? ESP_ERR_NOT_FOUND : ret;
     }
 
-    if (stored_count < 0 || stored_count > AMM_MAX_MAPPING_ENTRIES) {
+    if (stored_count < 0 || stored_count > s_mapping_capacity) {
         ESP_LOGE(TAG, "NVS stored count %ld is out of range [0, %d]",
-                 (long)stored_count, AMM_MAX_MAPPING_ENTRIES);
+                 (long)stored_count, s_mapping_capacity);
         nvs_close(handle);
         return ESP_ERR_INVALID_SIZE;
     }
 
     char key[20];
-    memset(s_mapping_table, 0, sizeof(s_mapping_table));
+    memset(s_mapping_table, 0,
+           (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
 
     for (int i = 0; i < stored_count; i++) {
         amm_nvs_entry_key(i, key, sizeof(key));
@@ -725,7 +963,8 @@ esp_err_t amm_load_from_nvs(void)
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "NVS get blob[%d] failed: %s", i, esp_err_to_name(ret));
-            memset(s_mapping_table, 0, sizeof(s_mapping_table));
+            memset(s_mapping_table, 0,
+                   (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
             s_mapping_count = 0;
             nvs_close(handle);
             return ret;

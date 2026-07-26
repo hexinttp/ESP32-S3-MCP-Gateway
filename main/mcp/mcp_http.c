@@ -103,9 +103,11 @@ static cJSON *tool_text_result(cJSON *value, bool is_error)
 
 static cJSON *call_list_points(void)
 {
-    amm_mapping_entry_t *mappings = calloc(AMM_MAX_MAPPING_ENTRIES, sizeof(*mappings));
+    int capacity = amm_get_capacity();
+    amm_mapping_entry_t *mappings =
+        calloc((size_t)capacity, sizeof(*mappings));
     if (mappings == NULL) return cJSON_Parse("{\"error\":\"out of memory\"}");
-    int count = amm_get_entries(mappings, AMM_MAX_MAPPING_ENTRIES);
+    int count = amm_get_entries(mappings, capacity);
     cJSON *array = cJSON_CreateArray();
     for (int i = 0; i < count; ++i) {
         cJSON *point = cJSON_CreateObject();

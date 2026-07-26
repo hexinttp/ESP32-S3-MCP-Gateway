@@ -5,7 +5,9 @@
 #include "tcm/tcm_context.h"
 
 esp_err_t tcm_state_pool_init(void);
+int tcm_state_pool_get_capacity(void);
 void tcm_state_pool_update(const tcm_context_t *context);
+void tcm_state_pool_clear(void);
 esp_err_t tcm_state_pool_get(const char *device_id, const char *point_id,
                              tcm_context_t *out);
 int tcm_state_pool_snapshot(tcm_context_t *out, int max_items);

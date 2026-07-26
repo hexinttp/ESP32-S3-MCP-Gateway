@@ -29,9 +29,9 @@ extern "C" {
 
 #define DISCOVER_MAX_SLAVES         100   /**< PSRAM-backed discovery capacity */
 #define DISCOVER_FALLBACK_SLAVES      8   /**< Capacity when external PSRAM is unavailable */
-#define DISCOVER_MAX_REGS_PER_SLAVE   8   /**< First-pass points retained per discovered slave */
+#define DISCOVER_MAX_REGS_PER_SLAVE  32   /**< PSRAM-backed raw register words retained per slave */
 #define DISCOVER_MAX_BLOCK_REGS       8   /**< Largest adaptive read block used for discovery */
-#define DISCOVER_DEFAULT_EMPTY_GAP    8   /**< Stop after this many empty addresses after data */
+#define DISCOVER_DEFAULT_EMPTY_GAP   32   /**< Covers common sparse industrial register maps */
 #define DISCOVER_BROADCAST_TIMEOUT   100  /**< ms, timeout for quick slave probe */
 #define DISCOVER_SCAN_TIMEOUT        500  /**< ms, timeout for register scan */
 
@@ -92,6 +92,13 @@ typedef struct {
     bool     scan_complete;
     bool     scan_in_progress;
 } discover_result_t;
+
+typedef struct {
+    uint16_t semantic_mappings;     /**< Points resolved through a semantic profile */
+    uint16_t raw_mappings;          /**< Unresolved 16-bit register-word mappings */
+    uint16_t profile_devices;       /**< Discovered devices matched to a profile */
+    uint16_t unresolved_devices;    /**< Devices retained in discovery for profile authoring */
+} discover_apply_result_t;
 
 typedef enum {
     DISCOVER_PHASE_IDLE = 0,
@@ -202,6 +209,9 @@ uint16_t modbus_discover_get_capacity(void);
  * @return Number of mapping entries successfully created.
  */
 int modbus_discover_apply_mappings(void);
+
+/** Result breakdown from the most recent mapping application. */
+discover_apply_result_t modbus_discover_get_apply_result(void);
 
 /**
  * @brief Clear all discovery results and reset state.

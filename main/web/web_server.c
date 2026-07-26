@@ -146,6 +146,29 @@ static cJSON *parse_request_json(httpd_req_t *req)
     return root;
 }
 
+static cJSON *parse_large_request_json(httpd_req_t *req, size_t max_length)
+{
+    int total_len = req->content_len;
+    if (total_len <= 0 || (size_t)total_len > max_length) return NULL;
+
+    char *buf = malloc((size_t)total_len + 1);
+    if (buf == NULL) return NULL;
+
+    int received = 0;
+    while (received < total_len) {
+        int ret = httpd_req_recv(req, buf + received, total_len - received);
+        if (ret <= 0) {
+            free(buf);
+            return NULL;
+        }
+        received += ret;
+    }
+    buf[total_len] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    return root;
+}
+
 /* ================================================================
  * GET / -Serve HTML page
  * ================================================================ */
@@ -255,6 +278,9 @@ static esp_err_t system_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "cache_usage_percent", uif_get_cache_usage_percent());
     cJSON_AddBoolToObject(root, "tf_mounted", tf_storage_is_mounted());
     cJSON_AddNumberToObject(root, "amm_model_version", amm_get_model_version());
+    cJSON_AddNumberToObject(root, "mapping_count", amm_get_mapping_count());
+    cJSON_AddNumberToObject(root, "mapping_capacity", amm_get_capacity());
+    cJSON_AddNumberToObject(root, "state_capacity", tcm_state_pool_get_capacity());
     cJSON_AddNumberToObject(root, "uptime_seconds",
                             (int64_t)(esp_timer_get_time() / 1000000LL));
     cJSON_AddNumberToObject(root, "sequence_counter", tcm_get_sequence_counter());
@@ -511,11 +537,20 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(obj, "range_max", e->constraint.valid_range_max);
         tcm_context_t state;
         if (tcm_state_pool_get(e->device_id, e->point_id, &state) == ESP_OK) {
-            cJSON_AddNumberToObject(obj, "current_raw_value", state.raw_value);
-            cJSON_AddNumberToObject(obj, "current_value", state.value);
             cJSON_AddNumberToObject(obj, "current_timestamp_ms",
                                     (double)state.timestamp_ms);
             cJSON_AddNumberToObject(obj, "quality_state", state.quality_state);
+            if (state.quality_state == QUALITY_GOOD ||
+                state.quality_state == QUALITY_STALE) {
+                cJSON_AddNumberToObject(obj, "current_raw_value", state.raw_value);
+                cJSON_AddNumberToObject(obj, "current_value", state.value);
+            }
+            cJSON_AddStringToObject(obj, "poll_status",
+                                    state.quality_state == QUALITY_GOOD ? "ok" :
+                                    state.quality_state == QUALITY_STALE ? "stale" :
+                                    "error");
+        } else {
+            cJSON_AddStringToObject(obj, "poll_status", "pending");
         }
         char *json = cJSON_PrintUnformatted(obj);
         cJSON_Delete(obj);
@@ -647,6 +682,137 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
     }
 }
 
+static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entry)
+{
+    if (!cJSON_IsObject(root) || entry == NULL) return false;
+
+    memset(entry, 0, sizeof(*entry));
+    entry->source_protocol = SRC_MODBUS_RTU;
+    entry->function_code = 3;
+    entry->data_type = DT_UINT16;
+    entry->byte_order = BYTE_ORDER_ABCD;
+    entry->scale_factor = 1.0f;
+    entry->poll_interval_ms = POLL_INTERVAL_MS;
+    entry->priority = 5;
+
+    const cJSON *value;
+    value = cJSON_GetObjectItem(root, "source_protocol");
+    if (cJSON_IsString(value) && strcmp(value->valuestring, "TCP") == 0) {
+        entry->source_protocol = SRC_MODBUS_TCP;
+    }
+    value = cJSON_GetObjectItem(root, "channel_id");
+    if (cJSON_IsNumber(value)) entry->channel_id = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "slave_id");
+    if (cJSON_IsNumber(value)) entry->slave_id = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "function_code");
+    if (cJSON_IsNumber(value)) entry->function_code = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "register_address");
+    if (cJSON_IsNumber(value)) entry->register_address = (uint16_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "data_type");
+    if (cJSON_IsString(value)) {
+        if (strcmp(value->valuestring, "FLOAT32") == 0) entry->data_type = DT_FLOAT32;
+        else if (strcmp(value->valuestring, "INT16") == 0) entry->data_type = DT_INT16;
+        else if (strcmp(value->valuestring, "INT32") == 0) entry->data_type = DT_INT32;
+        else if (strcmp(value->valuestring, "UINT32") == 0) entry->data_type = DT_UINT32;
+        else entry->data_type = DT_UINT16;
+    }
+    value = cJSON_GetObjectItem(root, "byte_order");
+    if (cJSON_IsNumber(value)) entry->byte_order = (byte_order_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "scale_factor");
+    if (cJSON_IsNumber(value)) entry->scale_factor = (float)value->valuedouble;
+    value = cJSON_GetObjectItem(root, "offset");
+    if (cJSON_IsNumber(value)) entry->offset = (float)value->valuedouble;
+    value = cJSON_GetObjectItem(root, "poll_interval_ms");
+    if (cJSON_IsNumber(value)) entry->poll_interval_ms = (uint32_t)value->valuedouble;
+    value = cJSON_GetObjectItem(root, "priority");
+    if (cJSON_IsNumber(value)) entry->priority = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "read_start_address");
+    if (cJSON_IsNumber(value)) entry->read_start_address = (uint16_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "read_register_count");
+    if (cJSON_IsNumber(value)) entry->read_register_count = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "value_register_index");
+    if (cJSON_IsNumber(value)) entry->value_register_index = (uint8_t)value->valueint;
+
+    value = cJSON_GetObjectItem(root, "device_id");
+    if (cJSON_IsString(value)) strlcpy(entry->device_id, value->valuestring, sizeof(entry->device_id));
+    value = cJSON_GetObjectItem(root, "point_id");
+    if (cJSON_IsString(value)) strlcpy(entry->point_id, value->valuestring, sizeof(entry->point_id));
+    value = cJSON_GetObjectItem(root, "measurement_name");
+    if (cJSON_IsString(value)) strlcpy(entry->measurement_name, value->valuestring, sizeof(entry->measurement_name));
+    value = cJSON_GetObjectItem(root, "unit");
+    if (cJSON_IsString(value)) strlcpy(entry->unit, value->valuestring, sizeof(entry->unit));
+    value = cJSON_GetObjectItem(root, "mqtt_topic");
+    if (cJSON_IsString(value)) strlcpy(entry->mqtt_topic, value->valuestring, sizeof(entry->mqtt_topic));
+
+    value = cJSON_GetObjectItem(root, "writable");
+    if (cJSON_IsBool(value)) entry->constraint.writable = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "range_min");
+    if (cJSON_IsNumber(value)) entry->constraint.valid_range_min = (float)value->valuedouble;
+    value = cJSON_GetObjectItem(root, "range_max");
+    if (cJSON_IsNumber(value)) entry->constraint.valid_range_max = (float)value->valuedouble;
+    entry->active = true;
+
+    return entry->slave_id >= 1 &&
+           (entry->function_code == 3 || entry->function_code == 4) &&
+           entry->device_id[0] != '\0' && entry->point_id[0] != '\0';
+}
+
+/* POST /api/mappings/import - Batch semantic profile import. */
+static esp_err_t mappings_import_post_handler(httpd_req_t *req)
+{
+    cJSON *root = parse_large_request_json(req, 768U * 1024U);
+    if (root == NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"Invalid or oversized mapping profile\"}");
+    }
+
+    cJSON *items = cJSON_GetObjectItem(root, "mappings");
+    cJSON *replace = cJSON_GetObjectItem(root, "replace_devices");
+    int count = cJSON_IsArray(items) ? cJSON_GetArraySize(items) : 0;
+    if (count <= 0 || count > amm_get_capacity()) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"Mapping count exceeds runtime capacity\"}");
+    }
+
+    amm_mapping_entry_t *entries = calloc((size_t)count, sizeof(entries[0]));
+    if (entries == NULL) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"Out of memory\"}");
+    }
+
+    bool valid = true;
+    for (int i = 0; i < count; ++i) {
+        if (!mapping_entry_from_json(cJSON_GetArrayItem(items, i), &entries[i])) {
+            valid = false;
+            break;
+        }
+    }
+
+    int imported = 0;
+    esp_err_t err = valid
+        ? amm_import_mappings(entries, count, cJSON_IsTrue(replace), &imported)
+        : ESP_ERR_INVALID_ARG;
+    free(entries);
+    cJSON_Delete(root);
+
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        char error_json[128];
+        snprintf(error_json, sizeof(error_json),
+                 "{\"error\":\"Profile import failed: %s\"}",
+                 esp_err_to_name(err));
+        return send_json(req, error_json);
+    }
+
+    char response[128];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"ok\",\"imported\":%d,\"total_mappings\":%d,\"capacity\":%d}",
+             imported, amm_get_mapping_count(), amm_get_capacity());
+    return send_json(req, response);
+}
+
 /* ================================================================
  * PUT /api/mappings/:idx -Update mapping (re-add with same addr)
  * ================================================================ */
@@ -702,6 +868,20 @@ static esp_err_t mappings_delete_handler(httpd_req_t *req)
 
     httpd_resp_send_400(req);
     return ESP_FAIL;
+}
+
+static esp_err_t mappings_clear_handler(httpd_req_t *req)
+{
+    esp_err_t err = amm_clear_mappings();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Web API: clear mappings failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Clear mappings failed");
+    }
+
+    tcm_state_pool_clear();
+    ESP_LOGI(TAG, "Web API: cleared all mappings and runtime point states");
+    return send_json(req, "{\"status\":\"ok\",\"cleared\":true}");
 }
 
 /* ================================================================
@@ -874,7 +1054,7 @@ static esp_err_t discover_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "registers_found", r.registers_found);
     cJSON_AddNumberToObject(root, "mappings_created", r.mappings_created);
     cJSON_AddNumberToObject(root, "device_capacity", r.device_capacity);
-    cJSON_AddNumberToObject(root, "mapping_capacity", AMM_MAX_MAPPING_ENTRIES);
+    cJSON_AddNumberToObject(root, "mapping_capacity", amm_get_capacity());
     cJSON_AddNumberToObject(root, "current_slave", r.current_slave);
     cJSON_AddNumberToObject(root, "current_register", r.current_register);
     cJSON_AddNumberToObject(root, "current_function_code", r.current_function_code);
@@ -1080,9 +1260,14 @@ static esp_err_t discover_apply_post_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"discovery scan in progress\"}");
     }
     int created = modbus_discover_apply_mappings();
+    discover_apply_result_t apply = modbus_discover_get_apply_result();
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "mappings_created", created);
+    cJSON_AddNumberToObject(root, "semantic_mappings", apply.semantic_mappings);
+    cJSON_AddNumberToObject(root, "raw_mappings", apply.raw_mappings);
+    cJSON_AddNumberToObject(root, "profile_devices", apply.profile_devices);
+    cJSON_AddNumberToObject(root, "unresolved_devices", apply.unresolved_devices);
     cJSON_AddNumberToObject(root, "total_mappings", amm_get_mapping_count());
 
     char *json = cJSON_PrintUnformatted(root);
@@ -1437,6 +1622,13 @@ esp_err_t web_server_start(uint16_t port)
     const httpd_uri_t mappings_post = {
         .uri = "/api/mappings", .method = HTTP_POST, .handler = mappings_post_handler,
     };
+    const httpd_uri_t mappings_clear = {
+        .uri = "/api/mappings", .method = HTTP_DELETE, .handler = mappings_clear_handler,
+    };
+    const httpd_uri_t mappings_import_post = {
+        .uri = "/api/mappings/import", .method = HTTP_POST,
+        .handler = mappings_import_post_handler,
+    };
     const httpd_uri_t mappings_put = {
         .uri = "/api/mappings/*", .method = HTTP_PUT, .handler = mappings_put_handler,
     };
@@ -1511,6 +1703,8 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &modbus_logs_del);
     httpd_register_uri_handler(s_server, &mappings_get);
     httpd_register_uri_handler(s_server, &mappings_post);
+    httpd_register_uri_handler(s_server, &mappings_clear);
+    httpd_register_uri_handler(s_server, &mappings_import_post);
     httpd_register_uri_handler(s_server, &mappings_put);
     httpd_register_uri_handler(s_server, &mappings_del);
     httpd_register_uri_handler(s_server, &discover_status_get);

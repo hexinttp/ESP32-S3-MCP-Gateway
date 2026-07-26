@@ -30,6 +30,10 @@
 
 set(WEB_HTML "${CMAKE_CURRENT_LIST_DIR}/../web/web_config.html")
 set(WEB_HTML_GZIP "${CMAKE_CURRENT_BINARY_DIR}/web_config.html.gz")
+set(LAB_PROFILE "${CMAKE_CURRENT_LIST_DIR}/../profiles/lab_rtu_146_points.json")
+set(LAB_PROFILE_EMBED "${CMAKE_CURRENT_BINARY_DIR}/lab_profile.json")
+
+configure_file("${LAB_PROFILE}" "${LAB_PROFILE_EMBED}" COPYONLY)
 
 add_custom_command(
     OUTPUT "${WEB_HTML_GZIP}"
@@ -43,5 +47,10 @@ add_custom_command(
 target_add_binary_data(
     ${COMPONENT_LIB} "${WEB_HTML_GZIP}" BINARY
     DEPENDS "${WEB_HTML}" "${CMAKE_CURRENT_LIST_DIR}/gzip_asset.py"
+)
+
+target_add_binary_data(
+    ${COMPONENT_LIB} "${LAB_PROFILE_EMBED}" TEXT
+    DEPENDS "${LAB_PROFILE}"
 )
 

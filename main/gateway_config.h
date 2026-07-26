@@ -48,7 +48,9 @@
 #define TCM_MANDATORY_FIELD_CNT  16
 
 /* ======================== AMM Mapping Configuration ======================== */
-#define AMM_MAX_MAPPING_ENTRIES  64
+#define AMM_MAX_MAPPING_ENTRIES  1000
+#define AMM_FALLBACK_MAPPING_ENTRIES 64
+#define AMM_NVS_PARTITION        "amm_nvs"
 #define AMM_MAX_TOPIC_LEN        128
 #define AMM_MAX_DEVICE_NAME_LEN  32
 #define AMM_MAX_POINT_NAME_LEN   32

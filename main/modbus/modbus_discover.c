@@ -17,8 +17,12 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "cJSON.h"
 
 static const char *TAG = "DISCOVER";
+
+extern const uint8_t lab_profile_json_start[] asm("_binary_lab_profile_json_start");
+extern const uint8_t lab_profile_json_end[] asm("_binary_lab_profile_json_end");
 
 /* ======================== Internal State ======================== */
 
@@ -26,6 +30,7 @@ static discovered_device_t *s_devices = NULL;
 static uint16_t            s_device_capacity = 0;
 static uint16_t            s_device_count = 0;
 static discover_result_t   s_result;
+static discover_apply_result_t s_apply_result;
 static TaskHandle_t        s_scan_task;
 static portMUX_TYPE         s_result_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -816,77 +821,248 @@ uint16_t modbus_discover_get_capacity(void)
 
 /* ======================== Apply Mappings ======================== */
 
+static data_type_t profile_data_type(const char *name)
+{
+    if (name && strcmp(name, "INT16") == 0) return DT_INT16;
+    if (name && strcmp(name, "FLOAT32") == 0) return DT_FLOAT32;
+    if (name && strcmp(name, "INT32") == 0) return DT_INT32;
+    if (name && strcmp(name, "UINT32") == 0) return DT_UINT32;
+    return DT_UINT16;
+}
+
+static byte_order_t profile_byte_order(const char *name)
+{
+    if (name && strcmp(name, "CDAB") == 0) return BYTE_ORDER_CDAB;
+    if (name && strcmp(name, "BADC") == 0) return BYTE_ORDER_BADC;
+    if (name && strcmp(name, "DCBA") == 0) return BYTE_ORDER_DCBA;
+    return BYTE_ORDER_ABCD;
+}
+
+static uint8_t profile_type_width(data_type_t type)
+{
+    return type == DT_FLOAT32 || type == DT_INT32 || type == DT_UINT32 ? 2 : 1;
+}
+
+static bool discovered_has_register(const discovered_device_t *device,
+                                    uint16_t address, uint8_t function_code)
+{
+    uint16_t protocol_offset =
+        discover_register_offset(function_code, address);
+    for (int i = 0; i < device->reg_count; ++i) {
+        const discovered_register_t *reg = &device->registers[i];
+        if (reg->valid &&
+            (reg->register_address == address ||
+             reg->register_address == protocol_offset) &&
+            reg->function_code == function_code) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A profile match requires at least two semantic register starts. This is a
+ * lightweight fingerprint: slave ID alone is not enough to claim semantics.
+ */
+static bool profile_matches_discovered_device(const cJSON *profile_device,
+                                              const discovered_device_t *device)
+{
+    cJSON *slave = cJSON_GetObjectItem(profile_device, "slave_id");
+    cJSON *registers = cJSON_GetObjectItem(profile_device, "registers");
+    if (!cJSON_IsNumber(slave) || !cJSON_IsArray(registers) ||
+        (uint8_t)slave->valuedouble != device->slave_id) {
+        return false;
+    }
+
+    int overlap = 0;
+    cJSON *reg = NULL;
+    cJSON_ArrayForEach(reg, registers) {
+        cJSON *address = cJSON_GetObjectItem(reg, "address");
+        cJSON *function = cJSON_GetObjectItem(reg, "function_code");
+        if (!cJSON_IsNumber(address)) continue;
+        uint8_t fc = cJSON_IsNumber(function) ? (uint8_t)function->valuedouble : 3;
+        if (discovered_has_register(device, (uint16_t)address->valuedouble, fc)) {
+            ++overlap;
+            if (overlap >= 2) return true;
+        }
+    }
+    return false;
+}
+
+static cJSON *find_profile_device(cJSON *profile_devices,
+                                  const discovered_device_t *device)
+{
+    cJSON *profile_device = NULL;
+    cJSON_ArrayForEach(profile_device, profile_devices) {
+        if (profile_matches_discovered_device(profile_device, device)) {
+            return profile_device;
+        }
+    }
+    return NULL;
+}
+
+static void profile_copy_string(cJSON *object, const char *key,
+                                char *destination, size_t destination_size)
+{
+    cJSON *value = cJSON_GetObjectItem(object, key);
+    if (cJSON_IsString(value) && value->valuestring != NULL) {
+        strlcpy(destination, value->valuestring, destination_size);
+    }
+}
+
+static float profile_number(cJSON *object, const char *key, float fallback)
+{
+    cJSON *value = cJSON_GetObjectItem(object, key);
+    return cJSON_IsNumber(value) ? (float)value->valuedouble : fallback;
+}
+
+static int apply_embedded_semantic_profile(bool *matched_devices)
+{
+    size_t profile_length =
+        (size_t)(lab_profile_json_end - lab_profile_json_start);
+    cJSON *root = cJSON_ParseWithLength(
+        (const char *)lab_profile_json_start, profile_length);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Embedded TCM semantic profile is invalid");
+        return 0;
+    }
+
+    cJSON *profile_devices = cJSON_GetObjectItem(root, "devices");
+    int capacity = amm_get_capacity();
+    amm_mapping_entry_t *entries = heap_caps_calloc(
+        (size_t)capacity, sizeof(entries[0]),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (entries == NULL) {
+        entries = heap_caps_calloc(
+            (size_t)capacity, sizeof(entries[0]),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!cJSON_IsArray(profile_devices) || entries == NULL) {
+        cJSON_Delete(root);
+        free(entries);
+        return 0;
+    }
+
+    int entry_count = 0;
+    int matched_count = 0;
+    for (int i = 0; i < s_device_count && entry_count < capacity; ++i) {
+        const discovered_device_t *device = &s_devices[i];
+        if (!device->active) continue;
+
+        cJSON *profile_device = find_profile_device(profile_devices, device);
+        if (profile_device == NULL) continue;
+
+        matched_devices[i] = true;
+        ++matched_count;
+        cJSON *poll = cJSON_GetObjectItem(profile_device, "poll_interval_ms");
+        cJSON *priority = cJSON_GetObjectItem(profile_device, "priority");
+        cJSON *registers = cJSON_GetObjectItem(profile_device, "registers");
+        cJSON *reg = NULL;
+        cJSON_ArrayForEach(reg, registers) {
+            if (entry_count >= capacity) break;
+            cJSON *address = cJSON_GetObjectItem(reg, "address");
+            cJSON *function = cJSON_GetObjectItem(reg, "function_code");
+            cJSON *type = cJSON_GetObjectItem(reg, "data_type");
+            cJSON *order = cJSON_GetObjectItem(reg, "byte_order");
+            if (!cJSON_IsNumber(address)) continue;
+
+            amm_mapping_entry_t *entry = &entries[entry_count++];
+            entry->source_protocol = device->source_protocol;
+            entry->channel_id = device->channel_id;
+            entry->slave_id = device->slave_id;
+            entry->function_code =
+                cJSON_IsNumber(function) ? (uint8_t)function->valuedouble : 3;
+            entry->register_address = (uint16_t)address->valuedouble;
+            entry->data_type = profile_data_type(
+                cJSON_IsString(type) ? type->valuestring : NULL);
+            entry->byte_order = profile_byte_order(
+                cJSON_IsString(order) ? order->valuestring : NULL);
+            entry->scale_factor = profile_number(reg, "scale", 1.0f);
+            entry->offset = profile_number(reg, "offset", 0.0f);
+            entry->poll_interval_ms =
+                cJSON_IsNumber(poll) ? (uint32_t)poll->valuedouble : 1000;
+            entry->priority =
+                cJSON_IsNumber(priority) ? (uint8_t)priority->valuedouble : 5;
+            entry->read_start_address = entry->register_address;
+            entry->read_register_count = profile_type_width(entry->data_type);
+            entry->value_register_index = 0;
+            entry->active = true;
+            entry->discovered = true;
+
+            if (device->source_protocol == SRC_MODBUS_RTU) {
+                profile_copy_string(profile_device, "device_id",
+                                    entry->device_id, sizeof(entry->device_id));
+            }
+            if (entry->device_id[0] == '\0') {
+                snprintf(entry->device_id, sizeof(entry->device_id),
+                         "%s_ch%u_slave_%02u",
+                         device->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
+                         device->channel_id, device->slave_id);
+            }
+            profile_copy_string(reg, "point_id",
+                                entry->point_id, sizeof(entry->point_id));
+            profile_copy_string(reg, "name",
+                                entry->measurement_name,
+                                sizeof(entry->measurement_name));
+            profile_copy_string(reg, "unit",
+                                entry->unit, sizeof(entry->unit));
+            if (entry->point_id[0] == '\0') {
+                snprintf(entry->point_id, sizeof(entry->point_id),
+                         "register_%u", entry->register_address);
+            }
+            if (entry->measurement_name[0] == '\0') {
+                strlcpy(entry->measurement_name, entry->point_id,
+                        sizeof(entry->measurement_name));
+            }
+            snprintf(entry->mqtt_topic, sizeof(entry->mqtt_topic),
+                     "factory/data/%s/%s", entry->device_id, entry->point_id);
+            entry->constraint.writable =
+                cJSON_IsTrue(cJSON_GetObjectItem(reg, "writable"));
+            entry->constraint.valid_range_min =
+                profile_number(reg, "minimum", -32768.0f);
+            entry->constraint.valid_range_max =
+                profile_number(reg, "maximum", 65535.0f);
+        }
+    }
+
+    int imported = 0;
+    esp_err_t error = entry_count > 0
+        ? amm_import_mappings(entries, entry_count, true, &imported)
+        : ESP_ERR_NOT_FOUND;
+    if (error != ESP_OK) {
+        memset(matched_devices, 0,
+               (size_t)s_device_count * sizeof(matched_devices[0]));
+        matched_count = 0;
+        imported = 0;
+        ESP_LOGW(TAG, "TCM semantic profile apply failed: %s",
+                 esp_err_to_name(error));
+    } else {
+        ESP_LOGI(TAG, "TCM semantic profile resolved %d devices / %d points",
+                 matched_count, imported);
+    }
+
+    s_apply_result.profile_devices = matched_count;
+    s_apply_result.semantic_mappings = imported;
+    free(entries);
+    cJSON_Delete(root);
+    return imported;
+}
+
 int modbus_discover_apply_mappings(void)
 {
-    int created = 0;
+    memset(&s_apply_result, 0, sizeof(s_apply_result));
+    bool matched_devices[DISCOVER_MAX_SLAVES] = {false};
+    int created = apply_embedded_semantic_profile(matched_devices);
 
     for (int i = 0; i < s_device_count; i++) {
         const discovered_device_t *dev = &s_devices[i];
-        if (!dev->active) continue;
-
-        for (int j = 0; j < dev->reg_count; j++) {
-            const discovered_register_t *reg = &dev->registers[j];
-            if (!reg->valid) continue;
-
-            /* Skip if mapping already exists for this protocol/channel/slave/address. */
-            amm_mapping_entry_t existing;
-            if (amm_find_mapping_for_channel(dev->source_protocol, dev->channel_id,
-                                             dev->slave_id, reg->register_address,
-                                             &existing) == ESP_OK) {
-                ESP_LOGI(TAG, "Mapping already exists for %s channel %u slave %u / addr %u",
-                         dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
-                         dev->channel_id, dev->slave_id, reg->register_address);
-                continue;
-            }
-
-            amm_mapping_entry_t entry;
-            memset(&entry, 0, sizeof(entry));
-
-            entry.slave_id = dev->slave_id;
-            entry.source_protocol = dev->source_protocol;
-            entry.channel_id = dev->channel_id;
-            entry.function_code = reg->function_code;
-            entry.register_address = reg->register_address;
-            entry.data_type = reg->inferred_type;
-            entry.read_start_address = reg->read_start_address;
-            entry.read_register_count = reg->read_register_count;
-            entry.value_register_index = reg->value_register_index;
-            entry.scale_factor = 1.0f;
-
-            /* Device and point IDs */
-            snprintf(entry.device_id, AMM_MAX_DEVICE_NAME_LEN, "%s",
-                     dev->device_id);
-            snprintf(entry.point_id, AMM_MAX_POINT_NAME_LEN, "%s",
-                     reg->inferred_name);
-            snprintf(entry.measurement_name, AMM_MAX_POINT_NAME_LEN, "%s",
-                     reg->inferred_name);
-            snprintf(entry.unit, AMM_MAX_UNIT_LEN, "%s", reg->inferred_unit);
-
-            /* MQTT topic: factory/data/<device_id>/<point_id> */
-            snprintf(entry.mqtt_topic, AMM_MAX_TOPIC_LEN,
-                     "factory/data/%s/%s", dev->device_id, entry.point_id);
-
-            /* Constraint from semantic inference */
-            entry.constraint.writable = reg->writable;
-            float rmin, rmax;
-            modbus_discover_infer_semantics(reg->register_address,
-                                            reg->sample_value,
-                                            entry.point_id, entry.unit,
-                                            &rmin, &rmax);
-            entry.constraint.valid_range_min = rmin;
-            entry.constraint.valid_range_max = rmax;
-
-            entry.active = true;
-
-            esp_err_t err = amm_add_mapping(&entry);
-            if (err == ESP_OK) {
-                created++;
-                ESP_LOGI(TAG, "Created mapping: %s/%s @ slave %u addr %u",
-                         entry.device_id, entry.point_id,
-                         dev->slave_id, reg->register_address);
-            } else {
-                ESP_LOGW(TAG, "Failed to add mapping: %s", esp_err_to_name(err));
-            }
+        if (dev->active && !matched_devices[i]) {
+            ++s_apply_result.unresolved_devices;
+            ESP_LOGW(TAG,
+                     "Semantic profile unresolved for %s channel %u slave %u; "
+                     "raw words remain in discovery only",
+                     dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+                     dev->channel_id, dev->slave_id);
         }
     }
 
@@ -895,6 +1071,11 @@ int modbus_discover_apply_mappings(void)
     taskEXIT_CRITICAL(&s_result_lock);
     ESP_LOGI(TAG, "Applied %d new AMM mapping entries", created);
     return created;
+}
+
+discover_apply_result_t modbus_discover_get_apply_result(void)
+{
+    return s_apply_result;
 }
 
 /* ======================== Editing API ======================== */

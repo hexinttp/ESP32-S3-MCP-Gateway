@@ -3,16 +3,38 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
 #include "gateway_config.h"
 
-static tcm_context_t s_states[AMM_MAX_MAPPING_ENTRIES];
+static tcm_context_t *s_states;
 static int s_count;
+static int s_capacity;
 static SemaphoreHandle_t s_mutex;
 
 esp_err_t tcm_state_pool_init(void)
 {
     if (s_mutex == NULL) s_mutex = xSemaphoreCreateMutex();
-    return s_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK;
+    if (s_mutex == NULL) return ESP_ERR_NO_MEM;
+
+    if (s_states == NULL && esp_psram_is_initialized()) {
+        s_states = heap_caps_calloc(
+            AMM_MAX_MAPPING_ENTRIES, sizeof(s_states[0]),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_states != NULL) s_capacity = AMM_MAX_MAPPING_ENTRIES;
+    }
+    if (s_states == NULL) {
+        s_states = heap_caps_calloc(
+            AMM_FALLBACK_MAPPING_ENTRIES, sizeof(s_states[0]),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_states != NULL) s_capacity = AMM_FALLBACK_MAPPING_ENTRIES;
+    }
+    return s_states == NULL ? ESP_ERR_NO_MEM : ESP_OK;
+}
+
+int tcm_state_pool_get_capacity(void)
+{
+    return s_capacity;
 }
 
 void tcm_state_pool_update(const tcm_context_t *context)
@@ -30,9 +52,18 @@ void tcm_state_pool_update(const tcm_context_t *context)
         if (s_states[i].timestamp_ms < s_states[oldest].timestamp_ms) oldest = i;
     }
     if (slot < 0) {
-        slot = s_count < AMM_MAX_MAPPING_ENTRIES ? s_count++ : oldest;
+        slot = s_count < s_capacity ? s_count++ : oldest;
     }
     s_states[slot] = *context;
+    xSemaphoreGive(s_mutex);
+}
+
+void tcm_state_pool_clear(void)
+{
+    if (s_states == NULL || s_mutex == NULL) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    memset(s_states, 0, (size_t)s_capacity * sizeof(s_states[0]));
+    s_count = 0;
     xSemaphoreGive(s_mutex);
 }
 
