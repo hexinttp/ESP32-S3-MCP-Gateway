@@ -786,7 +786,13 @@ tbody tr:last-child td { border-bottom: none; }
         </div>
       </div>
       <div class="card">
-        <div class="card-header"><span data-i18n="modbus.tcp_title">MODBUS TCP Endpoints</span><button class="btn btn-primary btn-sm" onclick="addTcpEndpoint()" data-i18n="modbus.tcp_add">Add Endpoint</button></div>
+        <div class="card-header">
+          <span data-i18n="modbus.tcp_title">MODBUS TCP Endpoints</span>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-outline btn-sm" id="tcpEndpointCancel" style="display:none;" onclick="cancelTcpEndpointEdit()" data-i18n="btn.cancel">Cancel</button>
+            <button class="btn btn-primary btn-sm" id="tcpEndpointAction" onclick="saveTcpEndpointFromForm()" data-i18n="modbus.tcp_add">Add Endpoint</button>
+          </div>
+        </div>
         <div class="card-body">
           <div class="form-grid">
             <div class="form-group"><label data-i18n="modbus.tcp_name">Name</label><input id="tcpName" type="text" placeholder="PLC TCP 1"></div>
@@ -852,6 +858,17 @@ tbody tr:last-child td { border-bottom: none; }
         <!-- Scan Parameters -->
         <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:12px;">
           <div>
+            <label class="form-label" data-i18n="discover.transport">Transport</label>
+            <select id="scanTransport" class="form-input" onchange="updateScanTransport()">
+              <option value="RTU">Modbus RTU / RS485</option>
+              <option value="TCP">Modbus TCP</option>
+            </select>
+          </div>
+          <div id="scanTcpEndpointWrap" style="display:none;">
+            <label class="form-label" data-i18n="discover.tcp_endpoint">TCP Endpoint</label>
+            <select id="scanTcpEndpoint" class="form-input"></select>
+          </div>
+          <div>
             <label class="form-label" data-i18n="discover.slave_range">Slave ID Range</label>
             <div style="display:flex; gap:4px;">
               <input type="number" id="scanSlaveStart" value="1" min="1" max="247" class="form-input" style="width:60px;">
@@ -870,8 +887,8 @@ tbody tr:last-child td { border-bottom: none; }
           <div>
             <label class="form-label" data-i18n="discover.functions">Function Codes</label>
             <div style="display:flex; align-items:center; gap:12px; height:34px;">
-              <label><input type="checkbox" id="scanFc03" checked> FC03</label>
-              <label><input type="checkbox" id="scanFc04" checked> FC04</label>
+              <label title="Holding Registers: process/configuration values, commonly writable"><input type="checkbox" id="scanFc03" checked> FC03</label>
+              <label title="Input Registers: read-only measurement values"><input type="checkbox" id="scanFc04" checked> FC04</label>
             </div>
           </div>
           <div>
@@ -887,9 +904,9 @@ tbody tr:last-child td { border-bottom: none; }
             <div id="scanSummary" style="padding:6px 10px; border-radius:6px; background:var(--surface2); font-size:13px;">-</div>
           </div>
         </div>
-        <!-- MODBUS RTU Discovery Hint -->
+        <!-- MODBUS Discovery Hint -->
         <div style="display:flex; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--border); margin-top:8px; flex-wrap:wrap;">
-          <span style="font-size:13px; font-weight:600; color:var(--text2);" data-i18n="discover.rtu_hint">RTU discovery scans the RS485 bus configured in MODBUS Settings.</span>
+          <span id="scanTransportHint" style="font-size:13px; font-weight:600; color:var(--text2);" data-i18n="discover.rtu_hint">RTU discovery scans the RS485 bus configured in MODBUS Settings.</span>
         </div>
         <div id="scanProgress" style="display:none;">
           <div style="background:var(--surface2); border-radius:4px; height:8px; overflow:hidden;">
@@ -1297,6 +1314,7 @@ const I18N = {
     "modbus.poll_hint": "\u4e24\u6b21\u8f6e\u8be2\u5468\u671f\u4e4b\u95f4\u7684\u65f6\u95f4",
     "modbus.tcp_title": "MODBUS TCP \u7aef\u70b9",
     "modbus.tcp_add": "\u6dfb\u52a0\u7aef\u70b9",
+    "modbus.tcp_update": "\u66f4\u65b0\u7aef\u70b9",
     "modbus.tcp_name": "\u7aef\u70b9\u540d\u79f0",
     "modbus.tcp_host": "\u4e3b\u673a / IP",
     "modbus.tcp_port": "\u7aef\u53e3",
@@ -1324,6 +1342,8 @@ const I18N = {
     "discover.scan": "\u5168\u91cf\u626b\u63cf",
     "discover.apply": "\u5e94\u7528\u6620\u5c04",
     "discover.reset": "\u91cd\u7f6e",
+    "discover.transport": "\u626b\u63cf\u7c7b\u578b",
+    "discover.tcp_endpoint": "TCP \u7aef\u70b9",
     "discover.slave_range": "\u4ece\u7ad9 ID \u8303\u56f4",
     "discover.reg_range": "\u5bc4\u5b58\u5668\u8303\u56f4",
     "discover.functions": "\u529f\u80fd\u7801",
@@ -1491,6 +1511,7 @@ const I18N = {
     'modbus.poll_hint': 'Time between consecutive poll cycles',
     'modbus.tcp_title': 'MODBUS TCP Endpoints',
     'modbus.tcp_add': 'Add Endpoint',
+    'modbus.tcp_update': 'Update Endpoint',
     'modbus.tcp_name': 'Endpoint Name',
     'modbus.tcp_host': 'Host / IP',
     'modbus.tcp_port': 'Port',
@@ -1518,6 +1539,8 @@ const I18N = {
     'discover.scan': 'Full Scan',
     'discover.apply': 'Apply Mappings',
     'discover.reset': 'Reset',
+    'discover.transport': 'Transport',
+    'discover.tcp_endpoint': 'TCP Endpoint',
     'discover.slave_range': 'Slave ID Range',
     'discover.reg_range': 'Register Range',
     'discover.functions': 'Function Codes',
@@ -1643,6 +1666,12 @@ function setLang(lang, persist = true) {
   if (typeof updateBridgeUI === 'function') updateBridgeUI();
   if (typeof renderAutomationRules === 'function') renderAutomationRules();
   if (typeof renderModbusLogs === 'function') renderModbusLogs();
+  if (typeof updateScanTransport === 'function') updateScanTransport();
+  const tcpEndpointAction = document.getElementById('tcpEndpointAction');
+  if (tcpEndpointAction && typeof tcpEndpointEditIndex !== 'undefined') {
+    tcpEndpointAction.textContent = t(tcpEndpointEditIndex >= 0
+      ? 'modbus.tcp_update' : 'modbus.tcp_add');
+  }
   if (persist && typeof apiPut === 'function') {
     apiPut('/api/gateway/config', {locale: lang === 'zh' ? 'zh-CN' : 'en-US'});
   }
@@ -1696,6 +1725,7 @@ let systemState = {
 
 let mappings = [];
 let tcpEndpoints = [];
+let tcpEndpointEditIndex = -1;
 
 let logLines = [];
 let modbusLogEntries = [];
@@ -1762,7 +1792,12 @@ async function apiJson(method, path, body) {
     const res = await fetchWithTimeout(path, opts);
     if (res.ok) return await res.json();
     const errText = await res.text();
-    return { error: errText || `HTTP ${res.status}` };
+    try {
+      const errorPayload = JSON.parse(errText);
+      return { error: errorPayload.error || errorPayload.message || `HTTP ${res.status}` };
+    } catch (_) {
+      return { error: errText || `HTTP ${res.status}` };
+    }
   } catch(e) { return { error: e.message }; }
 }
 
@@ -1988,9 +2023,9 @@ function saveMqttConfig() {
   addLog('info', `[MQTT] Configuration saved: URI=${data.uri}`);
 }
 
-function saveModbusConfig() {
+function collectModbusConfig() {
   const parityMap = {none:0, even:2, odd:3};
-  const data = {
+  return {
     uart_port: parseInt(document.getElementById('mbUartPort').value),
     baudrate: parseInt(document.getElementById('mbBaudrate').value),
     parity: parityMap[document.getElementById('mbParity').value] ?? 0,
@@ -2003,9 +2038,24 @@ function saveModbusConfig() {
     poll_interval: parseInt(document.getElementById('mbPollInterval').value),
     tcp_endpoints: tcpEndpoints,
   };
-  apiPut('/api/modbus/config', data);
-  showToast(t('toast.saved'), 'success');
-  addLog('info', `[MODBUS] Configuration saved: baud=${data.baudrate} parity=${data.parity}`);
+}
+
+async function persistModbusConfig(notifyUser = true) {
+  const data = collectModbusConfig();
+  const result = await apiJson('PUT', '/api/modbus/config', data);
+  if (result && !result.error) {
+    if (notifyUser) showToast(t('toast.saved'), 'success');
+    addLog('info', `[MODBUS] Configuration saved: baud=${data.baudrate} parity=${data.parity} TCP=${data.tcp_endpoints.length}`);
+    return true;
+  }
+  const message = result?.error || t('toast.error');
+  if (notifyUser) showToast(message, 'error');
+  addLog('error', `[MODBUS] Configuration save failed: ${message}`);
+  return false;
+}
+
+async function saveModbusConfig() {
+  await persistModbusConfig(true);
 }
 
 function testMqttConnection() {
@@ -2249,20 +2299,104 @@ async function refreshAll() {
 function renderTcpEndpoints() {
   const body = document.getElementById('tcpEndpointsBody');
   if (!body) return;
-  body.innerHTML = tcpEndpoints.map((endpoint, index) => `<tr><td>${endpoint.endpoint_id}</td><td>${endpoint.name}</td><td>${endpoint.host}</td><td>${endpoint.port}</td><td><button class="btn btn-danger btn-sm" onclick="removeTcpEndpoint(${index})">&#128465;</button></td></tr>`).join('');
+  body.innerHTML = tcpEndpoints.map((endpoint, index) => `<tr>
+    <td>${endpoint.endpoint_id}</td>
+    <td>${escapeHtml(endpoint.name)}</td>
+    <td>${escapeHtml(endpoint.host)}</td>
+    <td>${endpoint.port}</td>
+    <td>
+      <button class="btn btn-outline btn-sm" onclick="editTcpEndpoint(${index})" title="${currentLang === 'zh' ? '\u7f16\u8f91' : 'Edit'}">&#9998;</button>
+      <button class="btn btn-danger btn-sm" onclick="removeTcpEndpoint(${index})" title="${currentLang === 'zh' ? '\u5220\u9664' : 'Delete'}">&#128465;</button>
+    </td>
+  </tr>`).join('');
+  const selector = document.getElementById('scanTcpEndpoint');
+  if (selector) {
+    const previous = selector.value;
+    selector.innerHTML = tcpEndpoints
+      .filter(endpoint => endpoint.enabled !== false)
+      .map(endpoint => `<option value="${endpoint.endpoint_id}">${endpoint.name || ('TCP ' + endpoint.endpoint_id)} - ${endpoint.host}:${endpoint.port}</option>`)
+      .join('');
+    if ([...selector.options].some(option => option.value === previous)) {
+      selector.value = previous;
+    }
+  }
 }
 
-function addTcpEndpoint() {
+function updateScanTransport() {
+  const isTcp = document.getElementById('scanTransport').value === 'TCP';
+  document.getElementById('scanTcpEndpointWrap').style.display = isTcp ? 'block' : 'none';
+  const hint = document.getElementById('scanTransportHint');
+  hint.textContent = isTcp
+    ? (currentLang === 'zh'
+        ? '\u626b\u63cf MODBUS \u8bbe\u7f6e\u4e2d\u5df2\u542f\u7528\u7684 TCP \u7aef\u70b9\uff1b\u7f51\u5173\u5fc5\u987b\u80fd\u8bbf\u95ee\u8be5 IP \u548c\u7aef\u53e3\u3002'
+        : 'Scans the enabled TCP endpoint configured in MODBUS Settings; its IP and port must be reachable by the gateway.')
+    : t('discover.rtu_hint');
+}
+
+function resetTcpEndpointForm() {
+  tcpEndpointEditIndex = -1;
+  document.getElementById('tcpName').value = '';
+  document.getElementById('tcpHost').value = '';
+  document.getElementById('tcpPort').value = '502';
+  document.getElementById('tcpTimeout').value = '1000';
+  document.getElementById('tcpEndpointAction').textContent = t('modbus.tcp_add');
+  document.getElementById('tcpEndpointCancel').style.display = 'none';
+}
+
+function cancelTcpEndpointEdit() {
+  resetTcpEndpointForm();
+}
+
+function editTcpEndpoint(index) {
+  const endpoint = tcpEndpoints[index];
+  if (!endpoint) return;
+  tcpEndpointEditIndex = index;
+  document.getElementById('tcpName').value = endpoint.name || '';
+  document.getElementById('tcpHost').value = endpoint.host || '';
+  document.getElementById('tcpPort').value = endpoint.port || 502;
+  document.getElementById('tcpTimeout').value = endpoint.timeout || 1000;
+  document.getElementById('tcpEndpointAction').textContent = t('modbus.tcp_update');
+  document.getElementById('tcpEndpointCancel').style.display = 'inline-flex';
+}
+
+function saveTcpEndpointFromForm() {
   const host = document.getElementById('tcpHost').value.trim();
-  if (!host || tcpEndpoints.length >= 8) { showToast(t('toast.error'), 'error'); return; }
-  const used = new Set(tcpEndpoints.map(endpoint => endpoint.endpoint_id));
-  let endpointId = 1; while (used.has(endpointId)) endpointId++;
-  tcpEndpoints.push({enabled:true, endpoint_id:endpointId, name:document.getElementById('tcpName').value.trim() || `TCP ${endpointId}`, host, port:Number(document.getElementById('tcpPort').value)||502, timeout:Number(document.getElementById('tcpTimeout').value)||1000});
+  const port = Number(document.getElementById('tcpPort').value);
+  const timeout = Number(document.getElementById('tcpTimeout').value);
+  if (!host || port < 1 || port > 65535 || timeout < 100) {
+    showToast(t('toast.error'), 'error');
+    return;
+  }
+  if (tcpEndpointEditIndex >= 0) {
+    const current = tcpEndpoints[tcpEndpointEditIndex];
+    tcpEndpoints[tcpEndpointEditIndex] = {
+      ...current,
+      enabled: true,
+      name: document.getElementById('tcpName').value.trim() || `TCP ${current.endpoint_id}`,
+      host,
+      port,
+      timeout,
+    };
+  } else {
+    if (tcpEndpoints.length >= 8) { showToast(t('toast.error'), 'error'); return; }
+    const used = new Set(tcpEndpoints.map(endpoint => endpoint.endpoint_id));
+    let endpointId = 1; while (used.has(endpointId)) endpointId++;
+    tcpEndpoints.push({
+      enabled: true,
+      endpoint_id: endpointId,
+      name: document.getElementById('tcpName').value.trim() || `TCP ${endpointId}`,
+      host,
+      port,
+      timeout,
+    });
+  }
+  resetTcpEndpointForm();
   renderTcpEndpoints();
 }
 
 function removeTcpEndpoint(index) {
   tcpEndpoints.splice(index, 1);
+  resetTcpEndpointForm();
   renderTcpEndpoints();
 }
 
@@ -2329,6 +2463,32 @@ async function startFullScan() {
     progressEl.style.display = 'none';
     return;
   }
+  const transport = document.getElementById('scanTransport').value;
+  const tcpEndpoint = document.getElementById('scanTcpEndpoint');
+  if (transport === 'TCP' && (!tcpEndpoint || !tcpEndpoint.value)) {
+    showToast(currentLang === 'zh'
+      ? '\u8bf7\u5148\u5728 MODBUS \u8bbe\u7f6e\u4e2d\u6dfb\u52a0\u5e76\u4fdd\u5b58 TCP \u7aef\u70b9'
+      : 'Add and save a TCP endpoint in MODBUS Settings first', 'error');
+    btn.disabled = false;
+    progressEl.style.display = 'none';
+    return;
+  }
+  if (transport === 'TCP') {
+    progressText.textContent = currentLang === 'zh'
+      ? '\u6b63\u5728\u4fdd\u5b58 TCP \u7aef\u70b9\u914d\u7f6e...'
+      : 'Saving the TCP endpoint configuration...';
+    const saved = await persistModbusConfig(false);
+    if (!saved) {
+      statusEl.textContent = currentLang === 'zh' ? '\u914d\u7f6e\u4fdd\u5b58\u5931\u8d25' : 'Configuration save failed';
+      statusEl.style.color = 'var(--error, #f38ba8)';
+      showToast(currentLang === 'zh'
+        ? 'TCP \u7aef\u70b9\u672a\u80fd\u4fdd\u5b58\uff0c\u626b\u63cf\u672a\u542f\u52a8'
+        : 'The TCP endpoint could not be saved; scan was not started', 'error');
+      btn.disabled = false;
+      progressEl.style.display = 'none';
+      return;
+    }
+  }
   const params = {
     slave_start: parseInt(document.getElementById('scanSlaveStart').value) || 1,
     slave_end: parseInt(document.getElementById('scanSlaveEnd').value) || 10,
@@ -2336,6 +2496,8 @@ async function startFullScan() {
     reg_end: Number.isFinite(regEndValue) ? regEndValue : 16,
     function_codes: functionCodes,
     max_empty_gap: parseInt(document.getElementById('scanEmptyGap').value) || 8,
+    source_protocol: transport,
+    channel_id: transport === 'TCP' ? Number(tcpEndpoint.value) : 0,
   };
 
   const startResult = await apiJson('POST', '/api/discover/scan', params);
@@ -2353,9 +2515,12 @@ async function startFullScan() {
 
   let lastDeviceCount = 0;
   let pollCount = 0;
-  const maxPolls = 300;
+  let pollActive = false;
+  const maxPolls = 900;
 
   const pollInterval = setInterval(async () => {
+    if (pollActive) return;
+    pollActive = true;
     pollCount++;
 
     const devices = await apiGet('/api/discover/devices');
@@ -2381,6 +2546,21 @@ async function startFullScan() {
     const status = await apiGet('/api/discover/status');
     if (status) {
       discoveryData.status = status;
+      const total = Math.max(Number(status.total_scanned) || 1, 1);
+      const completed = Math.min(Number(status.slaves_scanned) || 0, total);
+      const busPercent = Math.round((completed / total) * 75);
+      const isRegisterPhase = Number(status.phase) === 2;
+      progressBar.style.width = Math.min(isRegisterPhase ? 85 : 10 + busPercent, 95) + '%';
+      summaryEl.textContent = currentLang === 'zh'
+        ? `${status.devices_found || 0} \u53f0\u8bbe\u5907\uff0c\u5df2\u68c0\u67e5 ${completed}/${total} \u4e2a\u4ece\u7ad9`
+        : `${status.devices_found || 0} devices, checked ${completed}/${total} slaves`;
+      progressText.textContent = isRegisterPhase
+        ? (currentLang === 'zh'
+            ? `\u4ece\u7ad9 ${status.current_slave}\uff1a\u6b63\u5728\u8bfb\u53d6 FC${String(status.current_function_code || '').padStart(2, '0')} \u5bc4\u5b58\u5668 ${status.current_register}`
+            : `Slave ${status.current_slave}: reading FC${String(status.current_function_code || '').padStart(2, '0')} register ${status.current_register}`)
+        : (currentLang === 'zh'
+            ? `\u6b63\u5728\u68c0\u67e5\u4ece\u7ad9 ${status.current_slave}\uff08${completed}/${total}\uff09`
+            : `Checking slave ${status.current_slave} (${completed}/${total})`);
 
       if (!status.scan_in_progress || pollCount >= maxPolls) {
         clearInterval(pollInterval);
@@ -2408,6 +2588,7 @@ async function startFullScan() {
         setTimeout(() => { progressEl.style.display = 'none'; }, 5000);
       }
     }
+    pollActive = false;
   }, 1000);
 }
 

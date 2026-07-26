@@ -27,8 +27,9 @@ extern "C" {
 
 /* ======================== Constants ======================== */
 
-#define DISCOVER_MAX_SLAVES           8   /**< Bounded RAM snapshot; rescan for larger buses */
-#define DISCOVER_MAX_REGS_PER_SLAVE  32   /**< Max registers retained per discovered slave */
+#define DISCOVER_MAX_SLAVES         100   /**< PSRAM-backed discovery capacity */
+#define DISCOVER_FALLBACK_SLAVES      8   /**< Capacity when external PSRAM is unavailable */
+#define DISCOVER_MAX_REGS_PER_SLAVE   8   /**< First-pass points retained per discovered slave */
 #define DISCOVER_MAX_BLOCK_REGS       8   /**< Largest adaptive read block used for discovery */
 #define DISCOVER_DEFAULT_EMPTY_GAP    8   /**< Stop after this many empty addresses after data */
 #define DISCOVER_BROADCAST_TIMEOUT   100  /**< ms, timeout for quick slave probe */
@@ -78,12 +79,27 @@ typedef struct {
  */
 typedef struct {
     uint16_t total_scanned;         /**< Total slave IDs probed */
+    uint16_t slaves_scanned;        /**< Slave IDs completed so far */
     uint16_t devices_found;        /**< Number of responding slaves */
     uint16_t registers_found;      /**< Total registers across all slaves */
     uint16_t mappings_created;     /**< AMM entries auto-created */
+    uint16_t device_capacity;      /**< Runtime capacity after PSRAM/fallback allocation */
+    uint16_t current_register;     /**< Register currently being probed */
+    uint8_t  current_slave;        /**< Slave currently being probed */
+    uint8_t  current_function_code;/**< Function code currently being probed */
+    uint8_t  phase;                /**< discover_phase_t */
+    esp_err_t last_error;          /**< Final task error, ESP_OK while healthy */
     bool     scan_complete;
     bool     scan_in_progress;
 } discover_result_t;
+
+typedef enum {
+    DISCOVER_PHASE_IDLE = 0,
+    DISCOVER_PHASE_BUS_SCAN,
+    DISCOVER_PHASE_REGISTER_SCAN,
+    DISCOVER_PHASE_COMPLETE,
+    DISCOVER_PHASE_ERROR,
+} discover_phase_t;
 
 /**
  * @brief Scan parameter structure (used for web-triggered scans).
@@ -168,6 +184,14 @@ const discovered_device_t *modbus_discover_get_device(uint16_t index);
  * @brief Get total number of discovered devices.
  */
 uint16_t modbus_discover_get_device_count(void);
+
+/**
+ * @brief Get the runtime discovery table capacity.
+ *
+ * Returns DISCOVER_MAX_SLAVES when PSRAM is available, otherwise the
+ * internal-RAM fallback capacity.
+ */
+uint16_t modbus_discover_get_capacity(void);
 
 /**
  * @brief Apply all discovered registers as AMM mapping entries.

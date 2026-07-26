@@ -465,26 +465,23 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_get_handler(httpd_req_t *req)
 {
-    cJSON *arr = cJSON_CreateArray();
-    if (arr == NULL) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
-
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_send_chunk(req, "[", 1);
     int active_count = amm_get_mapping_count();
-    amm_mapping_entry_t *entries = NULL;
-    if (active_count > 0) {
-        entries = calloc((size_t)active_count, sizeof(*entries));
-    }
-    if (active_count > 0 && entries == NULL) {
-        cJSON_Delete(arr);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
-    int entry_count = active_count > 0 ? amm_get_entries(entries, active_count) : 0;
+    bool first = true;
 
-    for (int i = 0; i < entry_count; i++) {
-        amm_mapping_entry_t *e = &entries[i];
+    for (int i = 0; i < active_count && err == ESP_OK; i++) {
+        amm_mapping_entry_t entry;
+        if (amm_get_entry_at(i, &entry) != ESP_OK) continue;
+        amm_mapping_entry_t *e = &entry;
 
         cJSON *obj = cJSON_CreateObject();
+        if (obj == NULL) {
+            err = ESP_ERR_NO_MEM;
+            break;
+        }
         cJSON_AddStringToObject(obj, "source_protocol", e->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU");
         cJSON_AddNumberToObject(obj, "channel_id", e->channel_id);
         cJSON_AddNumberToObject(obj, "slave_id", e->slave_id);
@@ -520,15 +517,27 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
                                     (double)state.timestamp_ms);
             cJSON_AddNumberToObject(obj, "quality_state", state.quality_state);
         }
-        cJSON_AddItemToArray(arr, obj);
+        char *json = cJSON_PrintUnformatted(obj);
+        cJSON_Delete(obj);
+        if (json == NULL) {
+            err = ESP_ERR_NO_MEM;
+            break;
+        }
+        if (!first) {
+            err = httpd_resp_send_chunk(req, ",", 1);
+        }
+        if (err == ESP_OK) {
+            err = httpd_resp_send_chunk(req, json, strlen(json));
+        }
+        free(json);
+        first = false;
     }
 
-    char *json = cJSON_PrintUnformatted(arr);
-    send_json(req, json);
-    free(json);
-    free(entries);
-    cJSON_Delete(arr);
-    return ESP_OK;
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, "]", 1);
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return err;
 }
 
 /* ================================================================
@@ -860,9 +869,17 @@ static esp_err_t discover_status_get_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "total_scanned", r.total_scanned);
+    cJSON_AddNumberToObject(root, "slaves_scanned", r.slaves_scanned);
     cJSON_AddNumberToObject(root, "devices_found", r.devices_found);
     cJSON_AddNumberToObject(root, "registers_found", r.registers_found);
     cJSON_AddNumberToObject(root, "mappings_created", r.mappings_created);
+    cJSON_AddNumberToObject(root, "device_capacity", r.device_capacity);
+    cJSON_AddNumberToObject(root, "mapping_capacity", AMM_MAX_MAPPING_ENTRIES);
+    cJSON_AddNumberToObject(root, "current_slave", r.current_slave);
+    cJSON_AddNumberToObject(root, "current_register", r.current_register);
+    cJSON_AddNumberToObject(root, "current_function_code", r.current_function_code);
+    cJSON_AddNumberToObject(root, "phase", r.phase);
+    cJSON_AddNumberToObject(root, "last_error", r.last_error);
     cJSON_AddBoolToObject(root, "scan_complete", r.scan_complete);
     cJSON_AddBoolToObject(root, "scan_in_progress", r.scan_in_progress);
 
@@ -876,6 +893,10 @@ static esp_err_t discover_status_get_handler(httpd_req_t *req)
 /* GET /api/discover/devices */
 static esp_err_t discover_devices_get_handler(httpd_req_t *req)
 {
+    if (modbus_discover_get_result().scan_in_progress) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"error\":\"discovery scan in progress\"}");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -999,6 +1020,12 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
         params.reg_end = (uint16_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(body, "max_empty_gap")) && cJSON_IsNumber(v))
         params.max_empty_gap = (uint8_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(body, "source_protocol")) &&
+        cJSON_IsString(v) && strcmp(v->valuestring, "TCP") == 0) {
+        params.source_protocol = SRC_MODBUS_TCP;
+    }
+    if ((v = cJSON_GetObjectItem(body, "channel_id")) && cJSON_IsNumber(v))
+        params.channel_id = (uint8_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(body, "function_codes")) && cJSON_IsArray(v)) {
         params.fc_count = 0;
         cJSON *item;
@@ -1011,6 +1038,24 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
         }
     }
     cJSON_Delete(body);
+
+    if (params.source_protocol == SRC_MODBUS_TCP) {
+        runtime_config_t config;
+        runtime_config_get(&config);
+        bool endpoint_found = false;
+        for (int i = 0; i < config.tcp_endpoint_count; ++i) {
+            if (config.tcp_endpoints[i].enabled &&
+                config.tcp_endpoints[i].endpoint_id == params.channel_id) {
+                endpoint_found = true;
+                break;
+            }
+        }
+        if (!endpoint_found) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            return send_json(req,
+                "{\"error\":\"Selected Modbus TCP endpoint is not configured or enabled\"}");
+        }
+    }
 
     esp_err_t err = modbus_discover_full_scan(&params);
     if (err == ESP_OK) {
@@ -1030,6 +1075,10 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 /* POST /api/discover/apply */
 static esp_err_t discover_apply_post_handler(httpd_req_t *req)
 {
+    if (modbus_discover_get_result().scan_in_progress) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"error\":\"discovery scan in progress\"}");
+    }
     int created = modbus_discover_apply_mappings();
 
     cJSON *root = cJSON_CreateObject();

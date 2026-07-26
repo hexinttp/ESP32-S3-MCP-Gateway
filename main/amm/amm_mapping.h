@@ -103,6 +103,9 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry);
 /** Copy active entries into a caller-owned snapshot. */
 int amm_get_entries(amm_mapping_entry_t *out, int max_entries);
 
+/** Copy one active entry by its zero-based active-list index. */
+esp_err_t amm_get_entry_at(int active_index, amm_mapping_entry_t *out);
+
 /** Current monotonically increasing AMM model version. */
 uint32_t amm_get_model_version(void);
 

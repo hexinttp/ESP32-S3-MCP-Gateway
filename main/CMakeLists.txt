@@ -25,7 +25,7 @@
          "web/web_server.c"
     INCLUDE_DIRS "." "web"
     REQUIRES driver esp_wifi esp_event esp_netif esp_eth lwip nvs_flash mqtt esp-modbus esp_timer
-             fatfs wear_levelling sdmmc esp_driver_sdmmc esp_http_server json
+             fatfs wear_levelling sdmmc esp_driver_sdmmc esp_http_server json esp_psram
 )
 
 set(WEB_HTML "${CMAKE_CURRENT_LIST_DIR}/../web/web_config.html")

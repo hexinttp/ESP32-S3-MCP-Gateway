@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "modbus_discover.h"
 #include "modbus_access.h"
@@ -14,15 +15,50 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
 
 static const char *TAG = "DISCOVER";
 
 /* ======================== Internal State ======================== */
 
-static discovered_device_t s_devices[DISCOVER_MAX_SLAVES];
+static discovered_device_t *s_devices = NULL;
+static uint16_t            s_device_capacity = 0;
 static uint16_t            s_device_count = 0;
 static discover_result_t   s_result;
 static TaskHandle_t        s_scan_task;
+static portMUX_TYPE         s_result_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void discover_set_task_state(bool in_progress, bool complete,
+                                    discover_phase_t phase, esp_err_t error)
+{
+    taskENTER_CRITICAL(&s_result_lock);
+    s_result.scan_in_progress = in_progress;
+    s_result.scan_complete = complete;
+    s_result.phase = phase;
+    s_result.last_error = error;
+    taskEXIT_CRITICAL(&s_result_lock);
+}
+
+static void discover_set_bus_progress(uint8_t slave_id, uint16_t completed)
+{
+    taskENTER_CRITICAL(&s_result_lock);
+    s_result.current_slave = slave_id;
+    s_result.slaves_scanned = completed;
+    s_result.devices_found = s_device_count;
+    taskEXIT_CRITICAL(&s_result_lock);
+}
+
+static void discover_set_register_progress(uint8_t slave_id, uint8_t function_code,
+                                           uint16_t address)
+{
+    taskENTER_CRITICAL(&s_result_lock);
+    s_result.phase = DISCOVER_PHASE_REGISTER_SCAN;
+    s_result.current_slave = slave_id;
+    s_result.current_function_code = function_code;
+    s_result.current_register = address;
+    taskEXIT_CRITICAL(&s_result_lock);
+}
 
 static uint16_t discover_register_offset(uint8_t function_code, uint16_t configured_address)
 {
@@ -205,7 +241,14 @@ static esp_err_t discover_probe_device(const discover_scan_params_t *params,
         }
     }
 
-    if (invalid_responses >= 2) {
+    /*
+     * On RTU, an exception proves that a slave addressed the request because
+     * an absent slave stays silent. A Modbus TCP gateway can return exception
+     * 0x0B for any unavailable Unit ID, so exceptions alone must not create
+     * TCP discovery entries.
+     */
+    if (params->source_protocol == SRC_MODBUS_RTU &&
+        invalid_responses >= 2) {
         memset(probe, 0, sizeof(*probe));
         probe->function_code = functions[0];
         probe->address = params->reg_start;
@@ -342,10 +385,45 @@ void modbus_discover_infer_semantics(uint16_t reg_addr, float value,
 
 void modbus_discover_init(void)
 {
-    memset(s_devices, 0, sizeof(s_devices));
+    if (s_devices == NULL) {
+        if (esp_psram_is_initialized()) {
+            s_devices = heap_caps_calloc(
+                DISCOVER_MAX_SLAVES, sizeof(*s_devices),
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_devices != NULL) {
+                s_device_capacity = DISCOVER_MAX_SLAVES;
+                ESP_LOGI(TAG, "Allocated %u-device discovery table in PSRAM (%u bytes)",
+                         s_device_capacity,
+                         (unsigned)(s_device_capacity * sizeof(*s_devices)));
+            }
+        }
+
+        if (s_devices == NULL) {
+            s_devices = heap_caps_calloc(
+                DISCOVER_FALLBACK_SLAVES, sizeof(*s_devices),
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (s_devices != NULL) {
+                s_device_capacity = DISCOVER_FALLBACK_SLAVES;
+                ESP_LOGW(TAG,
+                         "PSRAM unavailable; discovery capacity reduced to %u devices",
+                         s_device_capacity);
+            }
+        }
+    }
+
+    if (s_devices != NULL) {
+        memset(s_devices, 0,
+               (size_t)s_device_capacity * sizeof(*s_devices));
+    }
     s_device_count = 0;
+    taskENTER_CRITICAL(&s_result_lock);
     memset(&s_result, 0, sizeof(s_result));
-    ESP_LOGI(TAG, "Discovery module initialized");
+    s_result.device_capacity = s_device_capacity;
+    s_result.phase = DISCOVER_PHASE_IDLE;
+    s_result.last_error = s_devices != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    taskEXIT_CRITICAL(&s_result_lock);
+    ESP_LOGI(TAG, "Discovery module initialized (capacity=%u)",
+             s_device_capacity);
 }
 
 void modbus_discover_reset(void)
@@ -362,6 +440,9 @@ void modbus_discover_reset(void)
 
 static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
 {
+    if (s_devices == NULL || s_device_capacity == 0) {
+        return ESP_ERR_NO_MEM;
+    }
     uint8_t start = params->slave_start;
     uint8_t end = params->slave_end;
     if (start < 1) start = 1;
@@ -371,11 +452,16 @@ static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
     ESP_LOGI(TAG, "%s scan: channel=%u slave IDs %u .. %u",
              params->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
              params->channel_id, start, end);
-    s_result.scan_in_progress = true;
+    taskENTER_CRITICAL(&s_result_lock);
+    s_result.phase = DISCOVER_PHASE_BUS_SCAN;
     s_result.total_scanned = end - start + 1;
+    s_result.slaves_scanned = 0;
+    s_result.current_slave = start;
+    taskEXIT_CRITICAL(&s_result_lock);
 
     /* Reset device list */
-    memset(s_devices, 0, sizeof(s_devices));
+    memset(s_devices, 0,
+           (size_t)s_device_capacity * sizeof(*s_devices));
     s_device_count = 0;
 
     for (uint16_t sid = start; sid <= end; ++sid) {
@@ -383,7 +469,7 @@ static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
         /* Probe with FC03, address 0, count 1 — quick liveness check */
         esp_err_t err = discover_probe_device(params, (uint8_t)sid, &probe);
         if (err == ESP_OK) {
-            if (s_device_count < DISCOVER_MAX_SLAVES) {
+            if (s_device_count < s_device_capacity) {
                 discovered_device_t *dev = &s_devices[s_device_count];
                 dev->slave_id = (uint8_t)sid;
                 dev->source_protocol = params->source_protocol;
@@ -410,14 +496,12 @@ static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
                          probe.register_count);
             }
         }
+        discover_set_bus_progress((uint8_t)sid, (uint16_t)(sid - start + 1));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 
-    s_result.devices_found = s_device_count;
-    s_result.scan_in_progress = false;
-    s_result.scan_complete = true;
-
     ESP_LOGI(TAG, "Bus scan complete: %u devices found out of %u probed",
-             s_device_count, s_result.total_scanned);
+             s_device_count, end - start + 1);
     return ESP_OK;
 }
 
@@ -445,8 +529,15 @@ static void bus_scan_task(void *argument)
         .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
     };
     scheduler_pause_modbus_polling(true);
-    scan_bus_sync(&params);
+    modbus_access_set_probe_mode(true);
+    esp_log_level_set("MB_CONTROLLER_MASTER", ESP_LOG_NONE);
+    esp_err_t err = scan_bus_sync(&params);
+    esp_log_level_set("MB_CONTROLLER_MASTER", ESP_LOG_ERROR);
+    modbus_access_set_probe_mode(false);
     scheduler_pause_modbus_polling(false);
+    discover_set_task_state(false, true,
+                            err == ESP_OK ? DISCOVER_PHASE_COMPLETE : DISCOVER_PHASE_ERROR,
+                            err);
     s_scan_task = NULL;
     vTaskDelete(NULL);
 }
@@ -461,9 +552,9 @@ esp_err_t modbus_discover_scan_bus(uint8_t start, uint8_t end)
         .start = start,
         .end = end
     };
-    s_result.scan_in_progress = true;
+    discover_set_task_state(true, false, DISCOVER_PHASE_BUS_SCAN, ESP_OK);
     if (xTaskCreate(bus_scan_task, "mb_discover", 4096, NULL, 3, &s_scan_task) != pdPASS) {
-        s_result.scan_in_progress = false;
+        discover_set_task_state(false, true, DISCOVER_PHASE_ERROR, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -489,7 +580,7 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
 
     if (!dev) {
         /* Device not yet discovered — add it */
-        if (s_device_count >= DISCOVER_MAX_SLAVES) {
+        if (s_device_count >= s_device_capacity) {
             ESP_LOGE(TAG, "Device table full");
             return ESP_ERR_NO_MEM;
         }
@@ -517,7 +608,6 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
 
     discover_default_functions(&s_full_request);
     dev->reg_count = 0;
-    s_result.scan_in_progress = true;
 
     uint32_t address = reg_start;
     uint8_t empty_gap = 0;
@@ -530,6 +620,8 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
                             DISCOVER_MAX_BLOCK_REGS ? DISCOVER_MAX_BLOCK_REGS :
                             (reg_end - address + 1U));
 
+        discover_set_register_progress(slave_id, dev->probe_function_code,
+                                       (uint16_t)address);
         if (preferred_count > remaining) preferred_count = remaining;
         if (dev->reg_count > 0 && preferred_count > 0) {
             memset(&probe, 0, sizeof(probe));
@@ -556,6 +648,7 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
                          empty_gap);
                 break;
             }
+            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
 
@@ -595,13 +688,13 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
                      reg->function_code, point_address, reg->raw_value,
                      reg->read_start_address, reg->read_register_count,
                      reg->value_register_index);
+            taskENTER_CRITICAL(&s_result_lock);
             ++s_result.registers_found;
+            taskEXIT_CRITICAL(&s_result_lock);
         }
         address += probe.register_count;
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
-
-    s_result.scan_in_progress = false;
-    s_result.scan_complete = true;
 
     ESP_LOGI(TAG, "Device scan complete: slave %u has %u registers",
              slave_id, dev->reg_count);
@@ -615,8 +708,10 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
     uint16_t r_start = params->reg_start;
     uint16_t r_end = params->reg_end;
     uint32_t scan_span = (uint32_t)r_end - r_start;
+    taskENTER_CRITICAL(&s_result_lock);
     s_result.registers_found = 0;
     s_result.mappings_created = 0;
+    taskEXIT_CRITICAL(&s_result_lock);
 
     /* Phase 1: bus / endpoint scan */
     esp_err_t err = scan_bus_sync(params);
@@ -640,8 +735,9 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
         }
     }
 
+    discover_result_t result = modbus_discover_get_result();
     ESP_LOGI(TAG, "Full scan complete: %u devices, %u registers",
-             s_device_count, s_result.registers_found);
+             s_device_count, result.registers_found);
     return ESP_OK;
 }
 
@@ -649,10 +745,15 @@ static void full_scan_task(void *argument)
 {
     (void)argument;
     scheduler_pause_modbus_polling(true);
-    full_scan_sync(&s_full_request);
+    modbus_access_set_probe_mode(true);
+    esp_log_level_set("MB_CONTROLLER_MASTER", ESP_LOG_NONE);
+    esp_err_t err = full_scan_sync(&s_full_request);
+    esp_log_level_set("MB_CONTROLLER_MASTER", ESP_LOG_ERROR);
+    modbus_access_set_probe_mode(false);
     scheduler_pause_modbus_polling(false);
-    s_result.scan_in_progress = false;
-    s_result.scan_complete = true;
+    discover_set_task_state(false, true,
+                            err == ESP_OK ? DISCOVER_PHASE_COMPLETE : DISCOVER_PHASE_ERROR,
+                            err);
     s_scan_task = NULL;
     vTaskDelete(NULL);
 }
@@ -660,6 +761,7 @@ static void full_scan_task(void *argument)
 esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
 {
     if (s_scan_task != NULL || s_result.scan_in_progress) return ESP_ERR_INVALID_STATE;
+    if (s_devices == NULL || s_device_capacity == 0) return ESP_ERR_NO_MEM;
     s_full_request = params != NULL ? *params : (discover_scan_params_t){
         .slave_start = 1, .slave_end = 247, .reg_start = 0, .reg_end = 100,
         .source_protocol = SRC_MODBUS_RTU, .channel_id = 0,
@@ -671,10 +773,15 @@ esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
         s_full_request.slave_start > s_full_request.slave_end ||
         s_full_request.reg_start > s_full_request.reg_end) return ESP_ERR_INVALID_ARG;
     if (s_full_request.max_empty_gap > 64) s_full_request.max_empty_gap = 64;
+    taskENTER_CRITICAL(&s_result_lock);
+    memset(&s_result, 0, sizeof(s_result));
+    s_result.device_capacity = s_device_capacity;
     s_result.scan_in_progress = true;
-    s_result.scan_complete = false;
+    s_result.phase = DISCOVER_PHASE_BUS_SCAN;
+    s_result.last_error = ESP_OK;
+    taskEXIT_CRITICAL(&s_result_lock);
     if (xTaskCreate(full_scan_task, "mb_full_scan", 6144, NULL, 3, &s_scan_task) != pdPASS) {
-        s_result.scan_in_progress = false;
+        discover_set_task_state(false, true, DISCOVER_PHASE_ERROR, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -684,7 +791,11 @@ esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
 
 discover_result_t modbus_discover_get_result(void)
 {
-    return s_result;
+    discover_result_t snapshot;
+    taskENTER_CRITICAL(&s_result_lock);
+    snapshot = s_result;
+    taskEXIT_CRITICAL(&s_result_lock);
+    return snapshot;
 }
 
 const discovered_device_t *modbus_discover_get_device(uint16_t index)
@@ -696,6 +807,11 @@ const discovered_device_t *modbus_discover_get_device(uint16_t index)
 uint16_t modbus_discover_get_device_count(void)
 {
     return s_device_count;
+}
+
+uint16_t modbus_discover_get_capacity(void)
+{
+    return s_device_capacity;
 }
 
 /* ======================== Apply Mappings ======================== */
@@ -774,7 +890,9 @@ int modbus_discover_apply_mappings(void)
         }
     }
 
+    taskENTER_CRITICAL(&s_result_lock);
     s_result.mappings_created += created;
+    taskEXIT_CRITICAL(&s_result_lock);
     ESP_LOGI(TAG, "Applied %d new AMM mapping entries", created);
     return created;
 }
@@ -891,7 +1009,9 @@ esp_err_t modbus_discover_delete_register(uint8_t slave_id,
                 dev->registers[k] = dev->registers[k + 1];
             }
             dev->reg_count--;
+            taskENTER_CRITICAL(&s_result_lock);
             if (s_result.registers_found > 0) s_result.registers_found--;
+            taskEXIT_CRITICAL(&s_result_lock);
 
             ESP_LOGI(TAG, "Register deleted: slave %u addr %u (remaining: %u)",
                      slave_id, reg_addr, dev->reg_count);

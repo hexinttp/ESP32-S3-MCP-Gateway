@@ -45,6 +45,7 @@ static const char *TAG = "MODBUS";
 
 /** Serialises every MODBUS bus transaction. */
 static SemaphoreHandle_t s_modbus_mutex = NULL;
+static volatile bool s_probe_mode = false;
 
 /** Opaque handle returned by mbc_master_create_serial(). */
 static void *s_master_handle = NULL;
@@ -365,7 +366,7 @@ static esp_err_t modbus_read_registers_internal(uint8_t slave_id,
                             reg_count, mb_err, NULL, 0);
     }
 
-    if (mb_err != ESP_OK) {
+    if (mb_err != ESP_OK && !s_probe_mode) {
         ESP_LOGE(TAG, "Read FC%02d slave=%u addr=%u cnt=%u failed: %s",
                  (reg_type == MB_PARAM_HOLDING) ? 3 : 4,
                  slave_id, reg_addr, reg_count, esp_err_to_name(mb_err));
@@ -376,6 +377,11 @@ static esp_err_t modbus_read_registers_internal(uint8_t slave_id,
     }
 
     return mb_err;
+}
+
+void modbus_access_set_probe_mode(bool enabled)
+{
+    s_probe_mode = enabled;
 }
 
 /**

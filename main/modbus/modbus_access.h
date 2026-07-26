@@ -143,6 +143,7 @@ uint16_t modbus_register_count_for_type(data_type_t data_type);
 esp_err_t modbus_read_channel(source_protocol_t protocol, uint8_t channel_id,
                               uint8_t slave_id, uint8_t function_code,
                               uint16_t reg_addr, uint16_t reg_count, uint16_t *raw_regs);
+void modbus_access_set_probe_mode(bool enabled);
 esp_err_t modbus_write_channel(source_protocol_t protocol, uint8_t channel_id,
                                uint8_t slave_id, uint8_t function_code,
                                uint16_t reg_addr, uint16_t reg_count, uint16_t *values);

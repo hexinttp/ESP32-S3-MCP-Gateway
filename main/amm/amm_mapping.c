@@ -373,6 +373,24 @@ int amm_get_entries(amm_mapping_entry_t *out, int max_entries)
     return copied;
 }
 
+esp_err_t amm_get_entry_at(int active_index, amm_mapping_entry_t *out)
+{
+    if (active_index < 0 || out == NULL) return ESP_ERR_INVALID_ARG;
+
+    int current = 0;
+    amm_lock();
+    for (int i = 0; i < s_mapping_count; ++i) {
+        if (!s_mapping_table[i].active) continue;
+        if (current++ == active_index) {
+            *out = s_mapping_table[i];
+            amm_unlock();
+            return ESP_OK;
+        }
+    }
+    amm_unlock();
+    return ESP_ERR_NOT_FOUND;
+}
+
 uint32_t amm_get_model_version(void)
 {
     amm_lock();
