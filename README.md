@@ -1,6 +1,8 @@
 # ESP32-S3 TCM/AMM/UIF Industrial Gateway
 
-本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。
+本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 和 FreeRTOS 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。
+
+当前版本已经在 16 MB Flash 的 ESP32-S3 实物开发板上完成烧录，并使用真实 RS485 温湿度传感器和 PC 端 RTU 仿真器完成设备发现与寄存器读取测试。
 
 ## 研究目标对应关系
 
@@ -14,14 +16,16 @@
 
 - MODBUS RTU 主站：FC03、FC04、FC06、FC16，RS485 半双工。
 - MODBUS TCP 主站：多个可配置 TCP endpoint，支持 FC03、FC04、FC06、FC16。
-- 后台设备发现：从站扫描、寄存器扫描、语义推断和 AMM 映射生成；发现过程严格只读。
+- RTU/TCP 设备发现：从站扫描、寄存器扫描、语义推断和 AMM 映射生成；发现过程严格只读。
+- RTU 自适应探测：支持 FC03/FC04、常用工业寄存器入口和 Modbus 异常响应在线判定；发现后按设备实际寄存器区域继续扫描。
+- 扫描隔离：设备发现期间暂停常规 AMM 轮询，扫描结束后自动恢复，避免两个任务竞争 RS485 总线。
 - 固定 TCM 1.0 JSON 上下文、字段验证、映射版本和掉电安全序列号。
 - 动态 AMM：NVS 持久化、运行时增删改、混合协议/通道寻址和动态轮询计划。
 - MQTT 上行和受控下行；所有 MQTT、Web、MCP 和自动化写入共用 AMM 权限/量程边界。
 - UIF 离线恢复：14 MB SPI Flash FAT 队列优先，TF 卡溢出，PUBACK 后删除。
 - TF 历史：按序列分片保存 JSONL；空间不足时删除最早历史文件。
 - 自动化规则：Web 配置条件、保持时间、冷却时间、写点或 MQTT 告警动作；规则保存在 NVS。
-- Web 配置：中文/English 一键切换，无登录认证；配置 AP 与已有网络接口均可访问。
+- Web 配置：中文/English 一键切换，无登录认证；配置 AP 与已有网络接口均可访问；设备结果和通信日志使用低内存流式传输。
 - LCD 状态菜单：网络、MQTT、TCM/AMM/UIF、TF 和配置 AP 状态轮播。
 - W5500 以太网优先，Wi-Fi STA 备用，同时保留配置 AP。
 - MCP JSON-RPC 工具入口：`POST /mcp`。
@@ -55,7 +59,17 @@
 
 GPIO15 是 W5500 与 LCD 的共享复位信号，由 `board` 模块统一控制。GPIO33-38 已由 TF 卡占用，不能再分配给 RS485。
 
-RS485 需要 3.3 V 兼容收发器。A/B 总线应按现场拓扑配置终端电阻、偏置和隔离保护。
+RS485 需要 3.3 V 兼容收发器。当前 MAX3485 接线如下：
+
+| MAX3485 | ESP32-S3 |
+| --- | --- |
+| DI / TX | GPIO39 |
+| RO / RX | GPIO40 |
+| DE + RE | GPIO41 |
+| VCC | 3.3 V |
+| GND | GND |
+
+MAX3485 的 A/B/GND 分别连接到传感器或 USB-RS485 模块的 A/B/GND。若无响应，可先交换 A/B 排查不同厂商的标记差异。总线应按现场拓扑配置终端电阻、偏置和隔离保护。
 
 ## Flash 分区
 
@@ -68,7 +82,7 @@ RS485 需要 3.3 V 兼容收发器。A/B 总线应按现场拓扑配置终端电
 | `factory` | `0x30000` | `0x1D0000` | 固件 |
 | `cache` | `0x200000` | 14 MB | SPI Flash UIF 离线队列 |
 
-当前构建固件约 1.28 MB，应用分区仍有约 28% 空间。
+当前构建固件约 1.20 MiB，应用分区仍有约 34% 空间。
 
 ## 构建
 
@@ -109,7 +123,7 @@ idf.py -p COMx flash monitor
 idf.py -p COMx flash
 ```
 
-尚未连接实物开发板时，编译成功只证明软件构建通过；W5500、LCD、SDMMC、RS485 电气时序和实际显示方向仍需上板验证。
+烧录完成后，开发板会从 NVS 恢复网络、MQTT、MODBUS、AMM 和自动化配置。串口监视器默认使用 `115200` 波特率。
 
 ## 首次配置
 
@@ -120,6 +134,32 @@ idf.py -p COMx flash
 5. Web 当前按课题第一版要求不启用登录认证，不应直接暴露到不可信网络。
 
 W5500 获得 DHCP 地址后优先作为默认路由；Wi-Fi STA 可作为备用。配置 AP 始终用于本地维护。
+
+## MODBUS RTU 设备发现
+
+默认 RTU 参数为 `9600 8N1`，响应超时为 `1000 ms`。Web 的“设备发现”页面可以设置从站范围、寄存器范围和 FC03/FC04，然后在后台执行扫描。
+
+扫描分为两个阶段：
+
+1. 使用用户起始地址、`0/1` 和常见工业寄存器入口探测从站。
+2. 对已发现设备，从实际响应地址继续读取寄存器，并保留原始值供用户建立 AMM 语义映射。
+
+发起扫描：
+
+```bash
+curl -X POST http://<gateway-ip>/api/discover/scan \
+  -H "Content-Type: application/json" \
+  -d '{"slave_start":1,"slave_end":10,"reg_start":1,"reg_end":16,"function_codes":[3,4],"max_empty_gap":8}'
+```
+
+查询状态和结果：
+
+```bash
+curl http://<gateway-ip>/api/discover/status
+curl http://<gateway-ip>/api/discover/devices
+```
+
+MODBUS RTU 没有统一的总线枚举和寄存器描述标准。自适应探测可以发现返回数据或合法异常响应的设备，但非标准寄存器布局仍应由用户指定扫描范围，或在发现后通过 AMM 配置数据类型、字节序、比例、偏移、单位和点位语义。
 
 ## TCM 1.0 固定格式
 
@@ -153,8 +193,8 @@ W5500 获得 DHCP 地址后优先作为默认路由；Wi-Fi STA 可作为备用�
   "operation_type": "read_publish",
   "control_constraint": {
     "writable": false,
-    "valid_range_min": 0,
-    "valid_range_max": 120
+    "min": 0,
+    "max": 120
   }
 }
 ```
@@ -196,7 +236,10 @@ W5500 获得 DHCP 地址后优先作为默认路由；Wi-Fi STA 可作为备用�
 | `GET/PUT /api/modbus/config` | RTU 和 TCP endpoint 配置 |
 | `GET/POST/PUT/DELETE /api/mappings` | AMM 动态映射 |
 | `POST /api/discover/scan` | 后台设备/寄存器扫描 |
+| `GET /api/discover/status` | 扫描进度和汇总 |
+| `GET /api/discover/devices` | 流式返回设备、探测入口和原始寄存器 |
 | `POST /api/discover/apply` | 将发现结果应用到 AMM |
+| `GET/DELETE /api/modbus/logs` | 查询或清空 RTU TX/RX 原始通信日志 |
 | `GET/POST/DELETE /api/automation/rules` | 离线自动化规则 |
 | `GET /api/system/status` | 运行状态与研究指标 |
 
@@ -225,7 +268,16 @@ web/
 
 ## 当前验证状态
 
-- ESP-IDF 5.3.1、目标 `esp32s3`：构建通过。
-- Web 内嵌 JavaScript：语法检查通过。
-- 固件尺寸与 16 MB 自定义分区：检查通过。
-- 实物板卡烧录与 RS485/W5500/LCD/TF 联调：待连接开发板后执行。
+- ESP32-S3 QFN56 rev0.2、16 MB Flash、ESP-IDF 5.3.1：构建和实物烧录通过。
+- LCD ST7735S：初始化、状态页面和字体显示通过。
+- Wi-Fi STA/配置 AP：Web 页面、REST API 和中英文切换通过。
+- W5500：SPI 驱动初始化和 DHCP 网络接入流程通过。
+- RS485/MAX3485：GPIO39/40/41 半双工收发通过。
+- 真实 SHT20 传感器：Slave 1、FC04、寄存器 1/2 读取通过；一次测试原始值为 `299` 和 `728`。
+- PC RTU 仿真器：Slave 2-8、FC03、寄存器 43000-43005 读取通过。
+- 默认范围 Slave 1-10 的一次扫描结果：保留 8 台设备、发现 44 个寄存器，符合当前设备表容量。
+- 设备结果接口：13,776 字节约 0.52 秒返回；64 条通信日志 15,224 字节约 0.47 秒返回。
+- 扫描和日志读取后 uptime 连续增长，测试时空闲堆约 15.7 KB，未发生自动重启。
+- TF 卡未插入时可以正常降级运行；TF 实卡写入、满盘覆盖和长时间耐久测试仍需后续验证。
+
+以上耗时来自当前开发环境的一次局域网测试，不作为所有网络条件下的硬实时保证。
