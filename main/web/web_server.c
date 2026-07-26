@@ -23,6 +23,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "mbedtls/sha256.h"
 
 #include "web_server.h"
 #include "gateway_config.h"
@@ -30,6 +31,7 @@
 #include "tcm/tcm_context.h"
 #include "tcm/tcm_state_pool.h"
 #include "modbus/modbus_comm_log.h"
+#include "modbus/modbus_tcp_server.h"
 #include "mqtt_comm/mqtt_handler.h"
 #include "eval/eval_logger.h"
 #include "automation/automation_web.h"
@@ -38,10 +40,69 @@
 #include "uif/uif_persistence.h"
 #include "board/tf_storage.h"
 #include "network/network_manager.h"
+#include "services/health_service.h"
+#include "services/time_service.h"
+#include "services/ota_service.h"
 
 static const char *TAG = "WEB";
 
 static httpd_handle_t s_server = NULL;
+
+static void sha256_hex(const char *text, char output[65])
+{
+    uint8_t digest[32];
+    mbedtls_sha256((const unsigned char *)text, strlen(text), digest, 0);
+    for (int i = 0; i < 32; ++i) {
+        snprintf(output + i * 2, 3, "%02x", digest[i]);
+    }
+    output[64] = '\0';
+}
+
+static const char *data_type_name(data_type_t type)
+{
+    static const char *names[] = {
+        "INT16", "UINT16", "FLOAT32", "INT32", "UINT32", "BOOL",
+        "INT64", "UINT64", "FLOAT64", "BCD16", "BITFIELD16", "ASCII"
+    };
+    return type <= DT_ASCII ? names[type] : "UINT16";
+}
+
+static data_type_t parse_data_type_name(const char *name)
+{
+    if (name == NULL) return DT_UINT16;
+    for (int i = DT_INT16; i <= DT_ASCII; ++i) {
+        if (strcmp(name, data_type_name((data_type_t)i)) == 0) {
+            return (data_type_t)i;
+        }
+    }
+    return DT_UINT16;
+}
+
+static esp_err_t require_authorization(httpd_req_t *req)
+{
+    runtime_config_t config;
+    runtime_config_get(&config);
+    if (!config.security.auth_enabled) return ESP_OK;
+
+    char authorization[192] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Authorization", authorization,
+                                    sizeof(authorization)) != ESP_OK ||
+        strncmp(authorization, "Bearer ", 7) != 0) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    char digest[65];
+    sha256_hex(authorization + 7, digest);
+    if (strcmp(digest, config.security.password_sha256) != 0) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    return ESP_OK;
+}
 
 static void httpd_resp_send_400(httpd_req_t *req)
 {
@@ -278,12 +339,25 @@ static esp_err_t system_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "cache_usage_percent", uif_get_cache_usage_percent());
     cJSON_AddBoolToObject(root, "tf_mounted", tf_storage_is_mounted());
     cJSON_AddNumberToObject(root, "amm_model_version", amm_get_model_version());
+    cJSON_AddBoolToObject(root, "amm_rollback_available", amm_can_rollback());
     cJSON_AddNumberToObject(root, "mapping_count", amm_get_mapping_count());
     cJSON_AddNumberToObject(root, "mapping_capacity", amm_get_capacity());
     cJSON_AddNumberToObject(root, "state_capacity", tcm_state_pool_get_capacity());
     cJSON_AddNumberToObject(root, "uptime_seconds",
                             (int64_t)(esp_timer_get_time() / 1000000LL));
     cJSON_AddNumberToObject(root, "sequence_counter", tcm_get_sequence_counter());
+    gateway_health_t health;
+    health_service_get(&health);
+    cJSON_AddNumberToObject(root, "boot_count", health.boot_count);
+    cJSON_AddNumberToObject(root, "reset_reason", health.reset_reason);
+    cJSON_AddNumberToObject(root, "minimum_free_heap", health.minimum_free_heap);
+    cJSON_AddNumberToObject(root, "free_psram", health.free_psram);
+    cJSON_AddBoolToObject(root, "time_synchronized", health.time_synchronized);
+    cJSON_AddBoolToObject(root, "ota_capable", health.ota_capable);
+    cJSON_AddBoolToObject(root, "secure_boot_enabled", health.secure_boot_enabled);
+    cJSON_AddBoolToObject(root, "flash_encryption_enabled",
+                          health.flash_encryption_enabled);
+    cJSON_AddNumberToObject(root, "watchdog_resets", health.watchdog_resets);
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -308,6 +382,10 @@ static esp_err_t wifi_config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "auth_mode", 3);
     cJSON_AddStringToObject(root, "ip", network.wifi_connected ? network.wifi_address : "");
     cJSON_AddStringToObject(root, "config_ap_ssid", network.config_ap_ssid);
+    cJSON_AddBoolToObject(root, "prefer_ethernet", config.prefer_ethernet);
+    cJSON_AddStringToObject(root, "active_uplink", network.active_uplink);
+    cJSON_AddNumberToObject(root, "failover_count", network.failover_count);
+    cJSON_AddStringToObject(root, "ethernet_ip", network.ethernet_address);
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -321,6 +399,7 @@ static esp_err_t wifi_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t wifi_config_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -336,6 +415,8 @@ static esp_err_t wifi_config_put_handler(httpd_req_t *req)
     value = cJSON_GetObjectItem(root, "password");
     if (cJSON_IsString(value) && strcmp(value->valuestring, "********") != 0)
         strlcpy(config.wifi.password, value->valuestring, sizeof(config.wifi.password));
+    value = cJSON_GetObjectItem(root, "prefer_ethernet");
+    if (cJSON_IsBool(value)) config.prefer_ethernet = cJSON_IsTrue(value);
     esp_err_t err = runtime_config_set(&config);
 
     cJSON_Delete(root);
@@ -360,6 +441,13 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "qos", config.mqtt.qos);
     cJSON_AddStringToObject(root, "topic_prefix", config.mqtt.data_prefix);
     cJSON_AddStringToObject(root, "command_prefix", config.mqtt.command_prefix);
+    cJSON_AddBoolToObject(root, "clean_session", config.mqtt.clean_session);
+    cJSON_AddBoolToObject(root, "retain", config.mqtt.retain);
+    cJSON_AddBoolToObject(root, "lwt_enabled", config.mqtt.lwt_enabled);
+    cJSON_AddStringToObject(root, "lwt_topic", config.mqtt.lwt_topic);
+    cJSON_AddStringToObject(root, "lwt_payload", config.mqtt.lwt_payload);
+    cJSON_AddNumberToObject(root, "lwt_qos", config.mqtt.lwt_qos);
+    cJSON_AddBoolToObject(root, "lwt_retain", config.mqtt.lwt_retain);
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -373,6 +461,7 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -390,6 +479,8 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
     COPY_MQTT_STRING("password", password);
     COPY_MQTT_STRING("topic_prefix", data_prefix);
     COPY_MQTT_STRING("command_prefix", command_prefix);
+    COPY_MQTT_STRING("lwt_topic", lwt_topic);
+    COPY_MQTT_STRING("lwt_payload", lwt_payload);
 #undef COPY_MQTT_STRING
     cJSON *value = cJSON_GetObjectItem(root, "enabled");
     if (cJSON_IsBool(value)) config.mqtt.enabled = cJSON_IsTrue(value);
@@ -397,6 +488,17 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
     if (cJSON_IsNumber(value)) config.mqtt.keepalive_sec = value->valueint;
     value = cJSON_GetObjectItem(root, "qos");
     if (cJSON_IsNumber(value) && value->valueint >= 0 && value->valueint <= 2) config.mqtt.qos = value->valueint;
+    value = cJSON_GetObjectItem(root, "clean_session");
+    if (cJSON_IsBool(value)) config.mqtt.clean_session = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "retain");
+    if (cJSON_IsBool(value)) config.mqtt.retain = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "lwt_enabled");
+    if (cJSON_IsBool(value)) config.mqtt.lwt_enabled = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "lwt_qos");
+    if (cJSON_IsNumber(value) && value->valueint >= 0 && value->valueint <= 2)
+        config.mqtt.lwt_qos = value->valueint;
+    value = cJSON_GetObjectItem(root, "lwt_retain");
+    if (cJSON_IsBool(value)) config.mqtt.lwt_retain = cJSON_IsTrue(value);
     esp_err_t err = runtime_config_set(&config);
     cJSON_Delete(root);
     return err == ESP_OK ? send_json(req, "{\"status\":\"ok\",\"restart_required\":true}")
@@ -422,6 +524,18 @@ static esp_err_t modbus_config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "rx_pin", MODBUS_RTU_UART_RXD);
     cJSON_AddNumberToObject(root, "rts_pin", MODBUS_RTU_UART_RTS);
     cJSON_AddNumberToObject(root, "poll_interval", POLL_INTERVAL_MS);
+    modbus_tcp_server_status_t server_status = {0};
+    modbus_tcp_server_get_status(&server_status);
+    cJSON *server = cJSON_AddObjectToObject(root, "tcp_server");
+    cJSON_AddBoolToObject(server, "enabled", config.modbus_tcp_server.enabled);
+    cJSON_AddBoolToObject(server, "running", server_status.running);
+    cJSON_AddNumberToObject(server, "port", config.modbus_tcp_server.port);
+    cJSON_AddNumberToObject(server, "max_clients",
+                            config.modbus_tcp_server.max_clients);
+    cJSON_AddNumberToObject(server, "active_clients",
+                            server_status.active_clients);
+    cJSON_AddNumberToObject(server, "requests", server_status.requests);
+    cJSON_AddNumberToObject(server, "exceptions", server_status.exceptions);
     cJSON *endpoints = cJSON_AddArrayToObject(root, "tcp_endpoints");
     for (int i = 0; i < config.tcp_endpoint_count; ++i) {
         cJSON *endpoint = cJSON_CreateObject();
@@ -446,6 +560,7 @@ static esp_err_t modbus_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t modbus_config_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -462,6 +577,21 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
     if (cJSON_IsNumber(value)) config.modbus_rtu.parity = value->valueint;
     value = cJSON_GetObjectItem(root, "timeout");
     if (cJSON_IsNumber(value)) config.modbus_rtu.timeout_ms = value->valueint;
+    cJSON *server = cJSON_GetObjectItem(root, "tcp_server");
+    if (cJSON_IsObject(server)) {
+        value = cJSON_GetObjectItem(server, "enabled");
+        if (cJSON_IsBool(value)) {
+            config.modbus_tcp_server.enabled = cJSON_IsTrue(value);
+        }
+        value = cJSON_GetObjectItem(server, "port");
+        if (cJSON_IsNumber(value)) {
+            config.modbus_tcp_server.port = (uint16_t)value->valueint;
+        }
+        value = cJSON_GetObjectItem(server, "max_clients");
+        if (cJSON_IsNumber(value)) {
+            config.modbus_tcp_server.max_clients = (uint8_t)value->valueint;
+        }
+    }
     cJSON *endpoints = cJSON_GetObjectItem(root, "tcp_endpoints");
     if (cJSON_IsArray(endpoints)) {
         int count = cJSON_GetArraySize(endpoints);
@@ -512,11 +642,7 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(obj, "channel_id", e->channel_id);
         cJSON_AddNumberToObject(obj, "slave_id", e->slave_id);
         cJSON_AddNumberToObject(obj, "register_address", e->register_address);
-        cJSON_AddStringToObject(obj, "data_type",
-            e->data_type == DT_FLOAT32 ? "FLOAT32" :
-            e->data_type == DT_INT16   ? "INT16"   :
-            e->data_type == DT_UINT16  ? "UINT16"  :
-            e->data_type == DT_INT32   ? "INT32"   : "UINT32");
+        cJSON_AddStringToObject(obj, "data_type", data_type_name(e->data_type));
         cJSON_AddNumberToObject(obj, "scale_factor", e->scale_factor);
         cJSON_AddNumberToObject(obj, "offset", e->offset);
         cJSON_AddNumberToObject(obj, "function_code", e->function_code);
@@ -527,6 +653,21 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(obj, "poll_interval_ms", e->poll_interval_ms);
         cJSON_AddNumberToObject(obj, "priority", e->priority);
         cJSON_AddNumberToObject(obj, "mapping_version", e->mapping_version);
+        cJSON_AddNumberToObject(obj, "object_type", e->object_type);
+        cJSON_AddNumberToObject(obj, "bit_index", e->bit_index);
+        cJSON_AddNumberToObject(obj, "string_length", e->string_length);
+        cJSON_AddNumberToObject(obj, "retry_count", e->retry_count);
+        cJSON_AddNumberToObject(obj, "retry_backoff_ms", e->retry_backoff_ms);
+        cJSON_AddNumberToObject(obj, "semantic_source", e->semantic_source);
+        cJSON_AddNumberToObject(obj, "semantic_status", e->semantic_status);
+        cJSON_AddStringToObject(obj, "semantic_profile_id",
+                                e->semantic_profile_id);
+        cJSON_AddNumberToObject(obj, "semantic_profile_version",
+                                e->semantic_profile_version);
+        cJSON_AddNumberToObject(obj, "semantic_confidence",
+                                e->semantic_confidence);
+        cJSON_AddStringToObject(obj, "semantic_evidence",
+                                e->semantic_evidence);
         cJSON_AddStringToObject(obj, "device_id", e->device_id);
         cJSON_AddStringToObject(obj, "point_id", e->point_id);
         cJSON_AddStringToObject(obj, "measurement_name", e->measurement_name);
@@ -544,6 +685,8 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
                 state.quality_state == QUALITY_STALE) {
                 cJSON_AddNumberToObject(obj, "current_raw_value", state.raw_value);
                 cJSON_AddNumberToObject(obj, "current_value", state.value);
+                cJSON_AddStringToObject(obj, "current_value_text",
+                                        state.value_text);
             }
             cJSON_AddStringToObject(obj, "poll_status",
                                     state.quality_state == QUALITY_GOOD ? "ok" :
@@ -580,6 +723,7 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_post_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -593,6 +737,13 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
     entry.scale_factor = 1.0f;
     entry.poll_interval_ms = POLL_INTERVAL_MS;
     entry.priority = 5;
+    entry.retry_count = 2;
+    entry.retry_backoff_ms = 50;
+    entry.semantic_source = SEMANTIC_SOURCE_USER;
+    entry.semantic_status = SEMANTIC_STATUS_VERIFIED;
+    entry.semantic_confidence = 100;
+    strlcpy(entry.semantic_evidence, "web configuration",
+            sizeof(entry.semantic_evidence));
 
     cJSON *v;
     uint8_t old_slave = 0;
@@ -616,6 +767,9 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         entry.channel_id = (uint8_t)v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "function_code")) && cJSON_IsNumber(v))
         entry.function_code = (uint8_t)v->valuedouble;
+    entry.object_type = entry.function_code >= 1 && entry.function_code <= 4
+        ? (modbus_object_type_t)entry.function_code
+        : MODBUS_OBJECT_HOLDING_REGISTER;
     if ((v = cJSON_GetObjectItem(root, "byte_order")) && cJSON_IsNumber(v))
         entry.byte_order = (byte_order_t)v->valueint;
     if ((v = cJSON_GetObjectItem(root, "read_start_address")) && cJSON_IsNumber(v))
@@ -633,12 +787,7 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
 
     /* Data type string to enum */
     if ((v = cJSON_GetObjectItem(root, "data_type")) && cJSON_IsString(v)) {
-        if      (strcmp(v->valuestring, "FLOAT32") == 0) entry.data_type = DT_FLOAT32;
-        else if (strcmp(v->valuestring, "INT16")   == 0) entry.data_type = DT_INT16;
-        else if (strcmp(v->valuestring, "UINT16")  == 0) entry.data_type = DT_UINT16;
-        else if (strcmp(v->valuestring, "INT32")   == 0) entry.data_type = DT_INT32;
-        else if (strcmp(v->valuestring, "UINT32")  == 0) entry.data_type = DT_UINT32;
-        else entry.data_type = DT_FLOAT32;
+        entry.data_type = parse_data_type_name(v->valuestring);
     }
 
     /* String fields */
@@ -694,6 +843,13 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     entry->scale_factor = 1.0f;
     entry->poll_interval_ms = POLL_INTERVAL_MS;
     entry->priority = 5;
+    entry->retry_count = 2;
+    entry->retry_backoff_ms = 50;
+    entry->semantic_source = SEMANTIC_SOURCE_IMPORTED;
+    entry->semantic_status = SEMANTIC_STATUS_RESOLVED;
+    entry->semantic_confidence = 100;
+    strlcpy(entry->semantic_evidence, "mapping profile import",
+            sizeof(entry->semantic_evidence));
 
     const cJSON *value;
     value = cJSON_GetObjectItem(root, "source_protocol");
@@ -706,15 +862,14 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     if (cJSON_IsNumber(value)) entry->slave_id = (uint8_t)value->valueint;
     value = cJSON_GetObjectItem(root, "function_code");
     if (cJSON_IsNumber(value)) entry->function_code = (uint8_t)value->valueint;
+    entry->object_type = entry->function_code >= 1 && entry->function_code <= 4
+        ? (modbus_object_type_t)entry->function_code
+        : MODBUS_OBJECT_HOLDING_REGISTER;
     value = cJSON_GetObjectItem(root, "register_address");
     if (cJSON_IsNumber(value)) entry->register_address = (uint16_t)value->valueint;
     value = cJSON_GetObjectItem(root, "data_type");
     if (cJSON_IsString(value)) {
-        if (strcmp(value->valuestring, "FLOAT32") == 0) entry->data_type = DT_FLOAT32;
-        else if (strcmp(value->valuestring, "INT16") == 0) entry->data_type = DT_INT16;
-        else if (strcmp(value->valuestring, "INT32") == 0) entry->data_type = DT_INT32;
-        else if (strcmp(value->valuestring, "UINT32") == 0) entry->data_type = DT_UINT32;
-        else entry->data_type = DT_UINT16;
+        entry->data_type = parse_data_type_name(value->valuestring);
     }
     value = cJSON_GetObjectItem(root, "byte_order");
     if (cJSON_IsNumber(value)) entry->byte_order = (byte_order_t)value->valueint;
@@ -732,6 +887,14 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     if (cJSON_IsNumber(value)) entry->read_register_count = (uint8_t)value->valueint;
     value = cJSON_GetObjectItem(root, "value_register_index");
     if (cJSON_IsNumber(value)) entry->value_register_index = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "bit_index");
+    if (cJSON_IsNumber(value)) entry->bit_index = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "string_length");
+    if (cJSON_IsNumber(value)) entry->string_length = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "retry_count");
+    if (cJSON_IsNumber(value)) entry->retry_count = (uint8_t)value->valueint;
+    value = cJSON_GetObjectItem(root, "retry_backoff_ms");
+    if (cJSON_IsNumber(value)) entry->retry_backoff_ms = (uint16_t)value->valueint;
 
     value = cJSON_GetObjectItem(root, "device_id");
     if (cJSON_IsString(value)) strlcpy(entry->device_id, value->valuestring, sizeof(entry->device_id));
@@ -743,6 +906,24 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     if (cJSON_IsString(value)) strlcpy(entry->unit, value->valuestring, sizeof(entry->unit));
     value = cJSON_GetObjectItem(root, "mqtt_topic");
     if (cJSON_IsString(value)) strlcpy(entry->mqtt_topic, value->valuestring, sizeof(entry->mqtt_topic));
+    value = cJSON_GetObjectItem(root, "semantic_profile_id");
+    if (cJSON_IsString(value)) {
+        strlcpy(entry->semantic_profile_id, value->valuestring,
+                sizeof(entry->semantic_profile_id));
+    }
+    value = cJSON_GetObjectItem(root, "semantic_profile_version");
+    if (cJSON_IsNumber(value)) {
+        entry->semantic_profile_version = (uint32_t)value->valuedouble;
+    }
+    value = cJSON_GetObjectItem(root, "semantic_confidence");
+    if (cJSON_IsNumber(value)) {
+        entry->semantic_confidence = (uint8_t)value->valueint;
+    }
+    value = cJSON_GetObjectItem(root, "semantic_evidence");
+    if (cJSON_IsString(value)) {
+        strlcpy(entry->semantic_evidence, value->valuestring,
+                sizeof(entry->semantic_evidence));
+    }
 
     value = cJSON_GetObjectItem(root, "writable");
     if (cJSON_IsBool(value)) entry->constraint.writable = cJSON_IsTrue(value);
@@ -753,13 +934,14 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     entry->active = true;
 
     return entry->slave_id >= 1 &&
-           (entry->function_code == 3 || entry->function_code == 4) &&
+           entry->function_code >= 1 && entry->function_code <= 4 &&
            entry->device_id[0] != '\0' && entry->point_id[0] != '\0';
 }
 
 /* POST /api/mappings/import - Batch semantic profile import. */
 static esp_err_t mappings_import_post_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_large_request_json(req, 768U * 1024U);
     if (root == NULL) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -818,6 +1000,7 @@ static esp_err_t mappings_import_post_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     /* Extract index from URI: /api/mappings/<idx> */
     char uri[64];
     httpd_req_get_url_str(req, uri, sizeof(uri));
@@ -834,6 +1017,7 @@ static esp_err_t mappings_put_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_delete_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     /* Extract slave_id and register_address from query or body */
     char uri[64];
     httpd_req_get_url_str(req, uri, sizeof(uri));
@@ -872,6 +1056,7 @@ static esp_err_t mappings_delete_handler(httpd_req_t *req)
 
 static esp_err_t mappings_clear_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     esp_err_t err = amm_clear_mappings();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Web API: clear mappings failed: %s", esp_err_to_name(err));
@@ -882,6 +1067,15 @@ static esp_err_t mappings_clear_handler(httpd_req_t *req)
     tcm_state_pool_clear();
     ESP_LOGI(TAG, "Web API: cleared all mappings and runtime point states");
     return send_json(req, "{\"status\":\"ok\",\"cleared\":true}");
+}
+
+static esp_err_t mappings_rollback_post_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+    esp_err_t err = amm_rollback();
+    if (err == ESP_OK) return send_ok(req);
+    httpd_resp_set_status(req, "409 Conflict");
+    return send_json(req, "{\"error\":\"No valid AMM rollback snapshot\"}");
 }
 
 /* ================================================================
@@ -1032,6 +1226,7 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
 
 static esp_err_t modbus_logs_delete_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     modbus_comm_log_clear();
     return send_ok(req);
 }
@@ -1118,6 +1313,24 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
             err = send_json_string_chunk(req, dev->mqtt_topic_prefix);
             if (err != ESP_OK) break;
         }
+        if (dev->vendor_name[0]) {
+            err = httpd_resp_send_chunk(req, ",\"vendor_name\":", 15);
+            if (err != ESP_OK) break;
+            err = send_json_string_chunk(req, dev->vendor_name);
+            if (err != ESP_OK) break;
+        }
+        if (dev->product_code[0]) {
+            err = httpd_resp_send_chunk(req, ",\"product_code\":", 16);
+            if (err != ESP_OK) break;
+            err = send_json_string_chunk(req, dev->product_code);
+            if (err != ESP_OK) break;
+        }
+        if (dev->revision[0]) {
+            err = httpd_resp_send_chunk(req, ",\"revision\":", 12);
+            if (err != ESP_OK) break;
+            err = send_json_string_chunk(req, dev->revision);
+            if (err != ESP_OK) break;
+        }
 
         length = snprintf(
             chunk, sizeof(chunk),
@@ -1170,6 +1383,7 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
 /* POST /api/discover/scan */
 static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *body = parse_request_json(req);
     if (body == NULL) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
@@ -1184,9 +1398,11 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
     params.reg_end = 16;
     params.source_protocol = SRC_MODBUS_RTU;
     params.channel_id = 0;
-    params.function_codes[0] = 3;
-    params.function_codes[1] = 4;
-    params.fc_count = 2;
+    params.function_codes[0] = 1;
+    params.function_codes[1] = 2;
+    params.function_codes[2] = 3;
+    params.function_codes[3] = 4;
+    params.fc_count = 4;
     params.max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP;
 
     cJSON *v;
@@ -1210,9 +1426,9 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
         params.fc_count = 0;
         cJSON *item;
         cJSON_ArrayForEach(item, v) {
-            if (params.fc_count >= 2) break;
+            if (params.fc_count >= 4) break;
             if (cJSON_IsNumber(item) &&
-                (item->valueint == 3 || item->valueint == 4)) {
+                item->valueint >= 1 && item->valueint <= 4) {
                 params.function_codes[params.fc_count++] = (uint8_t)item->valueint;
             }
         }
@@ -1255,6 +1471,7 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 /* POST /api/discover/apply */
 static esp_err_t discover_apply_post_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     if (modbus_discover_get_result().scan_in_progress) {
         httpd_resp_set_status(req, "409 Conflict");
         return send_json(req, "{\"error\":\"discovery scan in progress\"}");
@@ -1280,6 +1497,7 @@ static esp_err_t discover_apply_post_handler(httpd_req_t *req)
 /* POST /api/discover/reset */
 static esp_err_t discover_reset_post_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     modbus_discover_reset();
     return send_ok(req);
 }
@@ -1349,6 +1567,7 @@ static bool parse_discover_device_uri(const char *uri, uint8_t *slave_id,
 /* PUT /api/discover/devices/<slave_id> -update device info */
 static esp_err_t discover_device_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -1384,6 +1603,7 @@ static esp_err_t discover_device_put_handler(httpd_req_t *req)
 /* PUT /api/discover/devices/<slave_id>/registers/<reg_addr> -update register */
 static esp_err_t discover_register_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -1412,9 +1632,7 @@ static esp_err_t discover_register_put_handler(httpd_req_t *req)
     else if ((v = cJSON_GetObjectItem(body, "inferred_unit")) && cJSON_IsString(v))
         unit = v->valuestring;
     if ((v = cJSON_GetObjectItem(body, "data_type")) && cJSON_IsString(v)) {
-        if (strcmp(v->valuestring, "FLOAT32") == 0) dtype = DT_FLOAT32;
-        else if (strcmp(v->valuestring, "INT16") == 0) dtype = DT_INT16;
-        else dtype = DT_UINT16;
+        dtype = parse_data_type_name(v->valuestring);
     }
     if ((v = cJSON_GetObjectItem(body, "writable")) && cJSON_IsBool(v))
         writable = cJSON_IsTrue(v);
@@ -1438,6 +1656,7 @@ static esp_err_t discover_register_put_handler(httpd_req_t *req)
 /* POST /api/discover/devices/<slave_id>/registers/<reg_addr>/toggle */
 static esp_err_t discover_register_toggle_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -1469,6 +1688,7 @@ static esp_err_t discover_register_toggle_handler(httpd_req_t *req)
 /* DELETE /api/discover/devices/<slave_id>/registers/<reg_addr> */
 static esp_err_t discover_register_delete_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -1508,6 +1728,7 @@ static esp_err_t gateway_config_get_handler(httpd_req_t *req)
 
 static esp_err_t gateway_config_put_handler(httpd_req_t *req)
 {
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *root = parse_request_json(req);
     if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     runtime_config_t config;
@@ -1529,6 +1750,138 @@ static esp_err_t gateway_config_put_handler(httpd_req_t *req)
                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
 }
 
+static esp_err_t time_config_get_handler(httpd_req_t *req)
+{
+    runtime_config_t config;
+    runtime_config_get(&config);
+    time_service_status_t status;
+    time_service_get_status(&status);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", config.time.enabled);
+    cJSON_AddStringToObject(root, "server1", config.time.server1);
+    cJSON_AddStringToObject(root, "server2", config.time.server2);
+    cJSON_AddStringToObject(root, "timezone", config.time.timezone);
+    cJSON_AddNumberToObject(root, "sync_interval_ms", config.time.sync_interval_ms);
+    cJSON_AddBoolToObject(root, "synchronized", status.synchronized);
+    cJSON_AddNumberToObject(root, "last_sync_ms", (double)status.last_sync_ms);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    esp_err_t err = send_json(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t time_config_put_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+    cJSON *root = parse_request_json(req);
+    if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    runtime_config_t config;
+    runtime_config_get(&config);
+    cJSON *value = cJSON_GetObjectItem(root, "enabled");
+    if (cJSON_IsBool(value)) config.time.enabled = cJSON_IsTrue(value);
+#define COPY_TIME_STRING(key, field) do { value = cJSON_GetObjectItem(root, key); \
+    if (cJSON_IsString(value)) strlcpy(config.time.field, value->valuestring, \
+                                      sizeof(config.time.field)); } while (0)
+    COPY_TIME_STRING("server1", server1);
+    COPY_TIME_STRING("server2", server2);
+    COPY_TIME_STRING("timezone", timezone);
+#undef COPY_TIME_STRING
+    value = cJSON_GetObjectItem(root, "sync_interval_ms");
+    if (cJSON_IsNumber(value)) config.time.sync_interval_ms = (uint32_t)value->valuedouble;
+    cJSON_Delete(root);
+    esp_err_t err = runtime_config_set(&config);
+    return err == ESP_OK
+        ? send_json(req, "{\"status\":\"ok\",\"restart_required\":true}")
+        : httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid configuration");
+}
+
+static esp_err_t security_config_get_handler(httpd_req_t *req)
+{
+    runtime_config_t config;
+    runtime_config_get(&config);
+    gateway_health_t health;
+    health_service_get(&health);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "auth_enabled", config.security.auth_enabled);
+    cJSON_AddStringToObject(root, "username", config.security.username);
+    cJSON_AddBoolToObject(root, "token_configured",
+                          config.security.password_sha256[0] != '\0');
+    cJSON_AddBoolToObject(root, "ota_enabled", config.security.ota_enabled);
+    cJSON_AddBoolToObject(root, "ota_allow_http", config.security.ota_allow_http);
+    cJSON_AddBoolToObject(root, "secure_boot_enabled", health.secure_boot_enabled);
+    cJSON_AddBoolToObject(root, "flash_encryption_enabled",
+                          health.flash_encryption_enabled);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    esp_err_t err = send_json(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t security_config_put_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+    cJSON *root = parse_request_json(req);
+    if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    runtime_config_t config;
+    runtime_config_get(&config);
+    cJSON *value = cJSON_GetObjectItem(root, "auth_enabled");
+    if (cJSON_IsBool(value)) config.security.auth_enabled = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "username");
+    if (cJSON_IsString(value)) {
+        strlcpy(config.security.username, value->valuestring,
+                sizeof(config.security.username));
+    }
+    cJSON *token = cJSON_GetObjectItem(root, "bearer_token");
+    cJSON *token_hash = cJSON_GetObjectItem(root, "bearer_token_sha256");
+    if (cJSON_IsString(token) && token->valuestring[0] != '\0') {
+        sha256_hex(token->valuestring, config.security.password_sha256);
+    } else if (cJSON_IsString(token_hash) &&
+               strlen(token_hash->valuestring) == 64) {
+        strlcpy(config.security.password_sha256, token_hash->valuestring,
+                sizeof(config.security.password_sha256));
+    }
+    value = cJSON_GetObjectItem(root, "ota_enabled");
+    if (cJSON_IsBool(value)) config.security.ota_enabled = cJSON_IsTrue(value);
+    value = cJSON_GetObjectItem(root, "ota_allow_http");
+    if (cJSON_IsBool(value)) config.security.ota_allow_http = cJSON_IsTrue(value);
+    cJSON_Delete(root);
+    esp_err_t err = runtime_config_set(&config);
+    return err == ESP_OK ? send_ok(req)
+        : httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid configuration");
+}
+
+static esp_err_t ota_status_get_handler(httpd_req_t *req)
+{
+    ota_status_t status;
+    ota_service_get_status(&status);
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"state\":%d,\"error\":%ld,\"message\":\"%s\"}",
+             status.state, (long)status.last_error, status.message);
+    return send_json(req, response);
+}
+
+static esp_err_t ota_start_post_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+    cJSON *root = parse_request_json(req);
+    if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    cJSON *url = cJSON_GetObjectItem(root, "url");
+    cJSON *sha = cJSON_GetObjectItem(root, "sha256");
+    esp_err_t err = cJSON_IsString(url) && cJSON_IsString(sha)
+        ? ota_service_start(url->valuestring, sha->valuestring)
+        : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   esp_err_to_name(err));
+    }
+    httpd_resp_set_status(req, "202 Accepted");
+    return send_json(req, "{\"status\":\"started\"}");
+}
+
 /* ================================================================
  * OPTIONS handler (CORS preflight)
  * ================================================================ */
@@ -1536,7 +1889,8 @@ static esp_err_t cors_options_handler(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers",
+                       "Content-Type, Authorization");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
@@ -1559,7 +1913,7 @@ esp_err_t web_server_start(uint16_t port)
     config.server_port = port;
     config.stack_size = 8192;
     config.task_priority = 5;
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 56;
     config.max_open_sockets = 4;
     config.backlog_conn = 2;
     config.lru_purge_enable = true;
@@ -1591,6 +1945,28 @@ esp_err_t web_server_start(uint16_t port)
     };
     const httpd_uri_t gateway_put = {
         .uri = "/api/gateway/config", .method = HTTP_PUT, .handler = gateway_config_put_handler,
+    };
+    const httpd_uri_t time_get = {
+        .uri = "/api/time/config", .method = HTTP_GET, .handler = time_config_get_handler,
+    };
+    const httpd_uri_t time_put = {
+        .uri = "/api/time/config", .method = HTTP_PUT, .handler = time_config_put_handler,
+    };
+    const httpd_uri_t security_get = {
+        .uri = "/api/security/config", .method = HTTP_GET,
+        .handler = security_config_get_handler,
+    };
+    const httpd_uri_t security_put = {
+        .uri = "/api/security/config", .method = HTTP_PUT,
+        .handler = security_config_put_handler,
+    };
+    const httpd_uri_t ota_status_get = {
+        .uri = "/api/system/ota", .method = HTTP_GET,
+        .handler = ota_status_get_handler,
+    };
+    const httpd_uri_t ota_start_post = {
+        .uri = "/api/system/ota", .method = HTTP_POST,
+        .handler = ota_start_post_handler,
     };
     const httpd_uri_t wifi_get = {
         .uri = "/api/wifi/config", .method = HTTP_GET, .handler = wifi_config_get_handler,
@@ -1628,6 +2004,10 @@ esp_err_t web_server_start(uint16_t port)
     const httpd_uri_t mappings_import_post = {
         .uri = "/api/mappings/import", .method = HTTP_POST,
         .handler = mappings_import_post_handler,
+    };
+    const httpd_uri_t mappings_rollback_post = {
+        .uri = "/api/mappings/rollback", .method = HTTP_POST,
+        .handler = mappings_rollback_post_handler,
     };
     const httpd_uri_t mappings_put = {
         .uri = "/api/mappings/*", .method = HTTP_PUT, .handler = mappings_put_handler,
@@ -1693,6 +2073,12 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &sys_logs_get);
     httpd_register_uri_handler(s_server, &gateway_get);
     httpd_register_uri_handler(s_server, &gateway_put);
+    httpd_register_uri_handler(s_server, &time_get);
+    httpd_register_uri_handler(s_server, &time_put);
+    httpd_register_uri_handler(s_server, &security_get);
+    httpd_register_uri_handler(s_server, &security_put);
+    httpd_register_uri_handler(s_server, &ota_status_get);
+    httpd_register_uri_handler(s_server, &ota_start_post);
     httpd_register_uri_handler(s_server, &wifi_get);
     httpd_register_uri_handler(s_server, &wifi_put);
     httpd_register_uri_handler(s_server, &mqtt_get);
@@ -1705,6 +2091,7 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &mappings_post);
     httpd_register_uri_handler(s_server, &mappings_clear);
     httpd_register_uri_handler(s_server, &mappings_import_post);
+    httpd_register_uri_handler(s_server, &mappings_rollback_post);
     httpd_register_uri_handler(s_server, &mappings_put);
     httpd_register_uri_handler(s_server, &mappings_del);
     httpd_register_uri_handler(s_server, &discover_status_get);

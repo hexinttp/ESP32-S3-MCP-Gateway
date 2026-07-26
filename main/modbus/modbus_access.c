@@ -241,9 +241,22 @@ static esp_err_t modbus_tcp_read(uint8_t channel_id, uint8_t slave_id, uint8_t f
     size_t response_size = sizeof(response);
     esp_err_t err = tcp_exchange(channel_id, slave_id, pdu, sizeof(pdu), response, &response_size);
     if (err != ESP_OK) return err;
-    if (response_size != (size_t)(2 + reg_count * 2) || response[0] != function_code ||
+    if (response[0] != function_code) return ESP_ERR_INVALID_RESPONSE;
+    if (function_code == 1 || function_code == 2) {
+        size_t byte_count = (reg_count + 7U) / 8U;
+        if (response_size != 2U + byte_count || response[1] != byte_count) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        for (uint16_t i = 0; i < reg_count; ++i) {
+            raw_regs[i] = (response[2 + i / 8U] >> (i % 8U)) & 1U;
+        }
+        return ESP_OK;
+    }
+    if (response_size != (size_t)(2 + reg_count * 2) ||
         response[1] != reg_count * 2) return ESP_ERR_INVALID_RESPONSE;
-    for (int i = 0; i < reg_count; ++i) raw_regs[i] = (uint16_t)response[2 + i * 2] << 8 | response[3 + i * 2];
+    for (int i = 0; i < reg_count; ++i) {
+        raw_regs[i] = (uint16_t)response[2 + i * 2] << 8 | response[3 + i * 2];
+    }
     return ESP_OK;
 }
 
@@ -252,7 +265,20 @@ static esp_err_t modbus_tcp_write(uint8_t channel_id, uint8_t slave_id, uint8_t 
 {
     uint8_t pdu[260];
     size_t pdu_size;
-    if (function_code == 6 && reg_count == 1) {
+    if (function_code == 5 && reg_count == 1) {
+        uint16_t coil_value = values[0] ? 0xFF00U : 0x0000U;
+        pdu[0] = 5; pdu[1] = reg_addr >> 8; pdu[2] = reg_addr;
+        pdu[3] = coil_value >> 8; pdu[4] = coil_value; pdu_size = 5;
+    } else if (function_code == 15 && reg_count <= 1968) {
+        uint8_t byte_count = (uint8_t)((reg_count + 7U) / 8U);
+        pdu[0] = 15; pdu[1] = reg_addr >> 8; pdu[2] = reg_addr;
+        pdu[3] = reg_count >> 8; pdu[4] = reg_count; pdu[5] = byte_count;
+        memset(pdu + 6, 0, byte_count);
+        for (uint16_t i = 0; i < reg_count; ++i) {
+            if (values[i]) pdu[6 + i / 8U] |= 1U << (i % 8U);
+        }
+        pdu_size = 6 + byte_count;
+    } else if (function_code == 6 && reg_count == 1) {
         pdu[0] = 6; pdu[1] = reg_addr >> 8; pdu[2] = reg_addr;
         pdu[3] = values[0] >> 8; pdu[4] = values[0]; pdu_size = 5;
     } else if (function_code == 16 && reg_count <= 123) {
@@ -379,6 +405,47 @@ static esp_err_t modbus_read_registers_internal(uint8_t slave_id,
     return mb_err;
 }
 
+static esp_err_t modbus_read_bits_internal(uint8_t slave_id, uint8_t function_code,
+                                           uint16_t address, uint16_t count,
+                                           uint16_t *values)
+{
+    if (values == NULL || count == 0 || count > MODBUS_MAX_REG_COUNT ||
+        (function_code != 1 && function_code != 2) || !s_initialised) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t packed[(MODBUS_MAX_REG_COUNT + 7) / 8] = {0};
+    mb_param_request_t req = {
+        .slave_addr = slave_id,
+        .reg_start = address,
+        .reg_size = count,
+        .command = function_code,
+    };
+    uint8_t tx_frame[8];
+    size_t tx_length = build_rtu_read_request(tx_frame, slave_id, function_code,
+                                              address, count);
+    ESP_RETURN_ON_ERROR(modbus_lock(), TAG, "RTU bit lock");
+    modbus_comm_log_add(MODBUS_COMM_TX, slave_id, function_code, address,
+                        count, ESP_OK, tx_frame, tx_length);
+    esp_err_t err = mbc_master_send_request(s_master_handle, &req, packed);
+    modbus_unlock();
+    if (err == ESP_OK) {
+        for (uint16_t i = 0; i < count; ++i) {
+            values[i] = (packed[i / 8U] >> (i % 8U)) & 1U;
+        }
+        uint8_t rx_frame[3 + (MODBUS_MAX_REG_COUNT + 7) / 8 + 2] = {
+            slave_id, function_code, (uint8_t)((count + 7U) / 8U)
+        };
+        memcpy(rx_frame + 3, packed, rx_frame[2]);
+        size_t rx_length = append_rtu_crc(rx_frame, 3 + rx_frame[2]);
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, address,
+                            count, ESP_OK, rx_frame, rx_length);
+    } else {
+        modbus_comm_log_add(MODBUS_COMM_RX, slave_id, function_code, address,
+                            count, err, NULL, 0);
+    }
+    return err;
+}
+
 void modbus_access_set_probe_mode(bool enabled)
 {
     s_probe_mode = enabled;
@@ -466,6 +533,32 @@ static esp_err_t modbus_write_registers_internal(uint8_t slave_id,
     }
 
     return mb_err;
+}
+
+static esp_err_t modbus_write_coils_internal(uint8_t slave_id, uint16_t address,
+                                             uint16_t count, uint16_t *values,
+                                             uint8_t function_code)
+{
+    if (values == NULL || count == 0 || count > MODBUS_MAX_REG_COUNT ||
+        (function_code != 5 && function_code != 15) || !s_initialised) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t packed[(MODBUS_MAX_REG_COUNT + 7) / 8] = {0};
+    uint16_t single = values[0] ? 0xFF00U : 0x0000U;
+    for (uint16_t i = 0; i < count; ++i) {
+        if (values[i]) packed[i / 8U] |= 1U << (i % 8U);
+    }
+    mb_param_request_t req = {
+        .slave_addr = slave_id,
+        .reg_start = address,
+        .reg_size = count,
+        .command = function_code,
+    };
+    void *payload = function_code == 5 ? (void *)&single : (void *)packed;
+    ESP_RETURN_ON_ERROR(modbus_lock(), TAG, "RTU coil lock");
+    esp_err_t err = mbc_master_send_request(s_master_handle, &req, payload);
+    modbus_unlock();
+    return err;
 }
 
 /* ======================== Public API ======================== */
@@ -592,6 +685,18 @@ esp_err_t modbus_read_input_register(uint8_t slave_id,
                                           raw_regs);
 }
 
+esp_err_t modbus_read_coils(uint8_t slave_id, uint16_t address,
+                            uint16_t count, uint16_t *values)
+{
+    return modbus_read_bits_internal(slave_id, 1, address, count, values);
+}
+
+esp_err_t modbus_read_discrete_inputs(uint8_t slave_id, uint16_t address,
+                                      uint16_t count, uint16_t *values)
+{
+    return modbus_read_bits_internal(slave_id, 2, address, count, values);
+}
+
 /* ------------------------------------------------------------------ */
 esp_err_t modbus_write_single_register(uint8_t slave_id,
                                        uint16_t reg_addr,
@@ -618,85 +723,159 @@ esp_err_t modbus_write_multiple_registers(uint8_t slave_id,
                                            16);
 }
 
-/* ------------------------------------------------------------------ */
-float modbus_convert_to_float(uint16_t *raw_regs, data_type_t dtype)
+esp_err_t modbus_write_single_coil(uint8_t slave_id, uint16_t address, bool value)
 {
-    if (raw_regs == NULL) {
-        return 0.0f;
-    }
+    uint16_t word = value ? 1U : 0U;
+    return modbus_write_coils_internal(slave_id, address, 1, &word, 5);
+}
 
+esp_err_t modbus_write_multiple_coils(uint8_t slave_id, uint16_t address,
+                                      uint16_t count, uint16_t *values)
+{
+    return modbus_write_coils_internal(slave_id, address, count, values, 15);
+}
+
+/* ------------------------------------------------------------------ */
+static uint16_t swap_word_bytes(uint16_t value)
+{
+    return (uint16_t)(value << 8 | value >> 8);
+}
+
+static uint64_t ordered_bits(const uint16_t *raw_regs, uint8_t count,
+                             byte_order_t byte_order)
+{
+    uint16_t words[4] = {0};
+    for (uint8_t i = 0; i < count; ++i) words[i] = raw_regs[i];
+    if (byte_order == BYTE_ORDER_CDAB || byte_order == BYTE_ORDER_DCBA) {
+        for (uint8_t i = 0; i < count / 2U; ++i) {
+            uint16_t temp = words[i];
+            words[i] = words[count - 1U - i];
+            words[count - 1U - i] = temp;
+        }
+    }
+    if (byte_order == BYTE_ORDER_BADC || byte_order == BYTE_ORDER_DCBA) {
+        for (uint8_t i = 0; i < count; ++i) words[i] = swap_word_bytes(words[i]);
+    }
+    uint64_t bits = 0;
+    for (uint8_t i = 0; i < count; ++i) bits = (bits << 16) | words[i];
+    return bits;
+}
+
+double modbus_convert_to_number(const uint16_t *raw_regs, data_type_t dtype,
+                                byte_order_t byte_order, uint8_t bit_index)
+{
+    if (raw_regs == NULL) return 0.0;
+    uint8_t count = modbus_register_count_for_type(dtype);
+    uint64_t bits = ordered_bits(raw_regs, count, byte_order);
     switch (dtype) {
-
-    /* ---------- 16-bit signed ---------- */
-    case DT_INT16: {
-        int16_t signed_val = (int16_t)raw_regs[0];
-        return (float)signed_val;
-    }
-
-    /* ---------- 16-bit unsigned ---------- */
-    case DT_UINT16: {
-        return (float)raw_regs[0];
-    }
-
-    /* ---------- 32-bit IEEE-754 float (big-endian word order) ---------- */
+    case DT_BOOL: return raw_regs[0] != 0 ? 1.0 : 0.0;
+    case DT_INT16: return (double)(int16_t)bits;
+    case DT_UINT16: return (double)(uint16_t)bits;
     case DT_FLOAT32: {
-        /*
-         * Register 0 holds the most-significant word (high 16 bits),
-         * register 1 holds the least-significant word (low 16 bits).
-         * This matches the common "big-endian word" (ABCD) byte order
-         * used by the majority of industrial MODBUS devices.
-         */
-        uint32_t raw32 = ((uint32_t)raw_regs[0] << 16) |
-                          (uint32_t)raw_regs[1];
-        float result;
-        memcpy(&result, &raw32, sizeof(float));
-        return result;
+        uint32_t raw32 = (uint32_t)bits;
+        float value;
+        memcpy(&value, &raw32, sizeof(value));
+        return value;
     }
-
-    /* ---------- 32-bit signed integer (big-endian word order) ---------- */
-    case DT_INT32: {
-        uint32_t raw32 = ((uint32_t)raw_regs[0] << 16) |
-                          (uint32_t)raw_regs[1];
-        int32_t signed32 = (int32_t)raw32;
-        return (float)signed32;
+    case DT_INT32: return (double)(int32_t)bits;
+    case DT_UINT32: return (double)(uint32_t)bits;
+    case DT_INT64: return (double)(int64_t)bits;
+    case DT_UINT64: return (double)bits;
+    case DT_FLOAT64: {
+        double value;
+        memcpy(&value, &bits, sizeof(value));
+        return value;
     }
-
-    /* ---------- 32-bit unsigned integer (big-endian word order) ---------- */
-    case DT_UINT32: {
-        uint32_t raw32 = ((uint32_t)raw_regs[0] << 16) |
-                          (uint32_t)raw_regs[1];
-        return (float)raw32;
-    }
-
+    case DT_BCD16:
+        return ((bits >> 12) & 0xF) * 1000 + ((bits >> 8) & 0xF) * 100 +
+               ((bits >> 4) & 0xF) * 10 + (bits & 0xF);
+    case DT_BITFIELD16:
+        return ((uint16_t)bits >> (bit_index & 15U)) & 1U;
+    case DT_ASCII:
     default:
-        ESP_LOGW(TAG, "Unsupported data type %d in convert_to_float", dtype);
-        return 0.0f;
+        return 0.0;
     }
 }
 
-float modbus_convert_to_float_order(const uint16_t *raw_regs, data_type_t dtype,
-                                    byte_order_t byte_order)
+size_t modbus_decode_ascii(const uint16_t *raw_regs, uint16_t register_count,
+                           byte_order_t byte_order, char *out, size_t out_size)
 {
-    if (raw_regs == NULL) return 0.0f;
-    uint16_t words[2] = {raw_regs[0], raw_regs[1]};
-    if (dtype == DT_INT16 || dtype == DT_UINT16) {
+    if (raw_regs == NULL || out == NULL || out_size == 0) return 0;
+    size_t written = 0;
+    for (uint16_t i = 0; i < register_count && written + 1 < out_size; ++i) {
+        uint16_t word = raw_regs[i];
         if (byte_order == BYTE_ORDER_BADC || byte_order == BYTE_ORDER_DCBA) {
-            words[0] = (uint16_t)(words[0] << 8 | words[0] >> 8);
+            word = swap_word_bytes(word);
         }
-        return modbus_convert_to_float(words, dtype);
+        char high = (char)(word >> 8);
+        char low = (char)word;
+        if (high == '\0') break;
+        out[written++] = high;
+        if (low == '\0' || written + 1 >= out_size) break;
+        out[written++] = low;
+    }
+    out[written] = '\0';
+    return written;
+}
+
+uint8_t modbus_encode_number(double value, data_type_t dtype,
+                             byte_order_t byte_order, uint16_t words[4])
+{
+    if (words == NULL) return 0;
+    memset(words, 0, sizeof(uint16_t) * 4);
+    uint64_t bits = 0;
+    uint8_t count = modbus_register_count_for_type(dtype);
+    switch (dtype) {
+    case DT_BOOL: words[0] = value != 0.0; return 1;
+    case DT_INT16: words[0] = (uint16_t)(int16_t)llround(value); return 1;
+    case DT_UINT16:
+    case DT_BITFIELD16: words[0] = (uint16_t)llround(value); return 1;
+    case DT_BCD16: {
+        uint16_t number = (uint16_t)llround(value);
+        words[0] = (uint16_t)(((number / 1000U) % 10U) << 12 |
+                              ((number / 100U) % 10U) << 8 |
+                              ((number / 10U) % 10U) << 4 |
+                              (number % 10U));
+        return 1;
+    }
+    case DT_FLOAT32: {
+        float number = (float)value;
+        uint32_t raw32;
+        memcpy(&raw32, &number, sizeof(raw32));
+        bits = raw32;
+        break;
+    }
+    case DT_INT32: bits = (uint32_t)(int32_t)llround(value); break;
+    case DT_UINT32: bits = (uint32_t)llround(value); break;
+    case DT_FLOAT64: memcpy(&bits, &value, sizeof(bits)); break;
+    case DT_INT64: bits = (uint64_t)(int64_t)llround(value); break;
+    case DT_UINT64: bits = (uint64_t)llround(value); break;
+    default: return 0;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        words[i] = (uint16_t)(bits >> (16U * (count - 1U - i)));
     }
     if (byte_order == BYTE_ORDER_CDAB || byte_order == BYTE_ORDER_DCBA) {
-        uint16_t temp = words[0]; words[0] = words[1]; words[1] = temp;
+        for (uint8_t i = 0; i < count / 2U; ++i) {
+            uint16_t temporary = words[i];
+            words[i] = words[count - 1U - i];
+            words[count - 1U - i] = temporary;
+        }
     }
     if (byte_order == BYTE_ORDER_BADC || byte_order == BYTE_ORDER_DCBA) {
-        words[0] = (uint16_t)(words[0] << 8 | words[0] >> 8);
-        words[1] = (uint16_t)(words[1] << 8 | words[1] >> 8);
+        for (uint8_t i = 0; i < count; ++i) words[i] = swap_word_bytes(words[i]);
     }
-    return modbus_convert_to_float(words, dtype);
+    return count;
 }
 
 uint16_t modbus_register_offset(uint8_t function_code, uint16_t configured_address)
 {
+    if (function_code == 1 && configured_address >= 1 && configured_address < 10001) {
+        return configured_address - 1;
+    }
+    if (function_code == 2 && configured_address >= 10001 && configured_address < 20001) {
+        return configured_address - 10001;
+    }
     if ((function_code == 3 || function_code == 6 || function_code == 16) && configured_address >= 40001) {
         return configured_address - 40001;
     }
@@ -708,7 +887,9 @@ uint16_t modbus_register_offset(uint8_t function_code, uint16_t configured_addre
 
 uint16_t modbus_register_count_for_type(data_type_t data_type)
 {
-    return (data_type == DT_FLOAT32 || data_type == DT_INT32 || data_type == DT_UINT32) ? 2 : 1;
+    if (data_type == DT_FLOAT32 || data_type == DT_INT32 || data_type == DT_UINT32) return 2;
+    if (data_type == DT_FLOAT64 || data_type == DT_INT64 || data_type == DT_UINT64) return 4;
+    return 1;
 }
 
 esp_err_t modbus_read_channel(source_protocol_t protocol, uint8_t channel_id,
@@ -716,9 +897,11 @@ esp_err_t modbus_read_channel(source_protocol_t protocol, uint8_t channel_id,
                               uint16_t reg_addr, uint16_t reg_count, uint16_t *raw_regs)
 {
     if (protocol == SRC_MODBUS_RTU) {
-        return function_code == 4
-            ? modbus_read_input_register(slave_id, reg_addr, reg_count, raw_regs)
-            : modbus_read_holding_register(slave_id, reg_addr, reg_count, raw_regs);
+        if (function_code == 1) return modbus_read_coils(slave_id, reg_addr, reg_count, raw_regs);
+        if (function_code == 2) return modbus_read_discrete_inputs(slave_id, reg_addr, reg_count, raw_regs);
+        if (function_code == 4) return modbus_read_input_register(slave_id, reg_addr, reg_count, raw_regs);
+        if (function_code == 3) return modbus_read_holding_register(slave_id, reg_addr, reg_count, raw_regs);
+        return ESP_ERR_NOT_SUPPORTED;
     }
     if (s_modbus_mutex == NULL) s_modbus_mutex = xSemaphoreCreateMutex();
     ESP_RETURN_ON_ERROR(modbus_lock(), TAG, "TCP lock");
@@ -733,9 +916,19 @@ esp_err_t modbus_write_channel(source_protocol_t protocol, uint8_t channel_id,
                                uint16_t reg_addr, uint16_t reg_count, uint16_t *values)
 {
     if (protocol == SRC_MODBUS_RTU) {
-        return function_code == 6 && reg_count == 1
-            ? modbus_write_single_register(slave_id, reg_addr, values[0])
-            : modbus_write_multiple_registers(slave_id, reg_addr, reg_count, values);
+        if (function_code == 5 && reg_count == 1) {
+            return modbus_write_single_coil(slave_id, reg_addr, values[0] != 0);
+        }
+        if (function_code == 15) {
+            return modbus_write_multiple_coils(slave_id, reg_addr, reg_count, values);
+        }
+        if (function_code == 6 && reg_count == 1) {
+            return modbus_write_single_register(slave_id, reg_addr, values[0]);
+        }
+        if (function_code == 16) {
+            return modbus_write_multiple_registers(slave_id, reg_addr, reg_count, values);
+        }
+        return ESP_ERR_NOT_SUPPORTED;
     }
     if (s_modbus_mutex == NULL) s_modbus_mutex = xSemaphoreCreateMutex();
     ESP_RETURN_ON_ERROR(modbus_lock(), TAG, "TCP lock");
@@ -743,6 +936,55 @@ esp_err_t modbus_write_channel(source_protocol_t protocol, uint8_t channel_id,
                                      reg_addr, reg_count, values);
     modbus_unlock();
     return err;
+}
+
+esp_err_t modbus_read_device_identity_channel(source_protocol_t protocol,
+                                              uint8_t channel_id,
+                                              uint8_t slave_id,
+                                              modbus_device_identity_t *identity)
+{
+    if (identity == NULL) return ESP_ERR_INVALID_ARG;
+    memset(identity, 0, sizeof(*identity));
+    if (protocol != SRC_MODBUS_TCP) return ESP_ERR_NOT_SUPPORTED;
+
+    uint8_t pdu[] = {43, 14, 1, 0};
+    uint8_t response[253];
+    size_t response_size = sizeof(response);
+    if (s_modbus_mutex == NULL) s_modbus_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_ERROR(modbus_lock(), TAG, "TCP identity lock");
+    esp_err_t err = tcp_exchange(channel_id, slave_id, pdu, sizeof(pdu),
+                                 response, &response_size);
+    modbus_unlock();
+    if (err != ESP_OK) return err;
+    if (response_size < 8 || response[0] != 43 || response[1] != 14) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    uint8_t object_count = response[7];
+    size_t cursor = 8;
+    for (uint8_t i = 0; i < object_count && cursor + 2 <= response_size; ++i) {
+        uint8_t object_id = response[cursor++];
+        uint8_t length = response[cursor++];
+        if (cursor + length > response_size) return ESP_ERR_INVALID_RESPONSE;
+        char *destination = NULL;
+        size_t capacity = 0;
+        if (object_id == 0) {
+            destination = identity->vendor_name;
+            capacity = sizeof(identity->vendor_name);
+        } else if (object_id == 1) {
+            destination = identity->product_code;
+            capacity = sizeof(identity->product_code);
+        } else if (object_id == 2) {
+            destination = identity->revision;
+            capacity = sizeof(identity->revision);
+        }
+        if (destination != NULL) {
+            size_t copy = length < capacity - 1U ? length : capacity - 1U;
+            memcpy(destination, response + cursor, copy);
+            destination[copy] = '\0';
+        }
+        cursor += length;
+    }
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */

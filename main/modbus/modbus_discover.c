@@ -67,15 +67,7 @@ static void discover_set_register_progress(uint8_t slave_id, uint8_t function_co
 
 static uint16_t discover_register_offset(uint8_t function_code, uint16_t configured_address)
 {
-    if ((function_code == 3 || function_code == 6 || function_code == 16) &&
-        configured_address >= 40001) {
-        return configured_address - 40001;
-    }
-    if (function_code == 4 && configured_address >= 30001 &&
-        configured_address < 40001) {
-        return configured_address - 30001;
-    }
-    return configured_address;
+    return modbus_register_offset(function_code, configured_address);
 }
 
 static esp_err_t discover_read_registers(source_protocol_t protocol, uint8_t channel_id,
@@ -91,16 +83,18 @@ static esp_err_t discover_read_registers(source_protocol_t protocol, uint8_t cha
 static void discover_default_functions(discover_scan_params_t *params)
 {
     if (params->fc_count == 0) {
-        params->function_codes[0] = 3;
-        params->function_codes[1] = 4;
-        params->fc_count = 2;
+        params->function_codes[0] = 1;
+        params->function_codes[1] = 2;
+        params->function_codes[2] = 3;
+        params->function_codes[3] = 4;
+        params->fc_count = 4;
     }
-    if (params->fc_count > 2) {
-        params->fc_count = 2;
+    if (params->fc_count > 4) {
+        params->fc_count = 4;
     }
     for (uint8_t i = 0; i < params->fc_count; ++i) {
-        if (params->function_codes[i] != 3 && params->function_codes[i] != 4) {
-            params->function_codes[i] = i == 0 ? 3 : 4;
+        if (params->function_codes[i] < 1 || params->function_codes[i] > 4) {
+            params->function_codes[i] = (uint8_t)(i + 1);
         }
     }
     if (params->max_empty_gap == 0) {
@@ -150,7 +144,7 @@ static uint8_t build_function_order(const discover_scan_params_t *params,
                                     uint8_t preferred, uint8_t *functions)
 {
     uint8_t count = 0;
-    if (preferred == 3 || preferred == 4) {
+    if (preferred >= 1 && preferred <= 4) {
         count = append_unique_u8(functions, count, preferred);
     }
     for (uint8_t i = 0; i < params->fc_count; ++i) {
@@ -215,7 +209,7 @@ static esp_err_t discover_probe_device(const discover_scan_params_t *params,
             addresses, address_count, common_register_entries[i]);
     }
 
-    uint8_t functions[2];
+    uint8_t functions[4];
     uint8_t function_count = build_function_order(params, 0, functions);
     uint8_t invalid_responses = 0;
 
@@ -492,6 +486,17 @@ static esp_err_t scan_bus_sync(const discover_scan_params_t *params)
                 dev->probe_function_code = probe.function_code;
                 dev->probe_address = probe.address;
                 dev->probe_register_count = probe.register_count;
+                modbus_device_identity_t identity;
+                if (modbus_read_device_identity_channel(
+                        dev->source_protocol, dev->channel_id, dev->slave_id,
+                        &identity) == ESP_OK) {
+                    strlcpy(dev->vendor_name, identity.vendor_name,
+                            sizeof(dev->vendor_name));
+                    strlcpy(dev->product_code, identity.product_code,
+                            sizeof(dev->product_code));
+                    strlcpy(dev->revision, identity.revision,
+                            sizeof(dev->revision));
+                }
                 dev->active = true;
                 dev->reg_count = 0;
                 s_device_count++;
@@ -529,8 +534,8 @@ static void bus_scan_task(void *argument)
         .reg_end = 100,
         .source_protocol = s_bus_request.protocol,
         .channel_id = s_bus_request.channel_id,
-        .function_codes = {3, 4},
-        .fc_count = 2,
+        .function_codes = {1, 2, 3, 4},
+        .fc_count = 4,
         .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
     };
     scheduler_pause_modbus_polling(true);
@@ -672,8 +677,8 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
             reg->register_address = point_address;
             reg->function_code = probe.function_code;
             reg->raw_value = probe.values[i];
-            reg->inferred_type = ((int16_t)probe.values[i] < 0) ?
-                                 DT_INT16 : DT_UINT16;
+            reg->inferred_type = probe.function_code <= 2 ? DT_BOOL :
+                (((int16_t)probe.values[i] < 0) ? DT_INT16 : DT_UINT16);
             reg->sample_value = reg->inferred_type == DT_INT16 ?
                                 (float)(int16_t)probe.values[i] :
                                 (float)probe.values[i];
@@ -770,7 +775,7 @@ esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
     s_full_request = params != NULL ? *params : (discover_scan_params_t){
         .slave_start = 1, .slave_end = 247, .reg_start = 0, .reg_end = 100,
         .source_protocol = SRC_MODBUS_RTU, .channel_id = 0,
-        .function_codes = {3, 4}, .fc_count = 2,
+        .function_codes = {1, 2, 3, 4}, .fc_count = 4,
         .max_empty_gap = DISCOVER_DEFAULT_EMPTY_GAP,
     };
     discover_default_functions(&s_full_request);
@@ -827,6 +832,13 @@ static data_type_t profile_data_type(const char *name)
     if (name && strcmp(name, "FLOAT32") == 0) return DT_FLOAT32;
     if (name && strcmp(name, "INT32") == 0) return DT_INT32;
     if (name && strcmp(name, "UINT32") == 0) return DT_UINT32;
+    if (name && strcmp(name, "BOOL") == 0) return DT_BOOL;
+    if (name && strcmp(name, "INT64") == 0) return DT_INT64;
+    if (name && strcmp(name, "UINT64") == 0) return DT_UINT64;
+    if (name && strcmp(name, "FLOAT64") == 0) return DT_FLOAT64;
+    if (name && strcmp(name, "BCD16") == 0) return DT_BCD16;
+    if (name && strcmp(name, "BITFIELD16") == 0) return DT_BITFIELD16;
+    if (name && strcmp(name, "ASCII") == 0) return DT_ASCII;
     return DT_UINT16;
 }
 
@@ -840,7 +852,9 @@ static byte_order_t profile_byte_order(const char *name)
 
 static uint8_t profile_type_width(data_type_t type)
 {
-    return type == DT_FLOAT32 || type == DT_INT32 || type == DT_UINT32 ? 2 : 1;
+    if (type == DT_FLOAT32 || type == DT_INT32 || type == DT_UINT32) return 2;
+    if (type == DT_FLOAT64 || type == DT_INT64 || type == DT_UINT64) return 4;
+    return 1;
 }
 
 static bool discovered_has_register(const discovered_device_t *device,
@@ -928,6 +942,8 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
     }
 
     cJSON *profile_devices = cJSON_GetObjectItem(root, "devices");
+    cJSON *profile_name = cJSON_GetObjectItem(root, "name");
+    cJSON *profile_version = cJSON_GetObjectItem(root, "profile_version");
     int capacity = amm_get_capacity();
     amm_mapping_entry_t *entries = heap_caps_calloc(
         (size_t)capacity, sizeof(entries[0]),
@@ -972,6 +988,10 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
             entry->slave_id = device->slave_id;
             entry->function_code =
                 cJSON_IsNumber(function) ? (uint8_t)function->valuedouble : 3;
+            entry->object_type = entry->function_code >= 1 &&
+                                 entry->function_code <= 4
+                ? (modbus_object_type_t)entry->function_code
+                : MODBUS_OBJECT_HOLDING_REGISTER;
             entry->register_address = (uint16_t)address->valuedouble;
             entry->data_type = profile_data_type(
                 cJSON_IsString(type) ? type->valuestring : NULL);
@@ -988,6 +1008,19 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
             entry->value_register_index = 0;
             entry->active = true;
             entry->discovered = true;
+            entry->retry_count = 2;
+            entry->retry_backoff_ms = 50;
+            entry->semantic_source = SEMANTIC_SOURCE_PROFILE;
+            entry->semantic_status = SEMANTIC_STATUS_VERIFIED;
+            entry->semantic_confidence = 100;
+            if (cJSON_IsString(profile_name)) {
+                strlcpy(entry->semantic_profile_id, profile_name->valuestring,
+                        sizeof(entry->semantic_profile_id));
+            }
+            entry->semantic_profile_version = cJSON_IsNumber(profile_version)
+                ? (uint32_t)profile_version->valuedouble : 1;
+            strlcpy(entry->semantic_evidence, "device fingerprint + register profile",
+                    sizeof(entry->semantic_evidence));
 
             if (device->source_protocol == SRC_MODBUS_RTU) {
                 profile_copy_string(profile_device, "device_id",

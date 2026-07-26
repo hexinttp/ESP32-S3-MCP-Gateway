@@ -26,8 +26,10 @@ extern "C" {
 #define AMM_NVS_KEY_COUNT       "entry_cnt"
 #define AMM_NVS_KEY_ENTRY_PREFIX "entry_"
 #define AMM_NVS_KEY_SCHEMA      "schema_ver"
-#define AMM_NVS_SCHEMA_VERSION  4
-#define AMM_MAX_READ_REGISTERS  8
+#define AMM_NVS_KEY_ROLLBACK_COUNT "rb_count"
+#define AMM_NVS_KEY_ROLLBACK    "rollback"
+#define AMM_NVS_SCHEMA_VERSION  5
+#define AMM_MAX_READ_REGISTERS  64
 
 /* ======================== Mapping Entry ======================== */
 
@@ -47,6 +49,7 @@ typedef struct {
     uint16_t register_address;
     data_type_t data_type;
     byte_order_t byte_order;
+    modbus_object_type_t object_type;
     float    scale_factor;
     float    offset;
     uint32_t poll_interval_ms;
@@ -62,6 +65,16 @@ typedef struct {
     uint16_t read_start_address;  /**< Start of the Modbus read window */
     uint8_t  read_register_count; /**< Total registers read for this point */
     uint8_t  value_register_index;/**< Value offset inside the read window */
+    uint8_t  bit_index;           /**< Bit inside a register for bitfield points */
+    uint8_t  string_length;       /**< Maximum decoded ASCII length */
+    uint8_t  retry_count;
+    uint16_t retry_backoff_ms;
+    semantic_source_t semantic_source;
+    semantic_status_t semantic_status;
+    char     semantic_profile_id[32];
+    uint32_t semantic_profile_version;
+    uint8_t  semantic_confidence;
+    char     semantic_evidence[48];
 } amm_mapping_entry_t;
 
 /* ======================== Validation Result ======================== */
@@ -123,11 +136,19 @@ uint32_t amm_get_model_version(void);
 
 /** Remove every mapping and persist the empty table in one NVS transaction. */
 esp_err_t amm_clear_mappings(void);
+esp_err_t amm_rollback(void);
+bool amm_can_rollback(void);
 
 /** Channel-aware lookup used for mixed RTU/TCP gateways. */
 esp_err_t amm_find_mapping_for_channel(source_protocol_t protocol, uint8_t channel_id,
                                        uint8_t slave_id, uint16_t reg_addr,
                                        amm_mapping_entry_t *out);
+esp_err_t amm_find_mapping_for_object(source_protocol_t protocol, uint8_t channel_id,
+                                      uint8_t slave_id, uint8_t function_code,
+                                      uint16_t address, amm_mapping_entry_t *out);
+esp_err_t amm_find_mapping_covering(uint8_t slave_id, uint8_t function_code,
+                                    uint16_t address, amm_mapping_entry_t *out,
+                                    uint8_t *word_index);
 
 /** Copy a mapping by its stable semantic identity. */
 esp_err_t amm_find_mapping_by_point(const char *device_id, const char *point_id,

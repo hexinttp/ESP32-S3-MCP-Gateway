@@ -32,7 +32,11 @@ static int s_count;
 static uint32_t s_next_id = 1;
 static int64_t s_condition_since[AUTOMATION_MAX_RULES];
 static int64_t s_last_trigger[AUTOMATION_MAX_RULES];
+static bool s_condition_active[AUTOMATION_MAX_RULES];
 static automation_stats_t s_stats;
+static automation_audit_event_t s_audit[AUTOMATION_AUDIT_CAPACITY];
+static uint16_t s_audit_head;
+static uint16_t s_audit_count;
 static SemaphoreHandle_t s_mutex;
 static TaskHandle_t s_task;
 
@@ -145,17 +149,58 @@ esp_err_t automation_delete_rule(uint32_t id)
     return ESP_ERR_NOT_FOUND;
 }
 
-static bool condition_matches(const automation_rule_t *rule, float value)
+static bool condition_matches(const automation_rule_t *rule, float value,
+                              bool was_active)
 {
+    float hysteresis = fmaxf(rule->hysteresis, 0.0f);
     switch (rule->condition_operator) {
-    case RULE_OP_GT: return value > rule->threshold;
-    case RULE_OP_GTE: return value >= rule->threshold;
-    case RULE_OP_LT: return value < rule->threshold;
-    case RULE_OP_LTE: return value <= rule->threshold;
+    case RULE_OP_GT:
+        return was_active ? value > rule->threshold - hysteresis
+                          : value > rule->threshold;
+    case RULE_OP_GTE:
+        return was_active ? value >= rule->threshold - hysteresis
+                          : value >= rule->threshold;
+    case RULE_OP_LT:
+        return was_active ? value < rule->threshold + hysteresis
+                          : value < rule->threshold;
+    case RULE_OP_LTE:
+        return was_active ? value <= rule->threshold + hysteresis
+                          : value <= rule->threshold;
     case RULE_OP_EQ: return fabsf(value - rule->threshold) <= fmaxf(rule->hysteresis, 0.0001f);
     case RULE_OP_NEQ: return fabsf(value - rule->threshold) > fmaxf(rule->hysteresis, 0.0001f);
     default: return false;
     }
+}
+
+static void audit_event(const automation_rule_t *rule, const tcm_context_t *state,
+                        bool success, const char *detail)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    automation_audit_event_t *event = &s_audit[s_audit_head];
+    memset(event, 0, sizeof(*event));
+    event->timestamp_ms = state->timestamp_ms;
+    event->rule_id = rule->id;
+    event->success = success;
+    event->source_value = (float)state->value;
+    strlcpy(event->action,
+            rule->action == RULE_ACTION_WRITE_POINT ? "write_point" : "mqtt_alert",
+            sizeof(event->action));
+    strlcpy(event->detail, detail, sizeof(event->detail));
+    s_audit_head = (s_audit_head + 1U) % AUTOMATION_AUDIT_CAPACITY;
+    if (s_audit_count < AUTOMATION_AUDIT_CAPACITY) ++s_audit_count;
+    xSemaphoreGive(s_mutex);
+}
+
+static bool interlock_allows(const automation_rule_t *rule)
+{
+    if (rule->interlock_device[0] == '\0' || rule->interlock_point[0] == '\0') {
+        return true;
+    }
+    tcm_context_t state;
+    return tcm_state_pool_get(rule->interlock_device, rule->interlock_point,
+                              &state) == ESP_OK &&
+           (state.value != 0.0) == rule->interlock_required_state &&
+           state.quality_state == QUALITY_GOOD;
 }
 
 static esp_err_t execute_rule(const automation_rule_t *rule, const tcm_context_t *state)
@@ -198,15 +243,29 @@ static void automation_task(void *argument)
             tcm_context_t state;
             if (tcm_state_pool_get(rules[i].source_device, rules[i].source_point, &state) != ESP_OK) continue;
             ++s_stats.evaluations;
-            if (!condition_matches(&rules[i], state.value)) {
+            bool matched = condition_matches(&rules[i], (float)state.value,
+                                             s_condition_active[i]);
+            s_condition_active[i] = matched;
+            if (!matched) {
                 s_condition_since[i] = 0;
                 continue;
             }
             if (s_condition_since[i] == 0) s_condition_since[i] = now;
             if (now - s_condition_since[i] < rules[i].hold_ms ||
                 now - s_last_trigger[i] < rules[i].cooldown_ms) continue;
-            if (execute_rule(&rules[i], &state) == ESP_OK) ++s_stats.triggers;
-            else ++s_stats.failures;
+            if (!interlock_allows(&rules[i])) {
+                ++s_stats.failures;
+                audit_event(&rules[i], &state, false, "interlock blocked action");
+                s_last_trigger[i] = now;
+                continue;
+            }
+            if (execute_rule(&rules[i], &state) == ESP_OK) {
+                ++s_stats.triggers;
+                audit_event(&rules[i], &state, true, "action completed");
+            } else {
+                ++s_stats.failures;
+                audit_event(&rules[i], &state, false, "action failed");
+            }
             s_last_trigger[i] = now;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -223,4 +282,18 @@ esp_err_t automation_start(void)
 automation_stats_t automation_get_stats(void)
 {
     return s_stats;
+}
+
+int automation_get_audit(automation_audit_event_t *out, int max_events)
+{
+    if (out == NULL || max_events <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int count = s_audit_count < max_events ? s_audit_count : max_events;
+    uint16_t start = (uint16_t)((s_audit_head + AUTOMATION_AUDIT_CAPACITY -
+                                 s_audit_count) % AUTOMATION_AUDIT_CAPACITY);
+    for (int i = 0; i < count; ++i) {
+        out[i] = s_audit[(start + i) % AUTOMATION_AUDIT_CAPACITY];
+    }
+    xSemaphoreGive(s_mutex);
+    return count;
 }

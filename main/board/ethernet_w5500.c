@@ -149,3 +149,5 @@ void ethernet_w5500_get_ip(char *buffer, size_t size)
         strlcpy(buffer, s_ip, size);
     }
 }
+
+esp_netif_t *ethernet_w5500_get_netif(void) { return s_eth_netif; }

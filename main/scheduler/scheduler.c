@@ -151,7 +151,7 @@ static void modbus_poll_task(void *arg)
         result.register_address = cfg->register_address;
         result.register_count   = modbus_register_count_for_type(cfg->data_type);
         result.data_type        = cfg->data_type;
-        result.raw_value        = 0.0f;
+        result.raw_value        = 0.0;
         result.quality          = QUALITY_INVALID;
         result.valid            = false;
 
@@ -171,14 +171,31 @@ static void modbus_poll_task(void *arg)
 
         uint16_t raw_regs[AMM_MAX_READ_REGISTERS] = {0};
         uint16_t offset = modbus_register_offset(cfg->function_code, read_start);
-        esp_err_t err = modbus_read_channel(cfg->source_protocol, cfg->channel_id,
-                                             cfg->slave_id, cfg->function_code,
-                                             offset, read_count, raw_regs);
+        esp_err_t err = ESP_FAIL;
+        uint8_t attempts = (uint8_t)(cfg->retry_count + 1U);
+        for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+            err = modbus_read_channel(cfg->source_protocol, cfg->channel_id,
+                                      cfg->slave_id, cfg->function_code,
+                                      offset, read_count, raw_regs);
+            if (err == ESP_OK) break;
+            if (attempt + 1U < attempts) {
+                uint32_t delay_ms = cfg->retry_backoff_ms *
+                                    (uint32_t)(attempt + 1U);
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            }
+        }
 
         if (err == ESP_OK) {
-            result.raw_value = modbus_convert_to_float_order(&raw_regs[value_index],
-                                                              cfg->data_type,
-                                                              cfg->byte_order);
+            if (cfg->data_type == DT_ASCII) {
+                uint16_t available = read_count - value_index;
+                modbus_decode_ascii(&raw_regs[value_index], available,
+                                    cfg->byte_order, result.value_text,
+                                    sizeof(result.value_text));
+            } else {
+                result.raw_value = modbus_convert_to_number(
+                    &raw_regs[value_index], cfg->data_type,
+                    cfg->byte_order, cfg->bit_index);
+            }
             result.quality   = QUALITY_GOOD;
             result.valid     = true;
             eval_increment_metric("successful_polls", 1);
@@ -278,6 +295,7 @@ static void context_build_task(void *arg)
         eval_increment_metric("contexts_created", 1);
         ctx.source_protocol = raw.source_protocol;
         ctx.channel_id = raw.channel_id;
+        strlcpy(ctx.value_text, raw.value_text, sizeof(ctx.value_text));
 
         /* Step 2: Enrich context with AMM mapping metadata
          * (device name, point name, unit, measurement name, constraints)

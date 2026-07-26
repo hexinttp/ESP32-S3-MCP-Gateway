@@ -12,7 +12,7 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 
-#define TCM_VERSION "1.0"
+#define TCM_VERSION "1.1"
 #define TCM_SEQUENCE_RESERVATION 32U
 
 static const char *TAG = "TCM";
@@ -28,8 +28,11 @@ static const char *protocol_string(source_protocol_t value)
 
 static const char *data_type_string(data_type_t value)
 {
-    static const char *names[] = {"int16", "uint16", "float32", "int32", "uint32"};
-    return value <= DT_UINT32 ? names[value] : "uint16";
+    static const char *names[] = {
+        "int16", "uint16", "float32", "int32", "uint32", "bool",
+        "int64", "uint64", "float64", "bcd16", "bitfield16", "ascii"
+    };
+    return value <= DT_ASCII ? names[value] : "uint16";
 }
 
 static const char *byte_order_string(byte_order_t value)
@@ -56,6 +59,22 @@ static const char *operation_string(operation_type_t value)
     return value <= OP_READ_ONLY ? names[value] : "read_publish";
 }
 
+static const char *semantic_source_string(semantic_source_t value)
+{
+    static const char *names[] = {
+        "unresolved", "profile", "user", "discovery", "imported"
+    };
+    return value <= SEMANTIC_SOURCE_IMPORTED ? names[value] : "unresolved";
+}
+
+static const char *semantic_status_string(semantic_status_t value)
+{
+    static const char *names[] = {
+        "unresolved", "inferred", "resolved", "verified", "conflict"
+    };
+    return value <= SEMANTIC_STATUS_CONFLICT ? names[value] : "unresolved";
+}
+
 static data_type_t parse_data_type(const char *value)
 {
     if (!value) return DT_UINT16;
@@ -63,7 +82,32 @@ static data_type_t parse_data_type(const char *value)
     if (!strcmp(value, "float32")) return DT_FLOAT32;
     if (!strcmp(value, "int32")) return DT_INT32;
     if (!strcmp(value, "uint32")) return DT_UINT32;
+    if (!strcmp(value, "bool")) return DT_BOOL;
+    if (!strcmp(value, "int64")) return DT_INT64;
+    if (!strcmp(value, "uint64")) return DT_UINT64;
+    if (!strcmp(value, "float64")) return DT_FLOAT64;
+    if (!strcmp(value, "bcd16")) return DT_BCD16;
+    if (!strcmp(value, "bitfield16")) return DT_BITFIELD16;
+    if (!strcmp(value, "ascii")) return DT_ASCII;
     return DT_UINT16;
+}
+
+static semantic_source_t parse_semantic_source(const char *value)
+{
+    if (value && !strcmp(value, "profile")) return SEMANTIC_SOURCE_PROFILE;
+    if (value && !strcmp(value, "user")) return SEMANTIC_SOURCE_USER;
+    if (value && !strcmp(value, "discovery")) return SEMANTIC_SOURCE_DISCOVERY;
+    if (value && !strcmp(value, "imported")) return SEMANTIC_SOURCE_IMPORTED;
+    return SEMANTIC_SOURCE_UNRESOLVED;
+}
+
+static semantic_status_t parse_semantic_status(const char *value)
+{
+    if (value && !strcmp(value, "inferred")) return SEMANTIC_STATUS_INFERRED;
+    if (value && !strcmp(value, "resolved")) return SEMANTIC_STATUS_RESOLVED;
+    if (value && !strcmp(value, "verified")) return SEMANTIC_STATUS_VERIFIED;
+    if (value && !strcmp(value, "conflict")) return SEMANTIC_STATUS_CONFLICT;
+    return SEMANTIC_STATUS_UNRESOLVED;
 }
 
 static byte_order_t parse_byte_order(const char *value)
@@ -122,10 +166,10 @@ void tcm_init(void)
 }
 
 int tcm_build_context(tcm_context_t *ctx, uint8_t slave_id, uint8_t func_code,
-                      uint16_t reg_addr, float raw_value, quality_state_t quality,
+                      uint16_t reg_addr, double raw_value, quality_state_t quality,
                       network_state_t net_state)
 {
-    if (ctx == NULL || slave_id == 0 || (func_code != 3 && func_code != 4)) return -1;
+    if (ctx == NULL || slave_id == 0 || func_code < 1 || func_code > 4) return -1;
     memset(ctx, 0, sizeof(*ctx));
     runtime_config_t config;
     runtime_config_get(&config);
@@ -138,6 +182,7 @@ int tcm_build_context(tcm_context_t *ctx, uint8_t slave_id, uint8_t func_code,
     ctx->source_protocol = SRC_MODBUS_RTU;
     ctx->slave_id = slave_id;
     ctx->function_code = func_code;
+    ctx->object_type = (modbus_object_type_t)func_code;
     ctx->register_address = reg_addr;
     ctx->data_type = DT_UINT16;
     ctx->byte_order = BYTE_ORDER_ABCD;
@@ -145,10 +190,13 @@ int tcm_build_context(tcm_context_t *ctx, uint8_t slave_id, uint8_t func_code,
     ctx->scale_factor = 1.0f;
     ctx->value = raw_value;
     ctx->timestamp_ms = current_time_ms();
+    ctx->timestamp_synchronized = ctx->timestamp_ms > 1609459200000LL;
     ctx->quality_state = quality;
     ctx->network_state = net_state;
     ctx->operation_type = OP_READ_PUBLISH;
     ctx->sequence_id = next_sequence();
+    ctx->semantic_source = SEMANTIC_SOURCE_UNRESOLVED;
+    ctx->semantic_status = SEMANTIC_STATUS_UNRESOLVED;
     return 0;
 }
 
@@ -163,9 +211,11 @@ bool tcm_validate(const tcm_context_t *ctx, tcm_validation_result_t *result)
     if (ctx->device_id[0] == '\0') result->failed_field_mask |= 1U << 1;
     if (ctx->point_id[0] == '\0') result->failed_field_mask |= 1U << 2;
     if (ctx->slave_id == 0 || ctx->slave_id > 247) result->failed_field_mask |= 1U << 4;
-    if (ctx->function_code != 3 && ctx->function_code != 4 &&
-        ctx->function_code != 6 && ctx->function_code != 16) result->failed_field_mask |= 1U << 5;
-    if (ctx->data_type > DT_UINT32) result->failed_field_mask |= 1U << 7;
+    if (ctx->function_code != 1 && ctx->function_code != 2 &&
+        ctx->function_code != 3 && ctx->function_code != 4 &&
+        ctx->function_code != 5 && ctx->function_code != 6 &&
+        ctx->function_code != 15 && ctx->function_code != 16) result->failed_field_mask |= 1U << 5;
+    if (ctx->data_type > DT_ASCII) result->failed_field_mask |= 1U << 7;
     if (ctx->operation_type > OP_READ_ONLY) result->failed_field_mask |= 1U << 14;
     result->passed = result->failed_field_mask == 0;
     if (!result->passed) {
@@ -194,6 +244,7 @@ int tcm_serialize_json(const tcm_context_t *ctx, char *json_buf, size_t buf_size
     cJSON_AddNumberToObject(root, "function_code", ctx->function_code);
     cJSON_AddNumberToObject(root, "register_address", ctx->register_address);
     cJSON_AddStringToObject(root, "data_type", data_type_string(ctx->data_type));
+    cJSON_AddNumberToObject(root, "object_type", ctx->object_type);
     cJSON_AddStringToObject(root, "byte_order", byte_order_string(ctx->byte_order));
     cJSON_AddStringToObject(root, "measurement_name", ctx->measurement_name);
     cJSON_AddStringToObject(root, "unit", ctx->unit);
@@ -201,10 +252,22 @@ int tcm_serialize_json(const tcm_context_t *ctx, char *json_buf, size_t buf_size
     cJSON_AddNumberToObject(root, "scale_factor", ctx->scale_factor);
     cJSON_AddNumberToObject(root, "offset", ctx->offset);
     cJSON_AddNumberToObject(root, "value", ctx->value);
+    if (ctx->value_text[0]) cJSON_AddStringToObject(root, "value_text", ctx->value_text);
     cJSON_AddNumberToObject(root, "timestamp_ms", (double)ctx->timestamp_ms);
     cJSON_AddStringToObject(root, "quality_state", quality_string(ctx->quality_state));
     cJSON_AddStringToObject(root, "network_state", network_string(ctx->network_state));
     cJSON_AddStringToObject(root, "operation_type", operation_string(ctx->operation_type));
+    cJSON_AddStringToObject(root, "semantic_source",
+                            semantic_source_string(ctx->semantic_source));
+    cJSON_AddStringToObject(root, "semantic_status",
+                            semantic_status_string(ctx->semantic_status));
+    cJSON_AddStringToObject(root, "semantic_profile_id", ctx->semantic_profile_id);
+    cJSON_AddNumberToObject(root, "semantic_profile_version",
+                            ctx->semantic_profile_version);
+    cJSON_AddNumberToObject(root, "semantic_confidence", ctx->semantic_confidence);
+    cJSON_AddStringToObject(root, "semantic_evidence", ctx->semantic_evidence);
+    cJSON_AddBoolToObject(root, "timestamp_synchronized",
+                          ctx->timestamp_synchronized);
     cJSON *constraint = cJSON_AddObjectToObject(root, "control_constraint");
     cJSON_AddBoolToObject(constraint, "writable", ctx->control_constraint.writable);
     cJSON_AddNumberToObject(constraint, "min", ctx->control_constraint.valid_range_min);
@@ -234,12 +297,20 @@ int tcm_deserialize_json(const char *json_str, tcm_context_t *ctx)
     copy_json_string(root, "point_id", ctx->point_id, sizeof(ctx->point_id));
     copy_json_string(root, "measurement_name", ctx->measurement_name, sizeof(ctx->measurement_name));
     copy_json_string(root, "unit", ctx->unit, sizeof(ctx->unit));
+    copy_json_string(root, "value_text", ctx->value_text, sizeof(ctx->value_text));
+    copy_json_string(root, "semantic_profile_id", ctx->semantic_profile_id,
+                     sizeof(ctx->semantic_profile_id));
+    copy_json_string(root, "semantic_evidence", ctx->semantic_evidence,
+                     sizeof(ctx->semantic_evidence));
     cJSON *value;
 #define JSON_UINT(field, key) do { value = item(root, key); if (cJSON_IsNumber(value)) ctx->field = value->valuedouble; } while (0)
     JSON_UINT(context_id, "context_id"); JSON_UINT(sequence_id, "sequence_id");
     JSON_UINT(mapping_version, "mapping_version"); JSON_UINT(channel_id, "channel_id");
     JSON_UINT(slave_id, "slave_id"); JSON_UINT(function_code, "function_code");
     JSON_UINT(register_address, "register_address"); JSON_UINT(timestamp_ms, "timestamp_ms");
+    JSON_UINT(object_type, "object_type");
+    JSON_UINT(semantic_profile_version, "semantic_profile_version");
+    JSON_UINT(semantic_confidence, "semantic_confidence");
 #undef JSON_UINT
     value = item(root, "value"); if (cJSON_IsNumber(value)) ctx->value = value->valuedouble;
     value = item(root, "raw_value"); if (cJSON_IsNumber(value)) ctx->raw_value = value->valuedouble;
@@ -249,6 +320,12 @@ int tcm_deserialize_json(const char *json_str, tcm_context_t *ctx)
     ctx->source_protocol = cJSON_IsString(value) && !strcmp(value->valuestring, "MODBUS_TCP") ? SRC_MODBUS_TCP : SRC_MODBUS_RTU;
     value = item(root, "data_type"); ctx->data_type = parse_data_type(cJSON_IsString(value) ? value->valuestring : NULL);
     value = item(root, "byte_order"); ctx->byte_order = parse_byte_order(cJSON_IsString(value) ? value->valuestring : NULL);
+    value = item(root, "semantic_source");
+    ctx->semantic_source = parse_semantic_source(cJSON_IsString(value) ? value->valuestring : NULL);
+    value = item(root, "semantic_status");
+    ctx->semantic_status = parse_semantic_status(cJSON_IsString(value) ? value->valuestring : NULL);
+    value = item(root, "timestamp_synchronized");
+    ctx->timestamp_synchronized = cJSON_IsTrue(value);
     value = item(root, "operation_type");
     ctx->operation_type = cJSON_IsString(value) && !strcmp(value->valuestring, "write") ? OP_WRITE : OP_READ_PUBLISH;
     cJSON *constraint = item(root, "control_constraint");

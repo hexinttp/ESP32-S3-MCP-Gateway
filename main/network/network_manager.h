@@ -10,9 +10,12 @@ typedef struct {
     bool ethernet_ip;
     bool wifi_connected;
     bool config_ap_active;
+    bool ethernet_preferred;
+    uint32_t failover_count;
     char ethernet_address[16];
     char wifi_address[16];
     char config_ap_ssid[33];
+    char active_uplink[12];
 } network_status_t;
 
 esp_err_t network_manager_init(void);

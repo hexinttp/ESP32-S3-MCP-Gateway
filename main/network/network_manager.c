@@ -4,6 +4,7 @@
 #include "board/ethernet_w5500.h"
 #include "config/runtime_config.h"
 #include "esp_event.h"
+#include "esp_eth.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_mac.h"
@@ -16,6 +17,33 @@ static const char *TAG = "NETWORK";
 static network_status_t s_status;
 static SemaphoreHandle_t s_mutex;
 static esp_netif_t *s_sta_netif;
+static bool s_prefer_ethernet;
+
+static void select_uplink(bool ethernet)
+{
+    esp_netif_t *target = ethernet ? ethernet_w5500_get_netif() : s_sta_netif;
+    if (target == NULL || esp_netif_set_default_netif(target) != ESP_OK) return;
+    const char *name = ethernet ? "ethernet" : "wifi";
+    if (strcmp(s_status.active_uplink, name) != 0) {
+        if (s_status.active_uplink[0] != '\0') ++s_status.failover_count;
+        strlcpy(s_status.active_uplink, name, sizeof(s_status.active_uplink));
+        ESP_LOGI(TAG, "Active uplink: %s", name);
+    }
+}
+
+static void route_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)data;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (base == IP_EVENT && id == IP_EVENT_ETH_GOT_IP && s_prefer_ethernet) {
+        select_uplink(true);
+    } else if (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED &&
+               s_status.wifi_connected) {
+        select_uplink(false);
+    }
+    xSemaphoreGive(s_mutex);
+}
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -33,6 +61,9 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         snprintf(s_status.wifi_address, sizeof(s_status.wifi_address),
                  IPSTR, IP2STR(&event->ip_info.ip));
         s_status.wifi_connected = true;
+        if (!s_prefer_ethernet || !ethernet_w5500_has_ip()) {
+            select_uplink(false);
+        }
         ESP_LOGI(TAG, "WiFi address: %s", s_status.wifi_address);
     }
     xSemaphoreGive(s_mutex);
@@ -52,11 +83,21 @@ esp_err_t network_manager_init(void)
 
     runtime_config_t config;
     runtime_config_get(&config);
+    s_prefer_ethernet = config.prefer_ethernet;
+    s_status.ethernet_preferred = s_prefer_ethernet;
 
     err = ethernet_w5500_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "W5500 unavailable; WiFi/AP remains available: %s", esp_err_to_name(err));
     }
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(ETH_EVENT,
+                                                   ETHERNET_EVENT_DISCONNECTED,
+                                                   route_event, NULL),
+                        TAG, "ethernet route event");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT,
+                                                   IP_EVENT_ETH_GOT_IP,
+                                                   route_event, NULL),
+                        TAG, "ethernet ip route event");
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();

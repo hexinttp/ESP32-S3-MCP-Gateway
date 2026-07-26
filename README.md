@@ -4,6 +4,16 @@
 
 当前版本已经在带 16 MB Flash、8 MB PSRAM 的 ESP32-S3 实物开发板上完成烧录，并使用真实 RS485 温湿度传感器、PC 端 RTU 仿真器和 Modbus TCP 仿真器完成设备发现与寄存器读取测试。
 
+本次工业化功能扩展已再次在实板验证：固件可稳定启动并保持运行，WiFi 获取地址 `192.168.100.22`，Web 首页局域网首次响应约 400 ms，配置 API 返回 HTTP 200，北向 MODBUS TCP Server 的 502 端口可连接并返回标准异常响应。未配置有效 MQTT Broker 时 MQTT 保持停用；未插 TF 卡时系统继续使用 SPI Flash 缓存，这两种状态都不会阻塞网关启动。
+
+## 工业化优先级完成情况
+
+| 优先级 | 已实现能力 |
+| --- | --- |
+| P1 协议、语义、可靠性 | MODBUS FC01/02/03/04/05/06/15/16；BOOL、16/32/64 位整数、FLOAT32/FLOAT64、BCD16、位域、ASCII、字节序和块读取；TCM 1.1 语义来源/证据/置信度；AMM 模型版本、对象区冲突检测和一版回滚；配置双槽事务、CRC、轮询重试/退避、任务看门狗复位统计。 |
+| P2 时间、消息、网络、安全、控制 | NTP/时区/时间质量；MQTT TLS 证书包、QoS、持久会话、Retain、LWT 和 UIF 有序回放；W5500/WiFi 主备切换；可选 Bearer 鉴权；HTTPS OTA、镜像 SHA-256、双 OTA 分区和启动回滚；自动化回差、保持、冷却、联锁和审计。 |
+| P3 北向互操作与部署 | 北向 MODBUS TCP Server（FC01-06/15/16）、REST API、MCP 工具接口、运行健康指标和工业硬件部署检查表。Sparkplug B/OPC UA 定位为可选上位机适配器，不在 MCU 固件中伪装为已完成协议栈。 |
+
 ## 研究目标对应关系
 
 | 研究目标 | 固件实现 |
@@ -14,23 +24,24 @@
 
 ## 已实现功能
 
-- MODBUS RTU 主站：FC03、FC04、FC06、FC16，RS485 半双工。
-- MODBUS TCP 主站：最多 8 个运行时 TCP 端点，支持 FC03、FC04、FC06、FC16；名称、IP、端口和超时可在 Web 中增删改并持久化到 NVS，不依赖重新编译。
+- MODBUS RTU/TCP 主站：FC01、FC02、FC03、FC04、FC05、FC06、FC15、FC16，RS485 半双工；TCP 最多 8 个运行时端点。
+- 北向 MODBUS TCP Server：将 AMM/TCM 最新状态暴露为 coils、discrete inputs、holding/input registers，端口和最大客户端数可在 Web 配置。
 - RTU/TCP 设备发现：可选择 RS485 总线或指定 TCP 端点，执行从站扫描、原始寄存器扫描和 AMM 原始映射生成；发现过程严格只读。
 - RTU 自适应探测：支持 FC03/FC04、常用工业寄存器入口和 Modbus 异常响应在线判定；发现后按设备实际寄存器区域继续扫描。
 - 扫描隔离：设备发现期间暂停常规 AMM 轮询，扫描结束后自动恢复，避免两个任务竞争 RS485 总线。
-- 固定 TCM 1.0 JSON 上下文、字段验证、映射版本和掉电安全序列号。
+- 固定 TCM 1.1 JSON 上下文、字段验证、语义来源/版本/证据/置信度、映射版本和掉电安全序列号。
 - 动态 AMM：最多 1000 点，PSRAM 运行表、独立 NVS 持久化、运行时增删改、混合协议/通道寻址和动态轮询计划。
 - AMM 设备模板：Web 批量导入 RTU/TCP 设备语义，配置数据类型、字节序、比例、偏移、单位、量程和点位名称，将原始寄存器转换为工程值。
-- AMM 运维：映射表支持一次清空全部点位，并显示正常、等待首次轮询、读取失败和数据过期状态。
+- AMM 运维：映射表支持清空、事务导入、一版回滚和对象区冲突检测，并显示正常、等待首次轮询、读取失败和数据过期状态。
 - 公平轮询：最久未轮询点优先，优先级用于同等条件排序，避免前部 RTU 点或高优先级点长期阻塞后部 RTU/TCP 点。
-- MQTT 上行和受控下行；所有 MQTT、Web、MCP 和自动化写入共用 AMM 权限/量程边界。
+- MQTT TLS/QoS/持久会话/Retain/LWT 上行和受控下行；所有 MQTT、Web、MCP、北向 MODBUS TCP 和自动化写入共用 AMM 权限/量程边界。
 - UIF 离线恢复：13 MB SPI Flash FAT 队列优先，TF 卡溢出，PUBACK 后删除。
 - TF 历史：按序列分片保存 JSONL；空间不足时删除最早历史文件。
-- 自动化规则：Web 配置条件、保持时间、冷却时间、写点或 MQTT 告警动作；规则保存在 NVS。
-- Web 配置：中文/English 一键切换，无登录认证；配置 AP 与已有网络接口均可访问；设备结果和通信日志使用低内存流式传输。
+- 自动化规则：Web 配置阈值、回差、保持、冷却、点位联锁、写点或 MQTT 告警动作；规则保存在 NVS，并保留最近 64 条执行审计。
+- Web 配置：中文/English 一键切换；默认不启用认证，可选 Bearer Token；配置 AP 与已有网络接口均可访问；设备结果和通信日志使用低内存流式传输。
 - LCD 状态菜单：网络、MQTT、TCM/AMM/UIF、TF 和配置 AP 状态轮播。
-- W5500 以太网优先，Wi-Fi STA 备用，同时保留配置 AP。
+- W5500 以太网优先，链路断开后自动切换 Wi-Fi STA，同时保留配置 AP，并记录出口与切换次数。
+- NTP 时间同步、时间质量标记、运行健康指标、HTTPS OTA、镜像哈希校验和失败回滚。
 - MCP JSON-RPC 工具入口：`POST /mcp`。
 - 运行指标：轮询、TCM 验证、MQTT、缓存、回放、命令和数据丢失计数。
 
@@ -82,11 +93,15 @@ MAX3485 的 A/B/GND 分别连接到传感器或 USB-RS485 模块的 A/B/GND。�
 | --- | --- | --- | --- |
 | `nvs` | `0x9000` | 152 KB | 运行配置、规则、TCM 序列保留 |
 | `phy_init` | `0x2F000` | 4 KB | PHY 数据 |
-| `factory` | `0x30000` | `0x1D0000` | 固件 |
-| `amm_nvs` | `0x200000` | 1 MB | 1000 点 AMM 映射独立 NVS |
-| `cache` | `0x300000` | 13 MB | SPI Flash UIF 离线队列 |
+| `otadata` | `0x30000` | 8 KB | OTA 启动选择与回滚状态 |
+| `ota_0` | `0x40000` | `0x1D0000` | 当前/候选固件 A |
+| `ota_1` | `0x210000` | `0x1D0000` | 当前/候选固件 B |
+| `amm_nvs` | `0x3E0000` | 1 MB | 1000 点 AMM 映射与回滚快照 |
+| `cache` | `0x4E0000` | `0xB20000` | SPI Flash UIF 离线队列 |
 
-当前构建固件约 1.21 MiB，应用分区仍有约 33% 空间。
+当前构建固件约 1.47 MiB，单个 OTA 应用分区仍有约 19% 空间。
+
+从旧的单应用分区版本首次升级到该双 OTA 分区表时，`amm_nvs` 会按新布局初始化，原映射需要重新导入或通过设备发现重新应用一次。之后的普通 OTA 更新会保留 NVS、AMM 映射和离线缓存。
 
 ## 构建
 
@@ -209,13 +224,13 @@ curl -X POST http://<gateway-ip>/api/discover/scan \
 
 对于 RTU，目标从站返回合法 Modbus 异常可以证明该地址上存在设备；对于 TCP，服务器或网关可能对不存在的 Unit ID 统一返回异常 `0x0B`。因此 TCP 发现只有成功读取到寄存器数据才判定设备在线，避免把服务器异常响应误报为设备。
 
-## TCM 1.0 固定格式
+## TCM 1.1 固定格式
 
 主要字段包括：
 
 ```json
 {
-  "tcm_version": "1.0",
+  "tcm_version": "1.1",
   "gateway_id": "esp32s3_gateway_01",
   "context_id": 1,
   "sequence_id": 1,
@@ -231,6 +246,12 @@ curl -X POST http://<gateway-ip>/api/discover/scan \
   "byte_order": "ABCD",
   "measurement_name": "Motor temperature",
   "unit": "degC",
+  "semantic_source": "profile",
+  "semantic_status": "verified",
+  "semantic_profile_id": "sht20_rtu",
+  "semantic_profile_version": 1,
+  "semantic_confidence": 100,
+  "semantic_evidence": "vendor profile match",
   "raw_value": 72.5,
   "scale_factor": 1.0,
   "offset": 0.0,
@@ -246,6 +267,8 @@ curl -X POST http://<gateway-ip>/api/discover/scan \
   }
 }
 ```
+
+TCM JSON 使用可机读的 UCUM 风格单位 `degC`；中文 Web 显示层将其格式化为 `℃`。二者数值含义一致，避免把界面符号混入跨系统交换格式。
 
 ## MCP 工具接口
 
@@ -284,6 +307,7 @@ curl -X POST http://<gateway-ip>/api/discover/scan \
 | `GET/PUT /api/modbus/config` | RTU 和 TCP endpoint 配置 |
 | `GET/POST /api/mappings`、`PUT/DELETE /api/mappings/:index` | AMM 动态映射 |
 | `DELETE /api/mappings` | 一次清空全部 AMM 映射和运行点位状态 |
+| `POST /api/mappings/rollback` | 回滚到上一个 AMM 模型快照 |
 | `POST /api/mappings/import` | 批量导入设备语义模板并持久化 |
 | `POST /api/discover/scan` | 后台设备/寄存器扫描 |
 | `GET /api/discover/status` | 扫描进度和汇总 |
@@ -291,6 +315,10 @@ curl -X POST http://<gateway-ip>/api/discover/scan \
 | `POST /api/discover/apply` | 将发现结果应用到 AMM |
 | `GET/DELETE /api/modbus/logs` | 查询或清空 RTU TX/RX 原始通信日志 |
 | `GET/POST/DELETE /api/automation/rules` | 离线自动化规则 |
+| `GET /api/automation/audit` | 自动化执行与联锁审计 |
+| `GET/PUT /api/time/config` | NTP、时区和同步周期 |
+| `GET/PUT /api/security/config` | 可选 Web 鉴权和 OTA 安全策略 |
+| `GET /api/ota/status`、`POST /api/ota/start` | HTTPS OTA 状态与启动 |
 | `GET /api/system/status` | 运行状态与研究指标 |
 
 ## 目录结构

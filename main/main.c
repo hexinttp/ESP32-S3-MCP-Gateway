@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "modbus/modbus_access.h"
 #include "modbus/modbus_discover.h"
+#include "modbus/modbus_tcp_server.h"
 #include "mqtt_comm/mqtt_handler.h"
 #include "network/network_manager.h"
 #include "nvs_flash.h"
@@ -22,6 +23,9 @@
 #include "tcm/tcm_context.h"
 #include "tcm/tcm_state_pool.h"
 #include "services/control_service.h"
+#include "services/time_service.h"
+#include "services/health_service.h"
+#include "services/ota_service.h"
 #include "uif/uif_persistence.h"
 #include "web/web_server.h"
 #include "esp_log.h"
@@ -138,6 +142,7 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP32-S3 TCM/AMM/UIF gateway starting");
     init_nvs();
     ESP_ERROR_CHECK(runtime_config_init());
+    ESP_ERROR_CHECK(health_service_init());
     ESP_ERROR_CHECK(board_init());
     runtime_config_t config;
     runtime_config_get(&config);
@@ -147,6 +152,8 @@ void app_main(void)
     }
     if (config.tf_enabled) tf_storage_mount();
     ESP_ERROR_CHECK(network_manager_init());
+    ESP_ERROR_CHECK(time_service_init());
+    ESP_ERROR_CHECK(ota_service_init());
 
     tcm_init();
     amm_init();
@@ -181,6 +188,7 @@ void app_main(void)
              config.gateway_id);
     mqtt_subscribe(command_topic, 1, mqtt_command_callback);
     ESP_ERROR_CHECK(web_server_start(80));
+    ESP_ERROR_CHECK(modbus_tcp_server_start());
     scheduler_start();
     ESP_ERROR_CHECK(automation_start());
     if (config.lcd_enabled && board_get_status()->lcd_ready) {

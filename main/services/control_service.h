@@ -16,7 +16,7 @@ typedef struct {
 } control_result_t;
 
 esp_err_t control_service_write_point(const char *device_id, const char *point_id,
-                                      float engineering_value, control_source_t source,
+                                      double engineering_value, control_source_t source,
                                       control_result_t *result);
 
 #endif

@@ -17,6 +17,7 @@
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 #include "config/runtime_config.h"
 
 /* ======================== Logging Tag ======================== */
@@ -181,6 +182,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
         }
         mqtt_unlock();
+        runtime_config_t runtime;
+        runtime_config_get(&runtime);
+        if (runtime.mqtt.lwt_enabled && runtime.mqtt.lwt_topic[0] != '\0') {
+            esp_mqtt_client_publish(client, runtime.mqtt.lwt_topic, "online", 0,
+                                    runtime.mqtt.lwt_qos,
+                                    runtime.mqtt.lwt_retain);
+        }
         break;
     }
 
@@ -275,6 +283,8 @@ void mqtt_init(void)
         return;
     }
 
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
 #if ONENET_ENABLED
     s_mqtt_mode   = MQTT_MODE_ONENET;
     s_broker_uri  = ONENET_MQTT_BROKER_URI;
@@ -285,8 +295,6 @@ void mqtt_init(void)
              ONENET_PRODUCT_ID, ONENET_DEVICE_ID);
 #else
     s_mqtt_mode   = MQTT_MODE_STANDARD;
-    runtime_config_t runtime;
-    runtime_config_get(&runtime);
     if (!runtime.mqtt.enabled) {
         ESP_LOGW(TAG, "MQTT is disabled by runtime configuration");
         return;
@@ -333,12 +341,22 @@ void mqtt_init(void)
             .address = {
                 .uri = s_broker_uri,
             },
+            .verification = {
+                .crt_bundle_attach = esp_crt_bundle_attach,
+            },
         },
         .credentials = {
             .client_id = s_client_id,
         },
         .session = {
-            .keepalive = MQTT_KEEPALIVE_SEC,
+            .keepalive = runtime.mqtt.keepalive_sec,
+            .disable_clean_session = !runtime.mqtt.clean_session,
+            .last_will = {
+                .topic = runtime.mqtt.lwt_enabled ? runtime.mqtt.lwt_topic : NULL,
+                .msg = runtime.mqtt.lwt_enabled ? runtime.mqtt.lwt_payload : NULL,
+                .qos = runtime.mqtt.lwt_qos,
+                .retain = runtime.mqtt.lwt_retain,
+            },
         },
         .network = {
             .timeout_ms = MQTT_PUBLISH_TIMEOUT_MS,
@@ -400,8 +418,10 @@ esp_err_t mqtt_publish(const char *topic, const char *payload, int qos)
 
     int payload_len = (int)strlen(payload);
 
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
     int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload,
-                                         payload_len, qos, 0);
+                                         payload_len, qos, runtime.mqtt.retain);
 
     mqtt_lock();
     if (msg_id >= 0) {
@@ -425,7 +445,10 @@ esp_err_t mqtt_publish_tracked(const char *topic, const char *payload, int qos, 
     if (!s_initialized || s_mqtt_client == NULL || topic == NULL || payload == NULL || qos < 1) {
         return ESP_ERR_INVALID_ARG;
     }
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, qos, 0);
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, qos,
+                                         runtime.mqtt.retain);
     if (msg_id < 0) return ESP_FAIL;
 
     mqtt_lock();

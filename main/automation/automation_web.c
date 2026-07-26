@@ -46,6 +46,10 @@ static void add_rule_json(cJSON *array, const automation_rule_t *rule)
     cJSON_AddNumberToObject(item, "hysteresis", rule->hysteresis);
     cJSON_AddNumberToObject(item, "hold_ms", rule->hold_ms);
     cJSON_AddNumberToObject(item, "cooldown_ms", rule->cooldown_ms);
+    cJSON_AddStringToObject(item, "interlock_device", rule->interlock_device);
+    cJSON_AddStringToObject(item, "interlock_point", rule->interlock_point);
+    cJSON_AddBoolToObject(item, "interlock_required_state",
+                          rule->interlock_required_state);
     cJSON_AddNumberToObject(item, "action", rule->action);
     cJSON_AddStringToObject(item, "target_device", rule->target_device);
     cJSON_AddStringToObject(item, "target_point", rule->target_point);
@@ -100,6 +104,12 @@ static esp_err_t rules_post(httpd_req_t *req)
     rule.hysteresis = (float)number(root, "hysteresis", 0);
     rule.hold_ms = (uint32_t)number(root, "hold_ms", 0);
     rule.cooldown_ms = (uint32_t)number(root, "cooldown_ms", 1000);
+    copy_string(root, "interlock_device", rule.interlock_device,
+                sizeof(rule.interlock_device));
+    copy_string(root, "interlock_point", rule.interlock_point,
+                sizeof(rule.interlock_point));
+    cJSON *interlock_state = cJSON_GetObjectItem(root, "interlock_required_state");
+    rule.interlock_required_state = cJSON_IsTrue(interlock_state);
     rule.action = (automation_action_t)(int)number(root, "action", RULE_ACTION_MQTT_ALERT);
     copy_string(root, "target_device", rule.target_device, sizeof(rule.target_device));
     copy_string(root, "target_point", rule.target_point, sizeof(rule.target_point));
@@ -114,6 +124,25 @@ static esp_err_t rules_post(httpd_req_t *req)
     cJSON_AddStringToObject(response, "status", "ok");
     cJSON_AddNumberToObject(response, "id", id);
     return send_json(req, response);
+}
+
+static esp_err_t audit_get(httpd_req_t *req)
+{
+    automation_audit_event_t events[AUTOMATION_AUDIT_CAPACITY];
+    int count = automation_get_audit(events, AUTOMATION_AUDIT_CAPACITY);
+    cJSON *root = cJSON_CreateArray();
+    for (int i = 0; i < count; ++i) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "timestamp_ms",
+                                (double)events[i].timestamp_ms);
+        cJSON_AddNumberToObject(item, "rule_id", events[i].rule_id);
+        cJSON_AddBoolToObject(item, "success", events[i].success);
+        cJSON_AddNumberToObject(item, "source_value", events[i].source_value);
+        cJSON_AddStringToObject(item, "action", events[i].action);
+        cJSON_AddStringToObject(item, "detail", events[i].detail);
+        cJSON_AddItemToArray(root, item);
+    }
+    return send_json(req, root);
 }
 
 static esp_err_t rules_delete(httpd_req_t *req)
@@ -132,7 +161,9 @@ esp_err_t automation_web_register(httpd_handle_t server)
     const httpd_uri_t get = {.uri = "/api/automation/rules", .method = HTTP_GET, .handler = rules_get};
     const httpd_uri_t post = {.uri = "/api/automation/rules", .method = HTTP_POST, .handler = rules_post};
     const httpd_uri_t del = {.uri = "/api/automation/rules/*", .method = HTTP_DELETE, .handler = rules_delete};
+    const httpd_uri_t audit = {.uri = "/api/automation/audit", .method = HTTP_GET, .handler = audit_get};
     esp_err_t err = httpd_register_uri_handler(server, &get);
     if (err == ESP_OK) err = httpd_register_uri_handler(server, &post);
-    return err == ESP_OK ? httpd_register_uri_handler(server, &del) : err;
+    if (err == ESP_OK) err = httpd_register_uri_handler(server, &del);
+    return err == ESP_OK ? httpd_register_uri_handler(server, &audit) : err;
 }

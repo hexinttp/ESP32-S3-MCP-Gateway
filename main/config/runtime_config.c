@@ -1,21 +1,60 @@
 #include "runtime_config.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "esp_check.h"
 #include "gateway_config.h"
 
 #define CONFIG_NVS_NAMESPACE "gateway"
-#define CONFIG_NVS_KEY "runtime"
+#define CONFIG_NVS_KEY_LEGACY "runtime"
+#define CONFIG_NVS_KEY_A "runtime_a"
+#define CONFIG_NVS_KEY_B "runtime_b"
+#define CONFIG_NVS_KEY_ACTIVE "runtime_active"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t generation;
+    uint32_t crc32;
+    runtime_config_t config;
+} stored_config_t;
+
+typedef struct {
+    bool enabled;
+    char uri[128];
+    char client_id[48];
+    char username[64];
+    char password[96];
+    char data_prefix[64];
+    char command_prefix[64];
+    uint16_t keepalive_sec;
+    uint8_t qos;
+} runtime_mqtt_config_v1_t;
+
+typedef struct {
+    uint32_t schema_version;
+    char gateway_id[48];
+    ui_locale_t locale;
+    bool prefer_ethernet;
+    bool lcd_enabled;
+    bool tf_enabled;
+    bool mcp_write_enabled;
+    runtime_wifi_config_t wifi;
+    runtime_mqtt_config_v1_t mqtt;
+    runtime_modbus_rtu_config_t modbus_rtu;
+    runtime_modbus_tcp_endpoint_t tcp_endpoints[RUNTIME_MAX_TCP_ENDPOINTS];
+    uint8_t tcp_endpoint_count;
+} runtime_config_v1_t;
 
 typedef struct {
     uint32_t magic;
     uint32_t crc32;
-    runtime_config_t config;
-} stored_config_t;
+    runtime_config_v1_t config;
+} stored_config_v1_t;
 
 static const char *TAG = "CONFIG";
 static const uint32_t CONFIG_MAGIC = 0x47435731U;
@@ -56,10 +95,60 @@ static void load_defaults(runtime_config_t *cfg)
     strlcpy(cfg->mqtt.command_prefix, MQTT_CMD_TOPIC_PREFIX, sizeof(cfg->mqtt.command_prefix));
     cfg->mqtt.keepalive_sec = MQTT_KEEPALIVE_SEC;
     cfg->mqtt.qos = 1;
+    cfg->mqtt.clean_session = false;
+    cfg->mqtt.retain = false;
+    cfg->mqtt.lwt_enabled = true;
+    snprintf(cfg->mqtt.lwt_topic, sizeof(cfg->mqtt.lwt_topic),
+             "gateway/%s/status", cfg->gateway_id);
+    strlcpy(cfg->mqtt.lwt_payload, "offline", sizeof(cfg->mqtt.lwt_payload));
+    cfg->mqtt.lwt_qos = 1;
+    cfg->mqtt.lwt_retain = true;
     cfg->modbus_rtu.enabled = true;
     cfg->modbus_rtu.baud_rate = MODBUS_RTU_BAUD_RATE;
     cfg->modbus_rtu.parity = 0;
     cfg->modbus_rtu.timeout_ms = MODBUS_TIMEOUT_MS;
+    cfg->time.enabled = true;
+    strlcpy(cfg->time.server1, "pool.ntp.org", sizeof(cfg->time.server1));
+    strlcpy(cfg->time.server2, "time.cloudflare.com", sizeof(cfg->time.server2));
+    strlcpy(cfg->time.timezone, "CST-8", sizeof(cfg->time.timezone));
+    cfg->time.sync_interval_ms = 3600000;
+    cfg->security.auth_enabled = false;
+    cfg->security.ota_enabled = true;
+    cfg->security.ota_allow_http = false;
+    cfg->modbus_tcp_server.enabled = true;
+    cfg->modbus_tcp_server.port = 502;
+    cfg->modbus_tcp_server.max_clients = 4;
+    cfg->modbus_tcp_server.response_timeout_ms = 1000;
+    strlcpy(cfg->northbound.sparkplug_group, "ESP32_Gateways",
+            sizeof(cfg->northbound.sparkplug_group));
+    strlcpy(cfg->northbound.sparkplug_node, cfg->gateway_id,
+            sizeof(cfg->northbound.sparkplug_node));
+    strlcpy(cfg->northbound.sparkplug_device, "modbus",
+            sizeof(cfg->northbound.sparkplug_device));
+}
+
+esp_err_t runtime_config_validate(const runtime_config_t *config,
+                                  char *reason, size_t reason_size)
+{
+    const char *error = NULL;
+    if (config == NULL) error = "configuration is null";
+    else if (config->schema_version != RUNTIME_CONFIG_SCHEMA_VERSION) error = "schema version mismatch";
+    else if (config->gateway_id[0] == '\0') error = "gateway ID is required";
+    else if (config->tcp_endpoint_count > RUNTIME_MAX_TCP_ENDPOINTS) error = "too many TCP endpoints";
+    else if (config->mqtt.qos > 2 || config->mqtt.lwt_qos > 2) error = "MQTT QoS must be 0..2";
+    else if (config->modbus_rtu.baud_rate < 1200 ||
+             config->modbus_rtu.baud_rate > 1000000) error = "invalid RTU baud rate";
+    else if (config->modbus_rtu.timeout_ms < 20 ||
+             config->modbus_rtu.timeout_ms > 30000) error = "invalid RTU timeout";
+    else if (config->modbus_tcp_server.enabled &&
+             config->modbus_tcp_server.port == 0) error = "invalid Modbus TCP server port";
+    else if (config->security.auth_enabled &&
+             (config->security.username[0] == '\0' ||
+              strlen(config->security.password_sha256) != 64)) error = "web authentication credentials are incomplete";
+    if (reason != NULL && reason_size > 0) {
+        strlcpy(reason, error != NULL ? error : "ok", reason_size);
+    }
+    return error == NULL ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
 static esp_err_t save_locked(void)
@@ -67,6 +156,7 @@ static esp_err_t save_locked(void)
     stored_config_t *stored = calloc(1, sizeof(*stored));
     if (stored == NULL) return ESP_ERR_NO_MEM;
     stored->magic = CONFIG_MAGIC;
+    stored->generation = 1;
     stored->config = s_config;
     stored->crc32 = crc32_bytes((const uint8_t *)&stored->config, sizeof(stored->config));
     nvs_handle_t nvs;
@@ -75,11 +165,41 @@ static esp_err_t save_locked(void)
         free(stored);
         return err;
     }
-    err = nvs_set_blob(nvs, CONFIG_NVS_KEY, stored, sizeof(*stored));
+    uint8_t active = 0;
+    (void)nvs_get_u8(nvs, CONFIG_NVS_KEY_ACTIVE, &active);
+    const char *target = active == 0 ? CONFIG_NVS_KEY_B : CONFIG_NVS_KEY_A;
+    stored_config_t *old = calloc(1, sizeof(*old));
+    const char *active_key = active == 0 ? CONFIG_NVS_KEY_A : CONFIG_NVS_KEY_B;
+    size_t old_size = old != NULL ? sizeof(*old) : 0;
+    if (old != NULL &&
+        nvs_get_blob(nvs, active_key, old, &old_size) == ESP_OK &&
+        old_size == sizeof(*old)) {
+        stored->generation = old->generation + 1;
+    }
+    free(old);
+    err = nvs_set_blob(nvs, target, stored, sizeof(*stored));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    if (err == ESP_OK) {
+        active = active == 0 ? 1 : 0;
+        err = nvs_set_u8(nvs, CONFIG_NVS_KEY_ACTIVE, active);
+    }
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     free(stored);
     return err;
+}
+
+static bool stored_config_valid(const stored_config_t *stored, size_t size)
+{
+    if (stored == NULL || size != sizeof(*stored) ||
+        stored->magic != CONFIG_MAGIC ||
+        stored->config.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION) {
+        return false;
+    }
+    uint32_t crc = crc32_bytes((const uint8_t *)&stored->config,
+                               sizeof(stored->config));
+    return stored->crc32 == crc &&
+           runtime_config_validate(&stored->config, NULL, 0) == ESP_OK;
 }
 
 esp_err_t runtime_config_init(void)
@@ -88,28 +208,73 @@ esp_err_t runtime_config_init(void)
     if (s_mutex == NULL) return ESP_ERR_NO_MEM;
 
     load_defaults(&s_config);
-    stored_config_t *stored = calloc(1, sizeof(*stored));
-    if (stored == NULL) return ESP_ERR_NO_MEM;
-    size_t size = sizeof(*stored);
+    stored_config_t *slots = calloc(2, sizeof(*slots));
+    if (slots == NULL) return ESP_ERR_NO_MEM;
+    size_t sizes[2] = {sizeof(slots[0]), sizeof(slots[1])};
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_OK) {
-        err = nvs_get_blob(nvs, CONFIG_NVS_KEY, stored, &size);
-        nvs_close(nvs);
-    }
-    uint32_t crc = 0;
-    if (err == ESP_OK && size == sizeof(*stored)) {
-        crc = crc32_bytes((const uint8_t *)&stored->config, sizeof(stored->config));
-    }
-    if (err == ESP_OK && size == sizeof(*stored) && stored->magic == CONFIG_MAGIC &&
-        stored->crc32 == crc && stored->config.schema_version == RUNTIME_CONFIG_SCHEMA_VERSION) {
-        s_config = stored->config;
-        free(stored);
-        ESP_LOGI(TAG, "Runtime configuration loaded from NVS");
-        return ESP_OK;
-    }
+        esp_err_t err_a = nvs_get_blob(nvs, CONFIG_NVS_KEY_A, &slots[0], &sizes[0]);
+        esp_err_t err_b = nvs_get_blob(nvs, CONFIG_NVS_KEY_B, &slots[1], &sizes[1]);
+        bool valid_a = err_a == ESP_OK && stored_config_valid(&slots[0], sizes[0]);
+        bool valid_b = err_b == ESP_OK && stored_config_valid(&slots[1], sizes[1]);
+        if (valid_a || valid_b) {
+            stored_config_t *selected = valid_b &&
+                (!valid_a || slots[1].generation > slots[0].generation)
+                ? &slots[1] : &slots[0];
+            s_config = selected->config;
+            nvs_close(nvs);
+            ESP_LOGI(TAG, "Transactional runtime configuration loaded (generation=%lu)",
+                     (unsigned long)selected->generation);
+            free(slots);
+            return ESP_OK;
+        }
 
-    free(stored);
+        stored_config_v1_t *legacy = calloc(1, sizeof(*legacy));
+        size_t legacy_size = legacy != NULL ? sizeof(*legacy) : 0;
+        err = legacy == NULL ? ESP_ERR_NO_MEM :
+            nvs_get_blob(nvs, CONFIG_NVS_KEY_LEGACY, legacy, &legacy_size);
+        nvs_close(nvs);
+        if (err == ESP_OK && legacy_size == sizeof(*legacy) &&
+            legacy->magic == CONFIG_MAGIC &&
+            legacy->crc32 == crc32_bytes((const uint8_t *)&legacy->config,
+                                         sizeof(legacy->config)) &&
+            legacy->config.schema_version == 1) {
+            s_config.locale = legacy->config.locale;
+            s_config.prefer_ethernet = legacy->config.prefer_ethernet;
+            s_config.lcd_enabled = legacy->config.lcd_enabled;
+            s_config.tf_enabled = legacy->config.tf_enabled;
+            s_config.mcp_write_enabled = legacy->config.mcp_write_enabled;
+            s_config.wifi = legacy->config.wifi;
+            s_config.modbus_rtu = legacy->config.modbus_rtu;
+            s_config.tcp_endpoint_count = legacy->config.tcp_endpoint_count;
+            memcpy(s_config.tcp_endpoints, legacy->config.tcp_endpoints,
+                   sizeof(s_config.tcp_endpoints));
+            strlcpy(s_config.gateway_id, legacy->config.gateway_id,
+                    sizeof(s_config.gateway_id));
+            s_config.mqtt.enabled = legacy->config.mqtt.enabled;
+            strlcpy(s_config.mqtt.uri, legacy->config.mqtt.uri,
+                    sizeof(s_config.mqtt.uri));
+            strlcpy(s_config.mqtt.client_id, legacy->config.mqtt.client_id,
+                    sizeof(s_config.mqtt.client_id));
+            strlcpy(s_config.mqtt.username, legacy->config.mqtt.username,
+                    sizeof(s_config.mqtt.username));
+            strlcpy(s_config.mqtt.password, legacy->config.mqtt.password,
+                    sizeof(s_config.mqtt.password));
+            strlcpy(s_config.mqtt.data_prefix, legacy->config.mqtt.data_prefix,
+                    sizeof(s_config.mqtt.data_prefix));
+            strlcpy(s_config.mqtt.command_prefix, legacy->config.mqtt.command_prefix,
+                    sizeof(s_config.mqtt.command_prefix));
+            s_config.mqtt.keepalive_sec = legacy->config.mqtt.keepalive_sec;
+            s_config.mqtt.qos = legacy->config.mqtt.qos;
+            free(legacy);
+            free(slots);
+            ESP_LOGI(TAG, "Migrated runtime configuration schema v1 to v2");
+            return save_locked();
+        }
+        free(legacy);
+    }
+    free(slots);
     ESP_LOGW(TAG, "Using default runtime configuration");
     return save_locked();
 }
@@ -132,13 +297,13 @@ ui_locale_t runtime_config_get_locale(void)
 
 esp_err_t runtime_config_set(const runtime_config_t *config)
 {
-    if (config == NULL || config->schema_version != RUNTIME_CONFIG_SCHEMA_VERSION ||
-        config->tcp_endpoint_count > RUNTIME_MAX_TCP_ENDPOINTS) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    ESP_RETURN_ON_ERROR(runtime_config_validate(config, NULL, 0),
+                        TAG, "runtime config validation");
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    runtime_config_t previous = s_config;
     s_config = *config;
     esp_err_t err = save_locked();
+    if (err != ESP_OK) s_config = previous;
     xSemaphoreGive(s_mutex);
     return err;
 }

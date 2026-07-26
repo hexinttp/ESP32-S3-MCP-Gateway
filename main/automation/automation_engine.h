@@ -7,6 +7,7 @@
 #include "gateway_config.h"
 
 #define AUTOMATION_MAX_RULES 16
+#define AUTOMATION_AUDIT_CAPACITY 64
 
 typedef enum {
     RULE_OP_GT = 0, RULE_OP_GTE, RULE_OP_LT, RULE_OP_LTE, RULE_OP_EQ, RULE_OP_NEQ
@@ -28,6 +29,9 @@ typedef struct {
     float hysteresis;
     uint32_t hold_ms;
     uint32_t cooldown_ms;
+    char interlock_device[AMM_MAX_DEVICE_NAME_LEN];
+    char interlock_point[AMM_MAX_POINT_NAME_LEN];
+    bool interlock_required_state;
     automation_action_t action;
     char target_device[AMM_MAX_DEVICE_NAME_LEN];
     char target_point[AMM_MAX_POINT_NAME_LEN];
@@ -42,11 +46,21 @@ typedef struct {
     uint32_t failures;
 } automation_stats_t;
 
+typedef struct {
+    int64_t timestamp_ms;
+    uint32_t rule_id;
+    bool success;
+    float source_value;
+    char action[32];
+    char detail[96];
+} automation_audit_event_t;
+
 esp_err_t automation_init(void);
 esp_err_t automation_start(void);
 int automation_get_rules(automation_rule_t *out, int max_rules);
 esp_err_t automation_upsert_rule(const automation_rule_t *rule, uint32_t *assigned_id);
 esp_err_t automation_delete_rule(uint32_t id);
 automation_stats_t automation_get_stats(void);
+int automation_get_audit(automation_audit_event_t *out, int max_events);
 
 #endif

@@ -42,7 +42,7 @@ extern "C" {
  */
 typedef struct {
     uint16_t    register_address;
-    uint8_t     function_code;      /**< 03 = holding, 04 = input */
+    uint8_t     function_code;      /**< 01/02 bits, 03/04 registers */
     uint16_t    raw_value;          /**< Unscaled 16-bit sample */
     data_type_t inferred_type;      /**< Best-guess data type */
     float       sample_value;       /**< Value read during scan */
@@ -65,6 +65,9 @@ typedef struct {
     char     device_id[32];         /**< Auto-generated, e.g. "device_slave_01" */
     char     name[48];              /**< User-editable display name */
     char     description[64];       /**< User-editable description */
+    char     vendor_name[48];
+    char     product_code[48];
+    char     revision[32];
     char     mqtt_topic_prefix[64]; /**< MQTT topic prefix for this device */
     uint8_t  probe_function_code;   /**< Function code that proved device liveness */
     uint16_t probe_address;         /**< Address used by the successful probe */
@@ -118,7 +121,7 @@ typedef struct {
     uint16_t reg_end;               /**< Last register address (default: 40100) */
     source_protocol_t source_protocol; /**< MODBUS RTU or TCP */
     uint8_t  channel_id;            /**< TCP endpoint id; RTU uses 0 */
-    uint8_t  function_codes[2];     /**< FC list: {0x03, 0x04} */
+    uint8_t  function_codes[4];     /**< FC list: {0x01, 0x02, 0x03, 0x04} */
     uint8_t  fc_count;              /**< Number of function codes */
     uint8_t  max_empty_gap;         /**< Stop after N empty addresses after first data */
 } discover_scan_params_t;

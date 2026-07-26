@@ -32,10 +32,17 @@ typedef struct {
     uint16_t        register_address;   /**< Starting register address       */
     uint16_t        register_count;     /**< Number of registers read        */
     data_type_t     data_type;          /**< Interpretation of raw bytes     */
-    float           raw_value;          /**< Converted floating-point value  */
+    double          raw_value;          /**< Converted numeric value         */
+    char            value_text[32];     /**< Decoded text for DT_ASCII       */
     quality_state_t quality;            /**< Data quality indicator          */
     bool            valid;              /**< true when read succeeded        */
 } modbus_read_result_t;
+
+typedef struct {
+    char vendor_name[48];
+    char product_code[48];
+    char revision[32];
+} modbus_device_identity_t;
 
 /* ======================== Initialisation ======================== */
 
@@ -88,6 +95,11 @@ esp_err_t modbus_read_input_register(uint8_t slave_id,
                                      uint16_t reg_count,
                                      uint16_t *raw_regs);
 
+esp_err_t modbus_read_coils(uint8_t slave_id, uint16_t address,
+                            uint16_t count, uint16_t *values);
+esp_err_t modbus_read_discrete_inputs(uint8_t slave_id, uint16_t address,
+                                      uint16_t count, uint16_t *values);
+
 /* ======================== Write Operations ======================== */
 
 /**
@@ -116,6 +128,10 @@ esp_err_t modbus_write_multiple_registers(uint8_t slave_id,
                                           uint16_t reg_count,
                                           uint16_t *values);
 
+esp_err_t modbus_write_single_coil(uint8_t slave_id, uint16_t address, bool value);
+esp_err_t modbus_write_multiple_coils(uint8_t slave_id, uint16_t address,
+                                      uint16_t count, uint16_t *values);
+
 /* ======================== Conversion Utility ======================== */
 
 /**
@@ -133,9 +149,12 @@ esp_err_t modbus_write_multiple_registers(uint8_t slave_id,
  * @param[in] dtype     Target data type interpretation.
  * @return Converted floating-point value (0.0f on unsupported type).
  */
-float modbus_convert_to_float(uint16_t *raw_regs, data_type_t dtype);
-float modbus_convert_to_float_order(const uint16_t *raw_regs, data_type_t dtype,
-                                    byte_order_t byte_order);
+double modbus_convert_to_number(const uint16_t *raw_regs, data_type_t dtype,
+                                byte_order_t byte_order, uint8_t bit_index);
+size_t modbus_decode_ascii(const uint16_t *raw_regs, uint16_t register_count,
+                           byte_order_t byte_order, char *out, size_t out_size);
+uint8_t modbus_encode_number(double value, data_type_t dtype,
+                             byte_order_t byte_order, uint16_t words[4]);
 
 uint16_t modbus_register_offset(uint8_t function_code, uint16_t configured_address);
 uint16_t modbus_register_count_for_type(data_type_t data_type);
@@ -147,6 +166,10 @@ void modbus_access_set_probe_mode(bool enabled);
 esp_err_t modbus_write_channel(source_protocol_t protocol, uint8_t channel_id,
                                uint8_t slave_id, uint8_t function_code,
                                uint16_t reg_addr, uint16_t reg_count, uint16_t *values);
+esp_err_t modbus_read_device_identity_channel(source_protocol_t protocol,
+                                              uint8_t channel_id,
+                                              uint8_t slave_id,
+                                              modbus_device_identity_t *identity);
 
 /* ======================== Teardown ======================== */
 

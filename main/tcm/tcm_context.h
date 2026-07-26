@@ -43,7 +43,14 @@ typedef enum {
     DT_UINT16,
     DT_FLOAT32,
     DT_INT32,
-    DT_UINT32
+    DT_UINT32,
+    DT_BOOL,
+    DT_INT64,
+    DT_UINT64,
+    DT_FLOAT64,
+    DT_BCD16,
+    DT_BITFIELD16,
+    DT_ASCII
 } data_type_t;
 
 typedef enum {
@@ -52,6 +59,29 @@ typedef enum {
     BYTE_ORDER_BADC,
     BYTE_ORDER_DCBA
 } byte_order_t;
+
+typedef enum {
+    MODBUS_OBJECT_COIL = 1,
+    MODBUS_OBJECT_DISCRETE_INPUT = 2,
+    MODBUS_OBJECT_HOLDING_REGISTER = 3,
+    MODBUS_OBJECT_INPUT_REGISTER = 4
+} modbus_object_type_t;
+
+typedef enum {
+    SEMANTIC_SOURCE_UNRESOLVED = 0,
+    SEMANTIC_SOURCE_PROFILE,
+    SEMANTIC_SOURCE_USER,
+    SEMANTIC_SOURCE_DISCOVERY,
+    SEMANTIC_SOURCE_IMPORTED
+} semantic_source_t;
+
+typedef enum {
+    SEMANTIC_STATUS_UNRESOLVED = 0,
+    SEMANTIC_STATUS_INFERRED,
+    SEMANTIC_STATUS_RESOLVED,
+    SEMANTIC_STATUS_VERIFIED,
+    SEMANTIC_STATUS_CONFLICT
+} semantic_status_t;
 
 /* ======================== Control Constraint ======================== */
 
@@ -84,8 +114,9 @@ typedef struct {
     /* Measurement Group (4 fields) */
     char measurement_name[AMM_MAX_POINT_NAME_LEN];    /* Field 9: human-readable name */
     char unit[AMM_MAX_UNIT_LEN];                      /* Field 10: engineering unit */
-    float value;                                      /* Field 11: measured value */
-    float raw_value;
+    double value;                                     /* Field 11: measured value */
+    double raw_value;
+    char value_text[32];
     float scale_factor;
     float offset;
     byte_order_t byte_order;
@@ -102,6 +133,14 @@ typedef struct {
     /* Metadata (not part of the 16 schema fields) */
     uint32_t sequence_id;                             /* Monotonic sequence for replay ordering */
     uint32_t mapping_version;
+    modbus_object_type_t object_type;
+    semantic_source_t semantic_source;
+    semantic_status_t semantic_status;
+    char semantic_profile_id[32];
+    uint32_t semantic_profile_version;
+    uint8_t semantic_confidence;
+    char semantic_evidence[48];
+    bool timestamp_synchronized;
     bool validated;                                   /* Whether validation has passed */
 } tcm_context_t;
 
@@ -135,7 +174,7 @@ int tcm_build_context(tcm_context_t *ctx,
                       uint8_t slave_id,
                       uint8_t func_code,
                       uint16_t reg_addr,
-                      float raw_value,
+                      double raw_value,
                       quality_state_t quality,
                       network_state_t net_state);
 
