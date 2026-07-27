@@ -632,7 +632,6 @@ esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
         }
 
         entry.active = true;
-        entry.discovered = false;
         entry.mapping_version = ++s_model_version;
         if (entry.poll_interval_ms == 0) entry.poll_interval_ms = POLL_INTERVAL_MS;
         if (entry.scale_factor == 0.0f) entry.scale_factor = 1.0f;

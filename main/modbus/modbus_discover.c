@@ -10,10 +10,12 @@
 #include "modbus_discover.h"
 #include "modbus_access.h"
 #include "amm/amm_mapping.h"
+#include "semantic/semantic_inference.h"
 #include "scheduler/scheduler.h"
 #include "gateway_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -51,6 +53,8 @@ static void discover_set_bus_progress(uint8_t slave_id, uint16_t completed)
     s_result.current_slave = slave_id;
     s_result.slaves_scanned = completed;
     s_result.devices_found = s_device_count;
+    s_result.slaves_skipped =
+        completed >= s_device_count ? completed - s_device_count : 0;
     taskEXIT_CRITICAL(&s_result_lock);
 }
 
@@ -160,7 +164,7 @@ static esp_err_t discover_probe_address(const discover_scan_params_t *params,
                                         discover_probe_t *probe)
 {
     uint8_t counts[5];
-    uint8_t functions[2];
+    uint8_t functions[4];
     uint8_t count_count = build_count_order(preferred_count, counts);
     uint8_t function_count = build_function_order(params, preferred_function, functions);
 
@@ -576,7 +580,7 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
                                       uint16_t reg_start,
                                       uint16_t reg_end)
 {
-    /* Find or create device entry */
+    /* Phase 2 is only allowed for a slave accepted by the liveness scan. */
     discovered_device_t *dev = NULL;
     for (int i = 0; i < s_device_count; i++) {
         if (s_devices[i].slave_id == slave_id &&
@@ -589,28 +593,35 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
     }
 
     if (!dev) {
-        /* Device not yet discovered — add it */
-        if (s_device_count >= s_device_capacity) {
-            ESP_LOGE(TAG, "Device table full");
-            return ESP_ERR_NO_MEM;
-        }
-        dev = &s_devices[s_device_count++];
-        dev->slave_id = slave_id;
-        dev->source_protocol = s_full_request.source_protocol;
-        dev->channel_id = s_full_request.channel_id;
-        snprintf(dev->device_id, sizeof(dev->device_id),
-                 "%s_ch%u_slave_%02u",
-                 dev->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
-                 dev->channel_id, slave_id);
-        dev->name[0] = '\0';
-        dev->description[0] = '\0';
-        snprintf(dev->mqtt_topic_prefix, sizeof(dev->mqtt_topic_prefix),
-                 "factory/data/%s_ch%u_slave_%02u",
-                 dev->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
-                 dev->channel_id, slave_id);
-        dev->active = true;
-        dev->reg_count = 0;
+        ESP_LOGD(TAG, "Skip register scan for unknown/offline slave %u", slave_id);
+        return ESP_ERR_NOT_FOUND;
     }
+
+    /*
+     * The device may disappear between the bus scan and this phase. Reuse the
+     * successful probe first; only a second positive liveness result permits
+     * the more expensive address-range scan.
+     */
+    discover_probe_t verification;
+    esp_err_t verify_err;
+    if (dev->probe_register_count > 0) {
+        verify_err = discover_probe_address(
+            &s_full_request, slave_id, dev->probe_address,
+            dev->probe_function_code, dev->probe_register_count, &verification);
+    } else {
+        verify_err = discover_probe_device(&s_full_request, slave_id, &verification);
+    }
+    if (verify_err != ESP_OK) {
+        dev->active = false;
+        dev->reg_count = 0;
+        ESP_LOGW(TAG,
+                 "Slave %u stopped responding after discovery; register scan skipped",
+                 slave_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    dev->probe_function_code = verification.function_code;
+    dev->probe_address = verification.address;
+    dev->probe_register_count = verification.register_count;
 
     ESP_LOGI(TAG, "Register scan: %s channel=%u slave %u, addr %u .. %u",
              dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
@@ -740,10 +751,31 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
                 device_end = candidate_end > UINT16_MAX
                     ? UINT16_MAX : (uint16_t)candidate_end;
             }
-            modbus_discover_scan_device(
+            esp_err_t scan_err = modbus_discover_scan_device(
                 s_devices[i].slave_id, device_start, device_end);
+            if (scan_err == ESP_ERR_NOT_FOUND) {
+                taskENTER_CRITICAL(&s_result_lock);
+                if (s_result.devices_found > 0) --s_result.devices_found;
+                ++s_result.slaves_skipped;
+                taskEXIT_CRITICAL(&s_result_lock);
+            } else if (scan_err != ESP_OK) {
+                return scan_err;
+            }
         }
     }
+
+    uint16_t active_count = 0;
+    for (uint16_t i = 0; i < s_device_count; ++i) {
+        if (!s_devices[i].active) continue;
+        if (active_count != i) {
+            s_devices[active_count] = s_devices[i];
+        }
+        ++active_count;
+    }
+    s_device_count = active_count;
+    taskENTER_CRITICAL(&s_result_lock);
+    s_result.devices_found = active_count;
+    taskEXIT_CRITICAL(&s_result_lock);
 
     discover_result_t result = modbus_discover_get_result();
     ESP_LOGI(TAG, "Full scan complete: %u devices, %u registers",
@@ -753,7 +785,7 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
 
 static void full_scan_task(void *argument)
 {
-    (void)argument;
+    bool stack_uses_caps = argument != NULL;
     scheduler_pause_modbus_polling(true);
     modbus_access_set_probe_mode(true);
     esp_log_level_set("MB_CONTROLLER_MASTER", ESP_LOG_NONE);
@@ -765,7 +797,11 @@ static void full_scan_task(void *argument)
                             err == ESP_OK ? DISCOVER_PHASE_COMPLETE : DISCOVER_PHASE_ERROR,
                             err);
     s_scan_task = NULL;
-    vTaskDelete(NULL);
+    if (stack_uses_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
@@ -790,7 +826,14 @@ esp_err_t modbus_discover_full_scan(const discover_scan_params_t *params)
     s_result.phase = DISCOVER_PHASE_BUS_SCAN;
     s_result.last_error = ESP_OK;
     taskEXIT_CRITICAL(&s_result_lock);
-    if (xTaskCreate(full_scan_task, "mb_full_scan", 6144, NULL, 3, &s_scan_task) != pdPASS) {
+    BaseType_t task_created = xTaskCreateWithCaps(
+        full_scan_task, "mb_full_scan", 6144, (void *)1, 3, &s_scan_task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_created != pdPASS) {
+        task_created = xTaskCreate(
+            full_scan_task, "mb_full_scan", 6144, NULL, 3, &s_scan_task);
+    }
+    if (task_created != pdPASS) {
         discover_set_task_state(false, true, DISCOVER_PHASE_ERROR, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
@@ -1087,17 +1130,133 @@ int modbus_discover_apply_mappings(void)
     bool matched_devices[DISCOVER_MAX_SLAVES] = {false};
     int created = apply_embedded_semantic_profile(matched_devices);
 
+    int capacity = amm_get_capacity();
+    amm_mapping_entry_t *raw_entries = heap_caps_calloc(
+        (size_t)capacity, sizeof(raw_entries[0]),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (raw_entries == NULL) {
+        raw_entries = heap_caps_calloc(
+            (size_t)capacity, sizeof(raw_entries[0]),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+
+    int raw_capacity = 0;
+    if (raw_entries != NULL) {
+        amm_mapping_entry_t *current = heap_caps_calloc(
+            (size_t)capacity, sizeof(current[0]),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (current == NULL) {
+            current = heap_caps_calloc(
+                (size_t)capacity, sizeof(current[0]),
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        int active_count = current != NULL
+            ? amm_get_entries(current, capacity) : amm_get_mapping_count();
+        int replaceable = 0;
+        for (int entry_index = 0;
+             current != NULL && entry_index < active_count; ++entry_index) {
+            for (int device_index = 0;
+                 device_index < s_device_count; ++device_index) {
+                const discovered_device_t *device = &s_devices[device_index];
+                if (!device->active || matched_devices[device_index]) continue;
+                if (current[entry_index].source_protocol ==
+                        device->source_protocol &&
+                    current[entry_index].channel_id == device->channel_id &&
+                    current[entry_index].slave_id == device->slave_id) {
+                    ++replaceable;
+                    break;
+                }
+            }
+        }
+        raw_capacity = capacity - active_count + replaceable;
+        if (raw_capacity < 0) raw_capacity = 0;
+        free(current);
+    }
+
+    int raw_count = 0;
     for (int i = 0; i < s_device_count; i++) {
         const discovered_device_t *dev = &s_devices[i];
-        if (dev->active && !matched_devices[i]) {
-            ++s_apply_result.unresolved_devices;
-            ESP_LOGW(TAG,
-                     "Semantic profile unresolved for %s channel %u slave %u; "
-                     "raw words remain in discovery only",
+        if (!dev->active || matched_devices[i]) continue;
+
+        ++s_apply_result.unresolved_devices;
+        int device_point_count = 0;
+        for (int j = 0; j < dev->reg_count; ++j) {
+            if (dev->registers[j].valid) ++device_point_count;
+        }
+        if (raw_entries == NULL ||
+            raw_count + device_point_count > raw_capacity) {
+            ESP_LOGE(TAG,
+                     "No AMM capacity for unknown %s channel %u slave %u "
+                     "(need %d, available %d)",
                      dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
-                     dev->channel_id, dev->slave_id);
+                     dev->channel_id, dev->slave_id, device_point_count,
+                     raw_capacity - raw_count);
+            continue;
+        }
+
+        semantic_register_signature_t signatures[DISCOVER_MAX_REGS_PER_SLAVE];
+        size_t signature_count = 0;
+        for (int j = 0; j < dev->reg_count &&
+                        j < DISCOVER_MAX_REGS_PER_SLAVE; ++j) {
+            if (!dev->registers[j].valid) continue;
+            signatures[signature_count].function_code =
+                dev->registers[j].function_code;
+            signatures[signature_count].address =
+                dev->registers[j].register_address;
+            ++signature_count;
+        }
+
+        semantic_device_features_t features = {
+            .source_protocol = dev->source_protocol,
+            .channel_id = dev->channel_id,
+            .slave_id = dev->slave_id,
+            .vendor_name = dev->vendor_name,
+            .product_code = dev->product_code,
+            .revision = dev->revision,
+            .probe_function_code = dev->probe_function_code,
+            .probe_address = dev->probe_address,
+            .registers = signatures,
+            .register_count = signature_count,
+        };
+        semantic_device_identity_t identity;
+        semantic_inference_identify(&features, &identity);
+
+        for (int j = 0; j < dev->reg_count; ++j) {
+            const discovered_register_t *reg = &dev->registers[j];
+            if (!reg->valid) continue;
+            semantic_raw_point_t point = {
+                .function_code = reg->function_code,
+                .address = reg->register_address,
+                .raw_value = reg->raw_value,
+                .read_start_address = reg->read_start_address,
+                .read_register_count = reg->read_register_count,
+                .value_register_index = reg->value_register_index,
+            };
+            semantic_inference_build_raw_mapping(
+                &features, &identity, &point, dev->device_id,
+                &raw_entries[raw_count++]);
+        }
+        ESP_LOGW(TAG,
+                 "Unknown %s channel %u slave %u fingerprint %s: "
+                 "%u raw points require semantic confirmation",
+                 dev->source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+                 dev->channel_id, dev->slave_id, identity.fingerprint,
+                 dev->reg_count);
+    }
+
+    if (raw_count > 0 && raw_entries != NULL) {
+        int imported = 0;
+        esp_err_t error =
+            amm_import_mappings(raw_entries, raw_count, true, &imported);
+        if (error == ESP_OK) {
+            s_apply_result.raw_mappings = imported;
+            created += imported;
+        } else {
+            ESP_LOGE(TAG, "Unknown-device raw mapping import failed: %s",
+                     esp_err_to_name(error));
         }
     }
+    free(raw_entries);
 
     taskENTER_CRITICAL(&s_result_lock);
     s_result.mappings_created += created;

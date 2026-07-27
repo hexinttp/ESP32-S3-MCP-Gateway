@@ -742,6 +742,9 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
     entry.semantic_source = SEMANTIC_SOURCE_USER;
     entry.semantic_status = SEMANTIC_STATUS_VERIFIED;
     entry.semantic_confidence = 100;
+    strlcpy(entry.semantic_profile_id, "user-confirmed",
+            sizeof(entry.semantic_profile_id));
+    entry.semantic_profile_version = 1;
     strlcpy(entry.semantic_evidence, "web configuration",
             sizeof(entry.semantic_evidence));
 
@@ -1246,6 +1249,7 @@ static esp_err_t discover_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "total_scanned", r.total_scanned);
     cJSON_AddNumberToObject(root, "slaves_scanned", r.slaves_scanned);
     cJSON_AddNumberToObject(root, "devices_found", r.devices_found);
+    cJSON_AddNumberToObject(root, "slaves_skipped", r.slaves_skipped);
     cJSON_AddNumberToObject(root, "registers_found", r.registers_found);
     cJSON_AddNumberToObject(root, "mappings_created", r.mappings_created);
     cJSON_AddNumberToObject(root, "device_capacity", r.device_capacity);

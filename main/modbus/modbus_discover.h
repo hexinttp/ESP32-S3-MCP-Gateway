@@ -83,7 +83,8 @@ typedef struct {
 typedef struct {
     uint16_t total_scanned;         /**< Total slave IDs probed */
     uint16_t slaves_scanned;        /**< Slave IDs completed so far */
-    uint16_t devices_found;        /**< Number of responding slaves */
+    uint16_t devices_found;         /**< Number of responding slaves */
+    uint16_t slaves_skipped;        /**< Silent/unavailable slaves excluded from register scan */
     uint16_t registers_found;      /**< Total registers across all slaves */
     uint16_t mappings_created;     /**< AMM entries auto-created */
     uint16_t device_capacity;      /**< Runtime capacity after PSRAM/fallback allocation */
@@ -153,9 +154,9 @@ esp_err_t modbus_discover_scan_bus(uint8_t start, uint8_t end);
 /**
  * @brief Fine register scan for a specific slave device.
  *
- * Probes register addresses from @p reg_start to @p reg_end using
- * both FC03 (holding) and FC04 (input).  For each responding register,
- * reads the value and applies semantic inference.
+ * Revalidates that the slave discovered during phase 1 is still online, then
+ * probes register addresses from @p reg_start to @p reg_end. An unknown or
+ * unavailable slave returns ESP_ERR_NOT_FOUND without scanning registers.
  *
  * @param slave_id   Target slave ID.
  * @param reg_start  First register address (e.g. 40001).

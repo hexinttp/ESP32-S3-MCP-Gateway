@@ -64,7 +64,7 @@
 
 /* ======================== Scheduler Configuration ======================== */
 #define TASK_STACK_SIZE_MODBUS   4096
-#define TASK_STACK_SIZE_TCM      4096
+#define TASK_STACK_SIZE_TCM      8192
 #define TASK_STACK_SIZE_MQTT     12288
 #define TASK_STACK_SIZE_SCHED    4096
 #define TASK_STACK_SIZE_EVAL     4096

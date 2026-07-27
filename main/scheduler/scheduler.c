@@ -262,6 +262,13 @@ static void context_build_task(void *arg)
     ESP_LOGI(TAG, "context_build_task started");
 
     modbus_read_result_t raw;
+    tcm_context_t *ctx = calloc(1, sizeof(*ctx));
+    if (ctx == NULL) {
+        ESP_LOGE(TAG, "Unable to allocate TCM context workspace");
+        s_task_context_build = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     while (s_running) {
         if (xQueueReceive(s_raw_data_queue, &raw, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -275,10 +282,10 @@ static void context_build_task(void *arg)
         }
 
         /* Step 1: Build TCM context from raw MODBUS data */
-        tcm_context_t ctx;
+        memset(ctx, 0, sizeof(*ctx));
         network_state_t net_state = get_network_state_locked();
 
-        int ret = tcm_build_context(&ctx,
+        int ret = tcm_build_context(ctx,
                                     raw.slave_id,
                                     raw.function_code,
                                     raw.register_address,
@@ -293,14 +300,14 @@ static void context_build_task(void *arg)
         }
 
         eval_increment_metric("contexts_created", 1);
-        ctx.source_protocol = raw.source_protocol;
-        ctx.channel_id = raw.channel_id;
-        strlcpy(ctx.value_text, raw.value_text, sizeof(ctx.value_text));
+        ctx->source_protocol = raw.source_protocol;
+        ctx->channel_id = raw.channel_id;
+        strlcpy(ctx->value_text, raw.value_text, sizeof(ctx->value_text));
 
         /* Step 2: Enrich context with AMM mapping metadata
          * (device name, point name, unit, measurement name, constraints)
          */
-        esp_err_t amm_err = amm_enrich_context(&ctx);
+        esp_err_t amm_err = amm_enrich_context(ctx);
         if (amm_err != ESP_OK) {
             ESP_LOGW(TAG, "amm_enrich_context failed for slave=%u addr=0x%04X (err=0x%x)",
                      raw.slave_id, raw.register_address, amm_err);
@@ -309,7 +316,7 @@ static void context_build_task(void *arg)
 
         /* Step 3: Validate the context against the TCM schema */
         tcm_validation_result_t val_result;
-        bool valid = tcm_validate(&ctx, &val_result);
+        bool valid = tcm_validate(ctx, &val_result);
         if (!valid) {
             ESP_LOGW(TAG, "Context validation failed: %s (field_mask=0x%08lX)",
                      val_result.fail_reason,
@@ -318,18 +325,19 @@ static void context_build_task(void *arg)
             continue;
         }
 
-        ctx.validated = true;
+        ctx->validated = true;
         eval_increment_metric("contexts_validated", 1);
-        tcm_state_pool_update(&ctx);
-        (void)history_store_append(&ctx);
+        tcm_state_pool_update(ctx);
+        (void)history_store_append(ctx);
 
         /* Push validated context downstream */
-        if (xQueueSend(s_context_queue, &ctx, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (xQueueSend(s_context_queue, ctx, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "context_queue full, dropping validated context");
             eval_increment_metric("data_loss_count", 1);
         }
     }
 
+    free(ctx);
     s_task_context_build = NULL;
     vTaskDelete(NULL);
 }

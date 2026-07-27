@@ -10,6 +10,7 @@
          "storage/history_store.c"
          "tcm/tcm_context.c"
          "tcm/tcm_state_pool.c"
+         "semantic/semantic_inference.c"
          "modbus/modbus_access.c"
          "modbus/modbus_comm_log.c"
          "modbus/modbus_discover.c"
