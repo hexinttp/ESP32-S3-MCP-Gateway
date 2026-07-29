@@ -51,7 +51,10 @@ typedef struct {
     uint8_t     value_register_index;/**< This point's index inside the read window */
     char        inferred_name[32];  /**< e.g. "Motor temperature" */
     char        inferred_unit[16];  /**< e.g. "degC" */
+    float       range_min;          /**< Suggested/user valid range minimum */
+    float       range_max;          /**< Suggested/user valid range maximum */
     bool        writable;           /**< true if FC06 write succeeds */
+    bool        user_edited;        /**< true once the user saves edits in the web UI */
     bool        valid;
 } discovered_register_t;
 

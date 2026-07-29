@@ -5,8 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "gateway_config.h"   /* for mqtt_platform_type_t */
 
-#define RUNTIME_CONFIG_SCHEMA_VERSION 2
+#define RUNTIME_CONFIG_SCHEMA_VERSION 3
 #define RUNTIME_MAX_TCP_ENDPOINTS 8
 
 typedef enum {
@@ -22,6 +23,7 @@ typedef struct {
 
 typedef struct {
     bool enabled;
+    mqtt_platform_type_t platform_type;/* MQTT_PLATFORM_CUSTOM or MQTT_PLATFORM_THINGSCLOUD */
     char uri[128];
     char client_id[48];
     char username[64];
@@ -37,6 +39,7 @@ typedef struct {
     char lwt_payload[64];
     uint8_t lwt_qos;
     bool lwt_retain;
+    mqtt_report_mode_t report_mode;  /* sub-device vs gateway aggregation */
 } runtime_mqtt_config_t;
 
 typedef struct {

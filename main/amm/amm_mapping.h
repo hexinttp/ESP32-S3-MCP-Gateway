@@ -28,7 +28,7 @@ extern "C" {
 #define AMM_NVS_KEY_SCHEMA      "schema_ver"
 #define AMM_NVS_KEY_ROLLBACK_COUNT "rb_count"
 #define AMM_NVS_KEY_ROLLBACK    "rollback"
-#define AMM_NVS_SCHEMA_VERSION  5
+#define AMM_NVS_SCHEMA_VERSION  6
 #define AMM_MAX_READ_REGISTERS  64
 
 /* ======================== Mapping Entry ======================== */
@@ -75,6 +75,10 @@ typedef struct {
     uint32_t semantic_profile_version;
     uint8_t  semantic_confidence;
     char     semantic_evidence[48];
+    /* Optional custom ThingsCloud gateway-mode property key. Empty -> the
+       reporter auto-generates "p{port}_s{slave}_{point_id}". Appended last so
+       the schema-v5 layout remains a strict prefix for cheap NVS migration. */
+    char     gateway_property_key[64];
 } amm_mapping_entry_t;
 
 /* ======================== Validation Result ======================== */

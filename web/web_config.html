@@ -716,6 +716,29 @@ tbody tr:last-child td { border-bottom: none; }
           <span class="badge badge-success" id="mqttConnBadge"><span class="dot dot-green"></span> <span data-i18n="status.connected">Connected</span></span>
         </div>
         <div class="card-body">
+          <div class="form-group">
+            <label data-i18n="mqtt.platform">Cloud Platform</label>
+            <select id="mqttPlatform" onchange="applyMqttPlatformUI()">
+              <option value="custom" data-i18n="mqtt.platform.custom">Custom MQTT</option>
+              <option value="thingscloud" data-i18n="mqtt.platform.thingscloud">ThingsCloud</option>
+            </select>
+          </div>
+          <div class="form-group tc-only">
+            <label data-i18n="mqtt.report_mode">Report Mode</label>
+            <div style="display:flex;gap:20px;align-items:center;margin:8px 0 4px;">
+              <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400;">
+                <input type="radio" name="reportMode" id="rmSubdevice" value="subdevice" checked onchange="applyReportModeUI()">
+                <span data-i18n="mqtt.report_mode.subdevice">Sub-device</span>
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400;">
+                <input type="radio" name="reportMode" id="rmGateway" value="gateway" onchange="applyReportModeUI()">
+                <span data-i18n="mqtt.report_mode.gateway">Gateway</span>
+              </label>
+            </div>
+            <div id="rmSubDesc" class="hint" style="white-space:pre-line;line-height:1.6;" data-i18n="mqtt.report_mode.sub.desc"></div>
+            <div id="rmGwDesc" class="hint" style="white-space:pre-line;line-height:1.6;display:none;" data-i18n="mqtt.report_mode.gw.desc"></div>
+            <div class="hint" id="reportModeEffective" style="margin-top:8px;font-weight:600;"></div>
+          </div>
           <div class="form-grid">
             <div class="form-group">
               <label data-i18n="mqtt.broker_uri">Broker URI</label>
@@ -726,18 +749,22 @@ tbody tr:last-child td { border-bottom: none; }
               <input type="text" id="mqttClientId" value="esp32s3_gateway_01">
             </div>
             <div class="form-group">
-              <label data-i18n="mqtt.username">Username (optional)</label>
+              <label id="mqttUserLabel">
+                <span class="custom-only" data-i18n="mqtt.username">Username (optional)</span><span class="tc-only" style="display:none" data-i18n="mqtt.access_token">AccessToken</span>
+              </label>
               <input type="text" id="mqttUser" placeholder="MQTT Username">
             </div>
             <div class="form-group">
-              <label data-i18n="mqtt.password">Password (optional)</label>
+              <label id="mqttPassLabel">
+                <span class="custom-only" data-i18n="mqtt.password">Password (optional)</span><span class="tc-only" style="display:none" data-i18n="mqtt.project_key">ProjectKey</span>
+              </label>
               <input type="password" id="mqttPass" placeholder="MQTT Password">
             </div>
             <div class="form-group">
               <label data-i18n="mqtt.keepalive">Keep-Alive (seconds)</label>
               <input type="number" id="mqttKeepalive" value="120" min="10" max="600">
             </div>
-            <div class="form-group">
+            <div class="form-group" id="mqttQosGroup">
               <label data-i18n="mqtt.qos">Default QoS Level</label>
               <select id="mqttQos">
                 <option value="0">QoS 0 (At most once)</option>
@@ -746,26 +773,48 @@ tbody tr:last-child td { border-bottom: none; }
               </select>
             </div>
           </div>
-          <div class="form-group" style="margin-top: 8px;">
-            <label data-i18n="mqtt.topic_prefix">Data Topic Prefix</label>
-            <input type="text" id="mqttTopicPrefix" value="factory/data">
-            <div class="hint" data-i18n="mqtt.topic_hint">Published topics: {prefix}/{client_id}/{device}/{point}</div>
+
+          <div class="tc-only" style="display:none; margin-top:12px; padding:10px; border:1px solid #2d4a63; border-radius:8px; background:#0f1d2b;">
+            <div class="hint" data-i18n="mqtt.tc.hint">ESP32-S3 connects using gateway device credentials; Modbus slaves are reported as ThingsCloud sub-devices.</div>
+            <ul style="font-size:12px; line-height:1.7; margin:6px 0 0 16px; color:#9fb3c8;">
+              <li data-i18n="mqtt.tc.t1">Gateway attributes: attributes</li>
+              <li data-i18n="mqtt.tc.t2">Sub-device attributes: gateway/attributes</li>
+              <li data-i18n="mqtt.tc.t3">Sub-device history: gateway/attributes/series</li>
+              <li data-i18n="mqtt.tc.t4">Sub-device online: gateway/connect</li>
+              <li data-i18n="mqtt.tc.t5">Sub-device offline: gateway/disconnect</li>
+              <li data-i18n="mqtt.tc.t6">Attribute push (downlink): gateway/attributes/push</li>
+              <li data-i18n="mqtt.tc.t7">Command send (downlink): gateway/command/send</li>
+            </ul>
           </div>
-          <div class="form-grid" style="margin-top:8px;">
-            <div class="form-group"><label data-i18n="mqtt.command_prefix">Command Topic Prefix</label><input id="mqttCommandPrefix" type="text" value="factory/command"></div>
-            <div class="form-group"><label data-i18n="mqtt.lwt_topic">LWT Topic</label><input id="mqttLwtTopic" type="text"></div>
-            <div class="form-group"><label data-i18n="mqtt.lwt_payload">LWT Payload</label><input id="mqttLwtPayload" type="text" value="offline"></div>
-            <div class="form-group"><label data-i18n="mqtt.lwt_qos">LWT QoS</label><select id="mqttLwtQos"><option value="0">0</option><option value="1" selected>1</option><option value="2">2</option></select></div>
+
+          <div class="custom-only" id="mqttCustomFields">
+            <div class="form-group" style="margin-top: 8px;">
+              <label data-i18n="mqtt.topic_prefix">Data Topic Prefix</label>
+              <input type="text" id="mqttTopicPrefix" value="factory/data">
+              <div class="hint" data-i18n="mqtt.topic_hint">Published topics: {prefix}/{client_id}/{device}/{point}</div>
+            </div>
+            <div class="form-grid" style="margin-top:8px;">
+              <div class="form-group"><label data-i18n="mqtt.command_prefix">Command Topic Prefix</label><input id="mqttCommandPrefix" type="text" value="factory/command"></div>
+              <div class="form-group"><label data-i18n="mqtt.lwt_topic">LWT Topic</label><input id="mqttLwtTopic" type="text"></div>
+              <div class="form-group"><label data-i18n="mqtt.lwt_payload">LWT Payload</label><input id="mqttLwtPayload" type="text" value="offline"></div>
+              <div class="form-group"><label data-i18n="mqtt.lwt_qos">LWT QoS</label><select id="mqttLwtQos"><option value="0">0</option><option value="1" selected>1</option><option value="2">2</option></select></div>
+            </div>
+            <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;">
+              <label><input id="mqttCleanSession" type="checkbox"> <span data-i18n="mqtt.clean_session">Clean Session</span></label>
+              <label><input id="mqttRetain" type="checkbox"> <span data-i18n="mqtt.retain">Retain Data</span></label>
+              <label><input id="mqttLwtEnabled" type="checkbox" checked> <span data-i18n="mqtt.lwt_enabled">Enable LWT</span></label>
+              <label><input id="mqttLwtRetain" type="checkbox" checked> <span data-i18n="mqtt.lwt_retain">Retain LWT</span></label>
+            </div>
           </div>
-          <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;">
-            <label><input id="mqttCleanSession" type="checkbox"> <span data-i18n="mqtt.clean_session">Clean Session</span></label>
-            <label><input id="mqttRetain" type="checkbox"> <span data-i18n="mqtt.retain">Retain Data</span></label>
-            <label><input id="mqttLwtEnabled" type="checkbox" checked> <span data-i18n="mqtt.lwt_enabled">Enable LWT</span></label>
-            <label><input id="mqttLwtRetain" type="checkbox" checked> <span data-i18n="mqtt.lwt_retain">Retain LWT</span></label>
+
+          <div class="tc-only" style="display:none; margin-top:12px;">
+            <div class="hint" data-i18n="mqtt.tc.fixed">ThingsCloud mode: QoS is fixed to 0, Retain is off, and the custom LWT is disabled (managed by connection state).</div>
           </div>
+
           <div style="margin-top:16px; display:flex; gap:8px;">
             <button class="btn btn-primary" onclick="saveMqttConfig()" data-i18n="btn.save">Save Configuration</button>
             <button class="btn btn-outline" onclick="testMqttConnection()" data-i18n="mqtt.test">Test Connection</button>
+            <button class="btn btn-danger" id="mqttDisconnectBtn" onclick="disconnectMqtt()" data-i18n="mqtt.disconnect">Disconnect</button>
           </div>
         </div>
       </div>
@@ -1325,6 +1374,11 @@ tbody tr:last-child td { border-bottom: none; }
         <label data-i18n="th.mqtt_topic">MQTT Topic</label>
         <input type="text" id="mMqttTopic" placeholder="e.g. factory/line1/plc01/motor/temp">
       </div>
+      <div class="form-group">
+        <label data-i18n="th.gateway_key">Gateway Key</label>
+        <input type="text" id="mGatewayKey" placeholder="auto">
+        <span class="hint" data-i18n="th.gateway_key.hint"></span>
+      </div>
       <div class="form-grid">
         <div class="form-group">
           <label data-i18n="th.writable">Writable</label>
@@ -1415,6 +1469,8 @@ const I18N = {
     "th.point_id": "\u70b9\u4f4d ID",
     "th.unit": "\u5355\u4f4d",
     "th.mqtt_topic": "MQTT \u4e3b\u9898",
+    "th.gateway_key": "网关属性 Key",
+    "th.gateway_key.hint": "网关模式下的属性名：留空自动生成 p{端口}_s{从站}_{属性}；填写则使用该值（仅字母/数字/下划线，保存时校验唯一性）",
     "th.writable": "\u53ef\u5199",
     "th.range": "\u8303\u56f4",
     "th.actions": "\u64cd\u4f5c",
@@ -1428,6 +1484,30 @@ const I18N = {
     "wifi.prefer_ethernet": "\u4f18\u5148\u4ee5\u592a\u7f51\uff0c\u65ad\u7ebf\u65f6\u5207\u6362\u5230 WiFi",
     "wifi.scan": "\u626b\u63cf\u7f51\u7edc",
     "mqtt.title": "MQTT Broker \u914d\u7f6e",
+    "mqtt.platform": "云平台类型",
+    "mqtt.platform.custom": "自定义 MQTT",
+    "mqtt.platform.thingscloud": "ThingsCloud",
+    "mqtt.report_mode": "上报方式（二选一，互斥）",
+    "mqtt.report_mode.subdevice": "通过子设备上报",
+    "mqtt.report_mode.gateway": "通过网关上报",
+    "mqtt.report_mode.subdevice.short": "子设备",
+    "mqtt.report_mode.gateway.short": "网关",
+    "mqtt.report_mode.sub.desc": "每个 Modbus 从站对应一个 ThingsCloud 网关子设备。云端需预先创建并绑定相应子设备地址（或另行实现自动创建）。\n业务数据经 gateway/connect 与 gateway/attributes 上报；属性名直接使用映射表中的云端属性标识符（点位 ID）。",
+    "mqtt.report_mode.gw.desc": "所有 Modbus 点位作为网关设备自身属性，经 attributes 上报。\n属性名自动生成为 p{端口}_s{从站}_{属性}（如 p1_s1_temperature）；网关在本地检测从站离线并上传在线状态属性；云端不显示独立的 ThingsCloud 子设备实体。",
+    "mqtt.report_mode.effective": "当前生效模式",
+    "mqtt.report_mode.warn_change": "切换上报模式会改变云端数据归属，且旧模式待发送数据将被丢弃。确认保存？",
+    "mqtt.report_mode.restart_hint": "保存后云端模块将按新模式重新初始化（无需重启设备，MQTT 连接复用）。",
+    "mqtt.access_token": "AccessToken（网关设备）",
+    "mqtt.project_key": "ProjectKey（项目密钥）",
+    "mqtt.tc.hint": "ESP32-S3 使用网关设备凭证连接 ThingsCloud，Modbus 从机作为子设备上报。",
+    "mqtt.tc.t1": "网关属性上报：attributes",
+    "mqtt.tc.t2": "子设备属性上报：gateway/attributes",
+    "mqtt.tc.t3": "子设备历史数据：gateway/attributes/series",
+    "mqtt.tc.t4": "子设备上线：gateway/connect",
+    "mqtt.tc.t5": "子设备下线：gateway/disconnect",
+    "mqtt.tc.t6": "属性下发（下行）：gateway/attributes/push",
+    "mqtt.tc.t7": "命令下发（下行）：gateway/command/send",
+    "mqtt.tc.fixed": "ThingsCloud 模式：QoS 固定为 0，Retain 关闭，自定义遗嘱（LWT）禁用（由连接状态管理）。",
     "mqtt.broker_uri": "Broker URI",
     "mqtt.uri": "Broker URI",
     "mqtt.client_id": "\u5ba2\u6237\u7aef ID",
@@ -1438,6 +1518,7 @@ const I18N = {
     "mqtt.topic_prefix": "\u6570\u636e\u4e3b\u9898\u524d\u7f00",
     "mqtt.topic_hint": "\u53d1\u5e03\u4e3b\u9898\uff1a{prefix}/{client_id}/{device}/{point}",
     "mqtt.test": "\u6d4b\u8bd5\u8fde\u63a5",
+    "mqtt.disconnect": "\u65ad\u5f00\u8fde\u63a5",
     "mqtt.command_prefix": "\u547d\u4ee4\u4e3b\u9898\u524d\u7f00",
     "mqtt.clean_session": "\u6e05\u7406\u4f1a\u8bdd",
     "mqtt.retain": "\u4fdd\u7559\u6570\u636e\u6d88\u606f",
@@ -1666,6 +1747,8 @@ const I18N = {
     'th.slave_id': 'Slave ID', 'th.reg_addr': 'Register', 'th.data_type': 'Data Type',
     'th.device_id': 'Device ID', 'th.point_id': 'Point ID', 'th.unit': 'Unit',
     'th.mqtt_topic': 'MQTT Topic', 'th.writable': 'Writable', 'th.range': 'Range',
+    'th.gateway_key': 'Gateway Key',
+    'th.gateway_key.hint': 'Gateway-mode attribute name. Leave empty to auto-generate p{port}_s{slave}_{property}; otherwise this value is used (letters/digits/underscore only, uniqueness checked on save)',
     'th.actions': 'Actions',
     'wifi.title': 'WiFi Station Configuration',
     'wifi.ssid': 'SSID',
@@ -1677,6 +1760,30 @@ const I18N = {
     'wifi.prefer_ethernet': 'Prefer Ethernet and fail over to WiFi',
     'wifi.scan': 'Scan Networks',
     'mqtt.title': 'MQTT Broker Configuration',
+    'mqtt.platform': 'Cloud Platform',
+    'mqtt.platform.custom': 'Custom MQTT',
+    'mqtt.platform.thingscloud': 'ThingsCloud',
+    'mqtt.report_mode': 'Report Mode (choose one)',
+    'mqtt.report_mode.subdevice': 'Report via Sub-device',
+    'mqtt.report_mode.gateway': 'Report via Gateway',
+    'mqtt.report_mode.subdevice.short': 'Sub-device',
+    'mqtt.report_mode.gateway.short': 'Gateway',
+    'mqtt.report_mode.sub.desc': 'Each Modbus slave maps to a ThingsCloud gateway sub-device. The cloud must pre-create and bind the matching sub-device addresses (or implement auto-creation).\nData is reported via gateway/connect and gateway/attributes; the property key is the cloud property identifier (Point ID) from the mapping table.',
+    'mqtt.report_mode.gw.desc': 'All Modbus points are reported as the gateway device\'s own attributes via the attributes topic.\nProperty keys are auto-generated as p{port}_s{slave}_{property} (e.g. p1_s1_temperature); the gateway detects slave offline locally and uploads online-status attributes. No separate ThingsCloud sub-device entities appear in the cloud.',
+    'mqtt.report_mode.effective': 'Effective mode',
+    'mqtt.report_mode.warn_change': 'Changing the report mode changes data ownership in the cloud, and pending data from the old mode will be discarded. Save anyway?',
+    'mqtt.report_mode.restart_hint': 'After saving, the cloud module re-initializes with the new mode (no device reboot; the MQTT connection is reused).',
+    'mqtt.access_token': 'AccessToken (gateway device)',
+    'mqtt.project_key': 'ProjectKey (project secret)',
+    'mqtt.tc.hint': 'ESP32-S3 connects with gateway device credentials; Modbus slaves are reported as ThingsCloud sub-devices.',
+    'mqtt.tc.t1': 'Gateway attributes: attributes',
+    'mqtt.tc.t2': 'Sub-device attributes: gateway/attributes',
+    'mqtt.tc.t3': 'Sub-device history: gateway/attributes/series',
+    'mqtt.tc.t4': 'Sub-device online: gateway/connect',
+    'mqtt.tc.t5': 'Sub-device offline: gateway/disconnect',
+    'mqtt.tc.t6': 'Attribute push (downlink): gateway/attributes/push',
+    'mqtt.tc.t7': 'Command send (downlink): gateway/command/send',
+    'mqtt.tc.fixed': 'ThingsCloud mode: QoS fixed to 0, Retain off, custom LWT disabled (managed by connection state).',
     'mqtt.broker_uri': 'Broker URI',
     'mqtt.uri': 'Broker URI',
     'mqtt.client_id': 'Client ID',
@@ -1687,6 +1794,7 @@ const I18N = {
     'mqtt.topic_prefix': 'Data Topic Prefix',
     'mqtt.topic_hint': 'Published topics: {prefix}/{client_id}/{device}/{point}',
     'mqtt.test': 'Test Connection',
+    'mqtt.disconnect': 'Disconnect',
     'mqtt.command_prefix': 'Command Topic Prefix',
     'mqtt.clean_session': 'Clean Session',
     'mqtt.retain': 'Retain Data',
@@ -2025,11 +2133,11 @@ async function apiDelete(path) {
 }
 
 /* Generic JSON API helper - supports any method, returns parsed JSON */
-async function apiJson(method, path, body) {
+async function apiJson(method, path, body, timeoutMs = API_TIMEOUT_MS) {
   try {
     const opts = { method: method, headers: { 'Content-Type': 'application/json' } };
     if (body !== undefined) opts.body = JSON.stringify(body);
-    const res = await fetchWithTimeout(path, opts);
+    const res = await fetchWithTimeout(path, opts, timeoutMs);
     if (res.ok) return await res.json();
     const errText = await res.text();
     try {
@@ -2062,6 +2170,24 @@ function updateDashboard() {
   document.getElementById('statMqttStatus').textContent = s.mqtt_connected
     ? (currentLang === 'zh' ? t('status.connected') : 'Connected')
     : (currentLang === 'zh' ? t('status.disconnected') : 'Disconnected');
+
+  // Reflect the REAL broker connection state on the MQTT page header badge
+  // (previously hard-coded to a static green "Connected").
+  const mqttBadge = document.getElementById('mqttConnBadge');
+  if (mqttBadge) {
+    const connected = !!s.mqtt_connected;
+    const dot = connected ? 'dot-green' : 'dot-red';
+    const label = connected
+      ? (currentLang === 'zh' ? t('status.connected') : 'Connected')
+      : (currentLang === 'zh' ? t('status.disconnected') : 'Disconnected');
+    mqttBadge.className = 'badge ' + (connected ? 'badge-success' : 'badge-danger');
+    mqttBadge.innerHTML = `<span class="dot ${dot}"></span> ${label}`;
+  }
+  // Only allow "Disconnect" when actually connected.
+  const mqttDisconnectBtn = document.getElementById('mqttDisconnectBtn');
+  if (mqttDisconnectBtn) {
+    mqttDisconnectBtn.disabled = !s.mqtt_connected;
+  }
   document.getElementById('statModbusPolls').textContent = s.total_polls;
   document.getElementById('statPublished').textContent = s.mqtt_published;
   document.getElementById('statCached').textContent = s.cached_records;
@@ -2297,7 +2423,7 @@ async function importMappingProfile(event) {
 function openAddMapping() {
   document.getElementById('mappingModalTitle').textContent = t('mapping.add_title');
   document.getElementById('editMappingIndex').value = -1;
-  ['mSlaveId','mRegAddr','mDeviceId','mPointId','mMeasurement','mUnit','mMqttTopic'].forEach(id => {
+  ['mSlaveId','mRegAddr','mDeviceId','mPointId','mMeasurement','mUnit','mMqttTopic','mGatewayKey'].forEach(id => {
     const el = document.getElementById(id);
     if (el.type === 'number') el.value = id==='mSlaveId' ? 1 : (id==='mRegAddr' ? 40001 : 1.0);
     else el.value = '';
@@ -2338,6 +2464,7 @@ function editMapping(index) {
   document.getElementById('mMeasurement').value = m.measurement_name;
   document.getElementById('mUnit').value = m.unit;
   document.getElementById('mMqttTopic').value = m.mqtt_topic;
+  document.getElementById('mGatewayKey').value = m.gateway_property_key || '';
   document.getElementById('mWritable').value = m.writable.toString();
   document.getElementById('mRangeMin').value = m.range_min;
   document.getElementById('mRangeMax').value = m.range_max;
@@ -2368,6 +2495,7 @@ async function saveMapping() {
     measurement_name: document.getElementById('mMeasurement').value,
     unit: document.getElementById('mUnit').value,
     mqtt_topic: document.getElementById('mMqttTopic').value,
+    gateway_property_key: document.getElementById('mGatewayKey').value.trim(),
     writable: document.getElementById('mWritable').value === 'true',
     range_min: parseFloat(document.getElementById('mRangeMin').value),
     range_max: parseFloat(document.getElementById('mRangeMax').value),
@@ -2482,8 +2610,26 @@ function saveWifiConfig() {
   addLog('info', `[WiFi] Configuration saved: SSID=${data.ssid}`);
 }
 
+function applyReportModeUI() {
+  const gw = document.getElementById('rmGateway').checked;
+  document.getElementById('rmSubDesc').style.display = gw ? 'none' : '';
+  document.getElementById('rmGwDesc').style.display = gw ? '' : 'none';
+}
+
 function saveMqttConfig() {
+  const isTC = document.getElementById('mqttPlatform').value === 'thingscloud';
+  const reportMode = document.getElementById('rmGateway').checked ? 'gateway' : 'subdevice';
+  if (reportMode !== 'subdevice' && reportMode !== 'gateway') {   // 前端枚举校验(不信任非法值)
+    showToast(t('toast.error'), 'error');
+    return;
+  }
+  if (window.__mqttEffectiveMode && reportMode !== window.__mqttEffectiveMode &&
+      !confirm(t('mqtt.report_mode.warn_change'))) {             // 切换提示:数据归属将变化
+    return;
+  }
   const data = {
+    platform_type: isTC ? 'thingscloud' : 'custom',
+    report_mode: reportMode,
     uri: document.getElementById('mqttUri').value,
     client_id: document.getElementById('mqttClientId').value,
     username: document.getElementById('mqttUser').value,
@@ -2502,7 +2648,24 @@ function saveMqttConfig() {
   };
   apiPut('/api/mqtt/config', data);
   showToast(t('toast.saved'), 'success');
-  addLog('info', `[MQTT] Configuration saved: URI=${data.uri}`);
+  addLog('info', `[MQTT] Configuration saved: platform=${data.platform_type} URI=${data.uri}`);
+  addLog('info', t('mqtt.report_mode.restart_hint'));
+  window.__mqttEffectiveMode = data.report_mode;
+  const effEl = document.getElementById('reportModeEffective');
+  if (effEl) effEl.textContent = `${t('mqtt.report_mode.effective')}: ${t('mqtt.report_mode.' + data.report_mode + '.short')}`;
+}
+
+/* Show/hide ThingsCloud vs Custom-MQTT fields and enforce ThingsCloud constraints. */
+function applyMqttPlatformUI() {
+  const isTC = document.getElementById('mqttPlatform').value === 'thingscloud';
+  document.querySelectorAll('.tc-only').forEach(e => { e.style.display = isTC ? '' : 'none'; });
+  document.querySelectorAll('.custom-only').forEach(e => { e.style.display = isTC ? 'none' : ''; });
+  const qosSel = document.getElementById('mqttQos');
+  if (isTC) {
+    qosSel.value = '0'; qosSel.disabled = true;
+  } else {
+    qosSel.disabled = false;
+  }
 }
 
 function collectModbusConfig() {
@@ -2545,9 +2708,49 @@ async function saveModbusConfig() {
   await persistModbusConfig(true);
 }
 
-function testMqttConnection() {
-  showToast(t('toast.mqtt_ok'), 'success');
-  addLog('ok', '[MQTT] Connection test: OK (broker responded)');
+async function testMqttConnection() {
+  const uri = document.getElementById('mqttUri').value.trim();
+  if (!uri) {
+    showToast(currentLang === 'zh' ? '请先填写 Broker URI' : 'Enter a broker URI first', 'error');
+    addLog('error', '[MQTT] Connection test: missing broker URI');
+    return;
+  }
+  const btn = event && event.target ? event.target : null;
+  if (btn) { btn.disabled = true; }
+  addLog('info', `[MQTT] Connection test: probing ${uri} ...`);
+  const result = await apiJson('POST', '/api/mqtt/test', {
+    uri: uri,
+    username: document.getElementById('mqttUser').value,
+    password: document.getElementById('mqttPass').value,
+    timeout_ms: 8000
+  }, 15000);
+  if (btn) { btn.disabled = false; }
+  if (result && result.success) {
+    showToast(currentLang === 'zh' ? '连接成功：Broker 已响应' : 'Connected: broker responded', 'success');
+    addLog('ok', '[MQTT] Connection test: OK (broker responded)');
+  } else {
+    const message = (result && (result.error || result.message)) || (currentLang === 'zh' ? '未知错误' : 'unknown error');
+    showToast((currentLang === 'zh' ? '连接失败：' : 'Connection failed: ') + message, 'error');
+    addLog('error', `[MQTT] Connection test: FAIL (${message})`);
+  }
+}
+
+async function disconnectMqtt() {
+  const btn = event && event.target ? event.target : null;
+  if (btn) { btn.disabled = true; }
+  addLog('info', '[MQTT] Disconnect: requesting broker disconnect ...');
+  const result = await apiJson('POST', '/api/mqtt/disconnect', {}, 15000);
+  if (btn) { btn.disabled = false; }
+  if (result && result.success) {
+    showToast(currentLang === 'zh' ? '已断开 MQTT 连接' : 'MQTT connection disconnected', 'info');
+    addLog('ok', '[MQTT] Disconnect: OK');
+    /* Refresh the badge immediately so the UI reflects the new state. */
+    if (typeof refreshAll === 'function') refreshAll();
+  } else {
+    const message = (result && (result.error || result.message)) || (currentLang === 'zh' ? '未知错误' : 'unknown error');
+    showToast((currentLang === 'zh' ? '断开失败：' : 'Disconnect failed: ') + message, 'error');
+    addLog('error', `[MQTT] Disconnect: FAIL (${message})`);
+  }
 }
 
 function scanWifi() {
@@ -2943,8 +3146,22 @@ async function loadRuntimeForms() {
   if (mqtt) {
     document.getElementById('mqttUri').value = mqtt.uri || '';
     document.getElementById('mqttClientId').value = mqtt.client_id || '';
-    document.getElementById('mqttUser').value = mqtt.username || '';
-    document.getElementById('mqttPass').value = mqtt.password || '';
+    document.getElementById('mqttPlatform').value = mqtt.platform_type === 'thingscloud' ? 'thingscloud' : 'custom';
+    const mode = mqtt.report_mode === 'gateway' ? 'gateway' : 'subdevice';
+    document.getElementById('rmSubdevice').checked = (mode === 'subdevice');
+    document.getElementById('rmGateway').checked = (mode === 'gateway');
+    window.__mqttEffectiveMode = mode;   // 运行中实际生效的模式(与表单配置区分)
+    const effEl = document.getElementById('reportModeEffective');
+    if (effEl) {
+      const gen = (typeof mqtt.config_generation === 'number') ? ` (gen ${mqtt.config_generation})` : '';
+      effEl.textContent = `${t('mqtt.report_mode.effective')}: ${t('mqtt.report_mode.' + mode + '.short')}${gen}`;
+    }
+    const userInput = document.getElementById('mqttUser');
+    const passInput = document.getElementById('mqttPass');
+    userInput.value = '';
+    passInput.value = '';
+    userInput.placeholder = mqtt.username_configured ? (mqtt.username_masked || '********') : 'MQTT Username';
+    passInput.placeholder = mqtt.password_configured ? '********' : 'MQTT Password';
     document.getElementById('mqttKeepalive').value = mqtt.keepalive || 60;
     document.getElementById('mqttQos').value = mqtt.qos ?? 1;
     document.getElementById('mqttTopicPrefix').value = mqtt.topic_prefix || '';
@@ -2956,6 +3173,8 @@ async function loadRuntimeForms() {
     document.getElementById('mqttLwtPayload').value = mqtt.lwt_payload || '';
     document.getElementById('mqttLwtQos').value = mqtt.lwt_qos ?? 1;
     document.getElementById('mqttLwtRetain').checked = mqtt.lwt_retain !== false;
+    applyMqttPlatformUI();
+    applyReportModeUI();
   }
   const modbus = await apiGet('/api/modbus/config');
   if (modbus) {
@@ -3283,7 +3502,7 @@ function renderDiscoveredDevices() {
         <td style="padding:5px 8px; text-align:right; font-family:monospace;">${rawStr}</td>
         <td style="padding:5px 8px; text-align:right; font-family:monospace;">${valStr}</td>
         <td style="padding:5px 8px; font-family:monospace; white-space:nowrap;">${windowStr}</td>
-        <td style="padding:5px 8px;">${regUnit}</td>
+        <td style="padding:5px 8px;">${displayUnit(regUnit)}</td>
         <td style="padding:5px 8px; text-align:center;">
           ${reg.writable ? '<span style="color:#a6e3a1;">&#10003;</span>' : '<span style="color:var(--text2);">&#10007;</span>'}
         </td>

@@ -94,6 +94,46 @@ typedef struct {
     uint8_t value_register_index;
 } amm_mapping_entry_v4_t;
 
+/* Binary layout used by schema v5, before gateway_property_key was appended.
+ * This is a strict prefix of the current amm_mapping_entry_t so migration is
+ * a plain prefix memcpy (the new trailing field is zeroed beforehand). */
+typedef struct {
+    uint32_t mapping_version;
+    source_protocol_t source_protocol;
+    uint8_t channel_id;
+    uint8_t slave_id;
+    uint8_t function_code;
+    uint16_t register_address;
+    data_type_t data_type;
+    byte_order_t byte_order;
+    modbus_object_type_t object_type;
+    float scale_factor;
+    float offset;
+    uint32_t poll_interval_ms;
+    uint8_t priority;
+    bool discovered;
+    char device_id[AMM_MAX_DEVICE_NAME_LEN];
+    char point_id[AMM_MAX_POINT_NAME_LEN];
+    char measurement_name[AMM_MAX_POINT_NAME_LEN];
+    char unit[AMM_MAX_UNIT_LEN];
+    char mqtt_topic[AMM_MAX_TOPIC_LEN];
+    control_constraint_t constraint;
+    bool active;
+    uint16_t read_start_address;
+    uint8_t read_register_count;
+    uint8_t value_register_index;
+    uint8_t bit_index;
+    uint8_t string_length;
+    uint8_t retry_count;
+    uint16_t retry_backoff_ms;
+    semantic_source_t semantic_source;
+    semantic_status_t semantic_status;
+    char semantic_profile_id[32];
+    uint32_t semantic_profile_version;
+    uint8_t semantic_confidence;
+    char semantic_evidence[48];
+} amm_mapping_entry_v5_t;
+
 /* Forward declaration – used by add/remove before its definition below. */
 static esp_err_t amm_save_to_nvs_unlocked(void);
 static esp_err_t amm_save_entry_to_nvs_unlocked(int index);
@@ -565,6 +605,53 @@ static bool amm_import_contains_device(const amm_mapping_entry_t *entries, int c
     return false;
 }
 
+/*
+ * User-verified semantics survive re-imports. When a profile/raw rebuild
+ * replaces an entry that the user previously edited (USER source, same
+ * physical key), the user's engineering metadata overlays the regenerated
+ * entry instead of being silently discarded with the old one.
+ */
+static void amm_overlay_user_semantics(const amm_mapping_entry_t *user_entry,
+                                       amm_mapping_entry_t *entry)
+{
+    entry->data_type = user_entry->data_type;
+    entry->byte_order = user_entry->byte_order;
+    entry->scale_factor = user_entry->scale_factor;
+    entry->offset = user_entry->offset;
+    entry->poll_interval_ms = user_entry->poll_interval_ms;
+    entry->priority = user_entry->priority;
+    entry->constraint = user_entry->constraint;
+    entry->read_start_address = user_entry->read_start_address;
+    entry->read_register_count = user_entry->read_register_count;
+    entry->value_register_index = user_entry->value_register_index;
+    strlcpy(entry->device_id, user_entry->device_id, sizeof(entry->device_id));
+    strlcpy(entry->point_id, user_entry->point_id, sizeof(entry->point_id));
+    strlcpy(entry->measurement_name, user_entry->measurement_name,
+            sizeof(entry->measurement_name));
+    strlcpy(entry->unit, user_entry->unit, sizeof(entry->unit));
+    strlcpy(entry->mqtt_topic, user_entry->mqtt_topic,
+            sizeof(entry->mqtt_topic));
+    entry->semantic_source = user_entry->semantic_source;
+    entry->semantic_status = user_entry->semantic_status;
+    entry->semantic_confidence = user_entry->semantic_confidence;
+    strlcpy(entry->semantic_profile_id, user_entry->semantic_profile_id,
+            sizeof(entry->semantic_profile_id));
+    entry->semantic_profile_version = user_entry->semantic_profile_version;
+    strlcpy(entry->semantic_evidence, user_entry->semantic_evidence,
+            sizeof(entry->semantic_evidence));
+}
+
+/* Physical-point key shared by dedup, lookup and user-semantics overlay. */
+static bool amm_same_physical_point(const amm_mapping_entry_t *a,
+                                    const amm_mapping_entry_t *b)
+{
+    return a->source_protocol == b->source_protocol &&
+           a->channel_id == b->channel_id &&
+           a->slave_id == b->slave_id &&
+           a->function_code == b->function_code &&
+           a->register_address == b->register_address;
+}
+
 esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
                               bool replace_devices, int *imported_count)
 {
@@ -637,13 +724,28 @@ esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
         if (entry.scale_factor == 0.0f) entry.scale_factor = 1.0f;
         amm_normalize_read_window(&entry);
 
+        /*
+         * A user-edited entry with the same physical key keeps its
+         * engineering semantics (unit/scale/range/type/identity) even when
+         * this import regenerates the point from a profile or raw scan.
+         */
+        for (int j = 0; j < s_mapping_count; ++j) {
+            const amm_mapping_entry_t *cur = &s_mapping_table[j];
+            if (cur->active && cur->semantic_source == SEMANTIC_SOURCE_USER &&
+                amm_same_physical_point(cur, &entry)) {
+                amm_overlay_user_semantics(cur, &entry);
+                ESP_LOGI(TAG, "User semantics preserved: %s ch%u slave=%u "
+                         "fc=%u reg=%u",
+                         entry.source_protocol == SRC_MODBUS_TCP ? "TCP" : "RTU",
+                         entry.channel_id, entry.slave_id, entry.function_code,
+                         entry.register_address);
+                break;
+            }
+        }
+
         int duplicate = -1;
         for (int j = 0; j < staged_count; ++j) {
-            if (staging[j].source_protocol == entry.source_protocol &&
-                staging[j].channel_id == entry.channel_id &&
-                staging[j].slave_id == entry.slave_id &&
-                staging[j].function_code == entry.function_code &&
-                staging[j].register_address == entry.register_address) {
+            if (amm_same_physical_point(&staging[j], &entry)) {
                 duplicate = j;
                 break;
             }
@@ -839,6 +941,8 @@ esp_err_t amm_enrich_context(tcm_context_t *ctx)
     ctx->semantic_confidence = entry->semantic_confidence;
     strlcpy(ctx->semantic_evidence, entry->semantic_evidence,
             sizeof(ctx->semantic_evidence));
+    strlcpy(ctx->gateway_property_key, entry->gateway_property_key,
+            sizeof(ctx->gateway_property_key));
     ctx->raw_value = ctx->value;
     ctx->value = ctx->raw_value * entry->scale_factor + entry->offset;
 
@@ -1163,6 +1267,18 @@ esp_err_t amm_load_from_nvs(void)
         ret = nvs_get_blob(handle, key, NULL, &blob_len);
         if (ret == ESP_OK && blob_len == sizeof(amm_mapping_entry_t)) {
             ret = nvs_get_blob(handle, key, &s_mapping_table[i], &blob_len);
+        } else if (ret == ESP_OK &&
+                   blob_len == sizeof(amm_mapping_entry_v5_t) &&
+                   s_loaded_schema_version == 5) {
+            amm_mapping_entry_v5_t legacy;
+            size_t legacy_len = sizeof(legacy);
+            ret = nvs_get_blob(handle, key, &legacy, &legacy_len);
+            if (ret == ESP_OK) {
+                /* v5 is a strict prefix of the current entry; copy the prefix
+                   and leave gateway_property_key zeroed (auto-generate mode). */
+                memset(&s_mapping_table[i], 0, sizeof(s_mapping_table[i]));
+                memcpy(&s_mapping_table[i], &legacy, sizeof(legacy));
+            }
         } else if (ret == ESP_OK &&
                    blob_len == sizeof(amm_mapping_entry_v4_t) &&
                    s_loaded_schema_version == 4) {

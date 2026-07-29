@@ -133,6 +133,9 @@ typedef struct {
     /* Metadata (not part of the 16 schema fields) */
     uint32_t sequence_id;                             /* Monotonic sequence for replay ordering */
     uint32_t mapping_version;
+    /* Optional user-defined ThingsCloud gateway property key. When empty the
+       gateway-mode reporter auto-generates "p{port}_s{slave}_{point}". */
+    char gateway_property_key[64];
     modbus_object_type_t object_type;
     semantic_source_t semantic_source;
     semantic_status_t semantic_status;

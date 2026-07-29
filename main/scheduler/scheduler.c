@@ -18,6 +18,8 @@
 #include "tcm/tcm_state_pool.h"
 #include "storage/history_store.h"
 #include "config/runtime_config.h"
+#include "cloud_adapter/cloud_adapter.h"
+#include "thingscloud/thingscloud_topics.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,21 +29,39 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 
 #include <string.h>
 #include <stdlib.h>
 
 static const char *TAG = "SCHED";
 
+/* Upstream (cloud) flush pacing. ThingsCloud enforces a per-device message
+ * rate limit; flushing too often can trip server-side flow control. Keep the
+ * periodic flush interval conservative. The adapter's token-bucket limiter
+ * provides the hard ceiling; this just lowers the baseline cadence. */
+#define THINGSCLOUD_FLUSH_INTERVAL_MS       10000
+#define THINGSCLOUD_GW_STATUS_INTERVAL_MS   60000
+
 /* ======================== Internal State ======================== */
 
 static QueueHandle_t s_raw_data_queue   = NULL;
 static QueueHandle_t s_context_queue    = NULL;
 static QueueHandle_t s_mqtt_out_queue  = NULL;
+/* Async offline-cache queue: publish_task enqueues here non-blockingly and
+   cache_writer_task performs the (slow/blocking) SPI-Flash FAT write. */
+static QueueHandle_t s_cache_queue      = NULL;
+/* The publish task stack is large (ThingsCloud path nests deeply) and internal
+   DRAM is too tight to host it, so it lives in PSRAM. The TCB must stay in
+   internal RAM (a requirement of FreeRTOS static allocation). */
+static StackType_t *s_publish_stack     = NULL;
+static StaticTask_t s_publish_tcb;
+#define PUBLISH_STACK_WORDS 16384  /* 64 KB (in PSRAM) */
 
 static TaskHandle_t s_task_modbus_poll    = NULL;
 static TaskHandle_t s_task_context_build  = NULL;
 static TaskHandle_t s_task_publish        = NULL;
+static TaskHandle_t s_task_cache_writer    = NULL;
 static TaskHandle_t s_task_replay         = NULL;
 static TaskHandle_t s_task_resource_mon   = NULL;
 
@@ -226,6 +246,19 @@ static void modbus_poll_task(void *arg)
             failed_state.network_state = get_network_state_locked();
             failed_state.validated = false;
             tcm_state_pool_update(&failed_state);
+            {
+                runtime_config_t rt_failure;
+                runtime_config_get(&rt_failure);
+                if (rt_failure.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) {
+                    /* Track per-slave online state in BOTH report modes so the
+                       gateway mode can report slave status attributes. */
+                    char tc_addr[40];
+                    thingscloud_format_device_address((uint8_t)cfg->channel_id,
+                                                      (uint8_t)cfg->slave_id,
+                                                      tc_addr, sizeof(tc_addr));
+                    thingscloud_subdev_register_failure(tc_addr);
+                }
+            }
             ESP_LOGW(TAG, "MODBUS read failed: slave=%u fc=0x%02X point=0x%04X "
                      "window=0x%04X+%u err=0x%x",
                      cfg->slave_id, cfg->function_code, cfg->register_address,
@@ -355,9 +388,35 @@ static void publish_task(void *arg)
     ESP_LOGI(TAG, "publish_task started");
 
     tcm_context_t ctx;
+    static int64_t s_last_tc_flush = 0;
+    static int64_t s_last_gw_status = 0;
+    static int64_t s_last_slave_status = 0;
 
     while (s_running) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
         if (xQueueReceive(s_context_queue, &ctx, pdMS_TO_TICKS(200)) != pdTRUE) {
+            /* Periodic ThingsCloud maintenance even when no telemetry arrives. */
+            runtime_config_t rt_periodic;
+            runtime_config_get(&rt_periodic);
+            if (rt_periodic.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD &&
+                mqtt_is_connected()) {
+                if (now_ms - s_last_tc_flush > THINGSCLOUD_FLUSH_INTERVAL_MS) {
+                    thingscloud_flush();
+                    s_last_tc_flush = now_ms;
+                }
+                if (now_ms - s_last_gw_status > THINGSCLOUD_GW_STATUS_INTERVAL_MS) {
+                    thingscloud_publish_gateway_status();
+                    s_last_gw_status = now_ms;
+                }
+                /* Gateway mode: periodic full slave-status heartbeat so the cloud
+                   always has a fresh online/summary snapshot even when nothing
+                   changed recently. */
+                if (rt_periodic.mqtt.report_mode == MQ_REPORT_GATEWAY &&
+                    now_ms - s_last_slave_status > THINGSCLOUD_GW_STATUS_INTERVAL_MS) {
+                    thingscloud_publish_gateway_slave_status();
+                    s_last_slave_status = now_ms;
+                }
+            }
             continue;
         }
 
@@ -378,57 +437,92 @@ static void publish_task(void *arg)
         }
 
         if (mqtt_is_connected()) {
-            /* Build MQTT output message with topic and serialized payload */
-            mqtt_out_msg_t out_msg;
-            memset(&out_msg, 0, sizeof(out_msg));
-
-            /* Determine topic from AMM mapping, or use default data topic */
-            if (amm_copy_mqtt_topic(ctx.source_protocol, ctx.channel_id, ctx.slave_id,
-                                    ctx.register_address, out_msg.topic,
-                                    sizeof(out_msg.topic)) == ESP_OK) {
-            } else {
-                strlcpy(out_msg.topic, runtime.mqtt.data_prefix, sizeof(out_msg.topic));
-                strlcat(out_msg.topic, ctx.device_id, sizeof(out_msg.topic));
-                strlcat(out_msg.topic, "/", sizeof(out_msg.topic));
-                strlcat(out_msg.topic, ctx.point_id, sizeof(out_msg.topic));
-            }
-
-            int json_len = tcm_serialize_json(&ctx, out_msg.payload,
-                                              sizeof(out_msg.payload));
-            if (json_len <= 0) {
-                ESP_LOGE(TAG, "JSON serialization failed for context_id=%lu",
-                         (unsigned long)ctx.context_id);
-                eval_increment_metric("mqtt_failed", 1);
-                continue;
-            }
-
-            out_msg.qos = 1;
-            out_msg.sequence_id = ctx.sequence_id;
-
-            if (xQueueSend(s_mqtt_out_queue, &out_msg, pdMS_TO_TICKS(100)) != pdTRUE) {
-                ESP_LOGW(TAG, "mqtt_out_queue full, caching record");
-                /* Fall back to cache when queue is full */
-                uif_cache_record(&ctx);
-                eval_increment_metric("cached_records", 1);
-            } else {
+            if (runtime.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) {
+                /* ThingsCloud: track per-slave online state (drives sub-device
+                   connect in SUBDEVICE mode and gateway status attributes in
+                   GATEWAY mode), then aggregate the point for upload. */
+                {
+                    char addr[40];
+                    thingscloud_format_device_address((uint8_t)ctx.channel_id, ctx.slave_id,
+                                                      addr, sizeof(addr));
+                    thingscloud_subdev_register_success(addr);
+                }
+                thingscloud_publish_context(&ctx);
                 eval_increment_metric("mqtt_published", 1);
+            } else {
+                /* Build MQTT output message with topic and serialized payload */
+                mqtt_out_msg_t out_msg;
+                memset(&out_msg, 0, sizeof(out_msg));
+
+                /* Determine topic from AMM mapping, or use default data topic */
+                if (amm_copy_mqtt_topic(ctx.source_protocol, ctx.channel_id, ctx.slave_id,
+                                        ctx.register_address, out_msg.topic,
+                                        sizeof(out_msg.topic)) == ESP_OK) {
+                } else {
+                    strlcpy(out_msg.topic, runtime.mqtt.data_prefix, sizeof(out_msg.topic));
+                    strlcat(out_msg.topic, ctx.device_id, sizeof(out_msg.topic));
+                    strlcat(out_msg.topic, "/", sizeof(out_msg.topic));
+                    strlcat(out_msg.topic, ctx.point_id, sizeof(out_msg.topic));
+                }
+
+                int json_len = tcm_serialize_json(&ctx, out_msg.payload,
+                                                  sizeof(out_msg.payload));
+                if (json_len <= 0) {
+                    ESP_LOGE(TAG, "JSON serialization failed for context_id=%lu",
+                             (unsigned long)ctx.context_id);
+                    eval_increment_metric("mqtt_failed", 1);
+                    continue;
+                }
+
+                out_msg.qos = 1;
+                out_msg.sequence_id = ctx.sequence_id;
+
+                if (xQueueSend(s_mqtt_out_queue, &out_msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+                    /* Fall back to offline cache (async, off the hot path). */
+                    if (xQueueSend(s_cache_queue, &ctx, 0) != pdTRUE) {
+                        eval_increment_metric("data_loss_count", 1);
+                    }
+                } else {
+                    eval_increment_metric("mqtt_published", 1);
+                }
             }
         } else {
-            /* Network unavailable - persist to cache */
-            esp_err_t cache_err = uif_cache_record(&ctx);
-            if (cache_err == ESP_OK) {
-                eval_increment_metric("cached_records", 1);
-                ESP_LOGD(TAG, "Cached record seq=%lu while MQTT is offline",
-                         (unsigned long)ctx.sequence_id);
-            } else {
-                ESP_LOGE(TAG, "Cache write failed for seq=%lu (err=0x%x)",
-                         (unsigned long)ctx.sequence_id, cache_err);
+            /* Network unavailable - persist to cache. The actual SPI-Flash FAT
+               write is slow/blocking, so offload it to cache_writer_task and
+               only perform a non-blocking enqueue here. */
+            if (xQueueSend(s_cache_queue, &ctx, 0) != pdTRUE) {
                 eval_increment_metric("data_loss_count", 1);
             }
         }
     }
 
     s_task_publish = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ======================== Cache writer task ======================== */
+/* The UIF offline cache writes to SPI-Flash FAT, which can be very slow or
+   even block under some flash/filesystem conditions. Doing it inline inside
+   publish_task starved the real-time telemetry path: the context queue
+   overflowed and ALL data was lost. This task owns the synchronous write so
+   publish_task only ever does a non-blocking queue push. */
+static void cache_writer_task(void *arg)
+{
+    (void)arg;
+    tcm_context_t ctx;
+    while (s_running) {
+        if (xQueueReceive(s_cache_queue, &ctx, portMAX_DELAY) == pdTRUE) {
+            esp_err_t err = uif_cache_record(&ctx);
+            if (err == ESP_OK) {
+                eval_increment_metric("cached_records", 1);
+            } else {
+                eval_increment_metric("data_loss_count", 1);
+                ESP_LOGW(TAG, "Async cache write failed for seq=%lu (err=0x%x)",
+                         (unsigned long)ctx.sequence_id, err);
+            }
+        }
+    }
+    s_task_cache_writer = NULL;
     vTaskDelete(NULL);
 }
 
@@ -576,6 +670,14 @@ void scheduler_init(QueueHandle_t raw_q,
         ESP_LOGE(TAG, "Failed to create replay trigger semaphore");
     }
 
+    /* Async offline-cache queue (publish_task -> cache_writer_task). Its depth is
+       intentionally small: offline persistence is best-effort and a slow/blocking
+       SPI-Flash write must never back-pressure the real-time telemetry path. */
+    s_cache_queue = xQueueCreate(16, sizeof(tcm_context_t));
+    if (s_cache_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create async cache queue");
+    }
+
     ESP_LOGI(TAG, "Scheduler initialized with dynamic AMM polling");
 }
 
@@ -605,11 +707,33 @@ void scheduler_start(void)
         ESP_LOGE(TAG, "Failed to create context_build_task");
     }
 
-    ret = xTaskCreate(publish_task, "publish", TASK_STACK_SIZE_MQTT,
-                      NULL, TASK_PRIORITY_MQTT, &s_task_publish);
-    if (ret != pdPASS) {
+    /* The publish path calls deep into the ThingsCloud adapter (context ->
+       gateway slave-status + RS485 summary + chunked attribute publish) which
+       holds several by-value copies of tcm_context_t / runtime_config_t on the
+       stack. 12 KB overflowed and crashed the device in a reboot loop, but a
+       plain 32 KB internal-RAM stack could not be allocated (DRAM too tight),
+       so the stack buffer is placed in PSRAM while the TCB stays in internal
+       RAM. */
+    if (s_publish_stack == NULL) {
+        s_publish_stack = heap_caps_malloc(PUBLISH_STACK_WORDS * sizeof(StackType_t),
+                                           MALLOC_CAP_SPIRAM);
+    }
+    if (s_publish_stack != NULL) {
+        /* Fully static creation: 32 KB stack buffer in PSRAM, TCB in internal
+           RAM. This both avoids the original 12 KB stack overflow and the
+           internal-DRAM exhaustion that a plain 32 KB xTaskCreate hit. */
+        s_task_publish = xTaskCreateStatic(publish_task, "publish",
+                                          PUBLISH_STACK_WORDS, NULL,
+                                          TASK_PRIORITY_MQTT,
+                                          s_publish_stack, &s_publish_tcb);
+    }
+    if (s_task_publish == NULL) {
         all_started = false;
-        ESP_LOGE(TAG, "Failed to create publish_task");
+        ESP_LOGE(TAG, "Failed to create publish_task (PSRAM stack)");
+        if (s_publish_stack) {
+            heap_caps_free(s_publish_stack);
+            s_publish_stack = NULL;
+        }
     }
 
     ret = xTaskCreate(replay_task, "replay", TASK_STACK_SIZE_SCHED,
@@ -617,6 +741,13 @@ void scheduler_start(void)
     if (ret != pdPASS) {
         all_started = false;
         ESP_LOGE(TAG, "Failed to create replay_task");
+    }
+
+    ret = xTaskCreate(cache_writer_task, "cache_writer", TASK_STACK_SIZE_SCHED,
+                      NULL, TASK_PRIORITY_SCHED, &s_task_cache_writer);
+    if (ret != pdPASS) {
+        all_started = false;
+        ESP_LOGE(TAG, "Failed to create cache_writer_task");
     }
 
     ret = xTaskCreate(resource_monitor_task, "res_monitor", TASK_STACK_SIZE_EVAL,
@@ -655,9 +786,17 @@ void scheduler_stop(void)
         vTaskDelete(s_task_publish);
         s_task_publish = NULL;
     }
+    if (s_publish_stack) {
+        heap_caps_free(s_publish_stack);
+        s_publish_stack = NULL;
+    }
     if (s_task_replay) {
         vTaskDelete(s_task_replay);
         s_task_replay = NULL;
+    }
+    if (s_task_cache_writer) {
+        vTaskDelete(s_task_cache_writer);
+        s_task_cache_writer = NULL;
     }
     if (s_task_resource_mon) {
         vTaskDelete(s_task_resource_mon);

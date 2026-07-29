@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 /* ======================== Type Definitions ======================== */
@@ -96,6 +97,9 @@ void mqtt_set_publish_ack_callback(mqtt_publish_ack_callback_t callback);
  */
 esp_err_t mqtt_subscribe(const char *topic, int qos, mqtt_cmd_callback_t cb);
 
+/** Custom-MQTT command downlink callback (defined in main.c). */
+void mqtt_command_callback(const char *topic, const char *data, int data_len);
+
 /**
  * @brief Get the current MQTT connection state.
  * @return mqtt_conn_state_t
@@ -109,9 +113,56 @@ mqtt_conn_state_t mqtt_get_connection_state(void);
 bool mqtt_is_connected(void);
 
 /**
+ * @brief Probe a broker URI with a throwaway client to verify it is actually
+ *        reachable and accepts the connection (with the given credentials).
+ *
+ * Used by the Web UI "Test Connection" action. Creates a temporary esp_mqtt
+ * client, attempts to connect, and tears it down before returning. Does NOT
+ * affect the persistent (configured) client.
+ *
+ * @param uri      Broker URI, e.g. "mqtt://host:1883" (must not be empty)
+ * @param username Optional username, or NULL/"" for anonymous
+ * @param password Optional password, or NULL/"" when none
+ * @param timeout_ms Connection timeout in ms (<=0 falls back to MQTT_PUBLISH_TIMEOUT_MS)
+ * @param reason   Optional output buffer filled with a human-readable reason
+ *                 for the result (e.g. "DNS resolution failed", "broker
+ *                 rejected login"). May be NULL.
+ * @param reason_len Size of the reason buffer in bytes.
+ * @return ESP_OK on successful connect, ESP_ERR_TIMEOUT if no response,
+ *         ESP_ERR_INVALID_ARG for empty URI, otherwise ESP_FAIL (auth/network error)
+ */
+esp_err_t mqtt_test_connection(const char *uri, const char *username,
+                               const char *password, int timeout_ms,
+                               char *reason, size_t reason_len);
+
+/**
  * @brief Shut down and destroy the MQTT client, releasing all resources.
  */
 void mqtt_destroy(void);
+
+/**
+ * @brief Tear down and re-create the MQTT client using the current runtime
+ *        configuration. Used after the broker settings are changed at runtime
+ *        (e.g. via the Web UI) so the new parameters take effect immediately
+ *        without a full device reboot. The subscription table is preserved,
+ *        so all previously registered topics (e.g. the command topic) are
+ *        re-subscribed automatically once the new client connects.
+ * @return ESP_OK if the restart was initiated
+ */
+esp_err_t mqtt_restart(void);
+
+/**
+ * @brief Disconnect the MQTT client from the broker without destroying the
+ *        module configuration or the subscription table.
+ *
+ * The connection stays down until mqtt_init()/mqtt_restart() is called again
+ * (e.g. when the user saves new broker settings). Intended for the Web UI
+ * "Disconnect" action so the user can drop the broker link on demand without
+ * losing the configured parameters.
+ * @return ESP_OK if the client was stopped, ESP_ERR_INVALID_STATE if the client
+ *         was not running.
+ */
+esp_err_t mqtt_disconnect(void);
 
 /**
  * @brief Get the current MQTT mode (standard or OneNET).

@@ -124,24 +124,54 @@ void semantic_inference_build_raw_mapping(
                  device->source_protocol == SRC_MODBUS_TCP ? "tcp" : "rtu",
                  device->channel_id, device->slave_id);
     }
-    snprintf(entry->point_id, sizeof(entry->point_id), "raw_fc%02u_%u",
-             point->function_code, point->address);
-    snprintf(entry->measurement_name, sizeof(entry->measurement_name),
-             "Raw FC%02u %u", point->function_code, point->address);
-    entry->unit[0] = '\0';
+
+    if (point->user_edited) {
+        /*
+         * The user confirmed this point in the discovery editor before the
+         * mapping was (re)applied: keep their semantics instead of the
+         * conservative raw defaults and mark the point USER/VERIFIED.
+         */
+        snprintf(entry->point_id, sizeof(entry->point_id), "raw_fc%02u_%u",
+                 point->function_code, point->address);
+        if (point->name != NULL && point->name[0] != '\0') {
+            strlcpy(entry->measurement_name, point->name,
+                    sizeof(entry->measurement_name));
+        } else {
+            snprintf(entry->measurement_name, sizeof(entry->measurement_name),
+                     "Raw FC%02u %u", point->function_code, point->address);
+        }
+        if (point->unit != NULL) {
+            strlcpy(entry->unit, point->unit, sizeof(entry->unit));
+        }
+        entry->data_type = point->data_type;
+        entry->constraint.writable = point->writable;
+        entry->constraint.valid_range_min = point->range_min;
+        entry->constraint.valid_range_max = point->range_max;
+        entry->semantic_source = SEMANTIC_SOURCE_USER;
+        entry->semantic_status = SEMANTIC_STATUS_VERIFIED;
+        entry->semantic_confidence = 100;
+        strlcpy(entry->semantic_evidence, "user edit via discovery editor",
+                sizeof(entry->semantic_evidence));
+    } else {
+        snprintf(entry->point_id, sizeof(entry->point_id), "raw_fc%02u_%u",
+                 point->function_code, point->address);
+        snprintf(entry->measurement_name, sizeof(entry->measurement_name),
+                 "Raw FC%02u %u", point->function_code, point->address);
+        entry->unit[0] = '\0';
+        entry->constraint.writable = false;
+        raw_range(point->function_code,
+                  &entry->constraint.valid_range_min,
+                  &entry->constraint.valid_range_max);
+        entry->semantic_source = SEMANTIC_SOURCE_DISCOVERY;
+        entry->semantic_status = SEMANTIC_STATUS_UNRESOLVED;
+        entry->semantic_confidence = identity->confidence;
+        strlcpy(entry->semantic_evidence, identity->evidence,
+                sizeof(entry->semantic_evidence));
+    }
     snprintf(entry->mqtt_topic, sizeof(entry->mqtt_topic),
              "factory/data/%s/%s", entry->device_id, entry->point_id);
 
-    entry->constraint.writable = false;
-    raw_range(point->function_code,
-              &entry->constraint.valid_range_min,
-              &entry->constraint.valid_range_max);
-    entry->semantic_source = SEMANTIC_SOURCE_DISCOVERY;
-    entry->semantic_status = SEMANTIC_STATUS_UNRESOLVED;
     strlcpy(entry->semantic_profile_id, identity->profile_id,
             sizeof(entry->semantic_profile_id));
     entry->semantic_profile_version = 0;
-    entry->semantic_confidence = identity->confidence;
-    strlcpy(entry->semantic_evidence, identity->evidence,
-            sizeof(entry->semantic_evidence));
 }

@@ -37,6 +37,7 @@
 #include "automation/automation_web.h"
 #include "mcp/mcp_http.h"
 #include "config/runtime_config.h"
+#include "cloud_adapter/cloud_adapter.h"
 #include "uif/uif_persistence.h"
 #include "board/tf_storage.h"
 #include "network/network_manager.h"
@@ -424,6 +425,18 @@ static esp_err_t wifi_config_put_handler(httpd_req_t *req)
                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
 }
 
+/* Run mqtt_restart() in the background so saving config never blocks the
+   HTTP response: esp_mqtt_client_stop() may wait on an unreachable broker
+   (e.g. a hung DNS lookup), which would otherwise stall the request. */
+static volatile bool s_mqtt_restart_pending = false;
+static void mqtt_restart_task(void *arg)
+{
+    (void)arg;
+    mqtt_restart();
+    s_mqtt_restart_pending = false;
+    vTaskDelete(NULL);
+}
+
 /* ================================================================
  * GET /api/mqtt/config
  * ================================================================ */
@@ -433,10 +446,20 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
     runtime_config_get(&config);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "enabled", config.mqtt.enabled);
+    cJSON_AddStringToObject(root, "platform_type",
+        (config.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) ? "thingscloud" : "custom");
     cJSON_AddStringToObject(root, "uri", config.mqtt.uri);
     cJSON_AddStringToObject(root, "client_id", config.mqtt.client_id);
-    cJSON_AddStringToObject(root, "username", config.mqtt.username);
-    cJSON_AddStringToObject(root, "password", config.mqtt.password[0] ? "********" : "");
+    /* Never return full credentials; expose only configured flags + masked. */
+    cJSON_AddBoolToObject(root, "username_configured", config.mqtt.username[0] != '\0');
+    cJSON_AddBoolToObject(root, "password_configured", config.mqtt.password[0] != '\0');
+    {
+        char umask[32], pmask[32];
+        thingscloud_mask_credential(config.mqtt.username, umask, sizeof(umask));
+        thingscloud_mask_credential(config.mqtt.password, pmask, sizeof(pmask));
+        cJSON_AddStringToObject(root, "username_masked", umask);
+        cJSON_AddStringToObject(root, "password_masked", pmask);
+    }
     cJSON_AddNumberToObject(root, "keepalive", config.mqtt.keepalive_sec);
     cJSON_AddNumberToObject(root, "qos", config.mqtt.qos);
     cJSON_AddStringToObject(root, "topic_prefix", config.mqtt.data_prefix);
@@ -448,6 +471,10 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "lwt_payload", config.mqtt.lwt_payload);
     cJSON_AddNumberToObject(root, "lwt_qos", config.mqtt.lwt_qos);
     cJSON_AddBoolToObject(root, "lwt_retain", config.mqtt.lwt_retain);
+    cJSON_AddStringToObject(root, "report_mode",
+        (config.mqtt.report_mode == MQ_REPORT_GATEWAY) ? "gateway" : "subdevice");
+    cJSON_AddNumberToObject(root, "config_generation",
+                            (double)thingscloud_get_config_generation());
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -471,17 +498,66 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
     runtime_config_t config;
     runtime_config_get(&config);
 #define COPY_MQTT_STRING(key, field) do { cJSON *item = cJSON_GetObjectItem(root, key); \
-    if (cJSON_IsString(item) && strcmp(item->valuestring, "********") != 0) \
-        strlcpy(config.mqtt.field, item->valuestring, sizeof(config.mqtt.field)); } while (0)
+    if (cJSON_IsString(item) && strcmp(item->valuestring, "********") != 0) { \
+        char _t[sizeof(config.mqtt.field)]; \
+        strlcpy(_t, item->valuestring, sizeof(_t)); \
+        /* Trim leading/trailing whitespace so a stray space in client_id/uri   \
+         * does not get rejected by the broker. */ \
+        char *_s = _t, *_e = _t + strlen(_t); \
+        while (*_s == ' ' || *_s == '\t') _s++; \
+        while (_e > _s && (_e[-1] == ' ' || _e[-1] == '\t')) _e--; \
+        *_e = '\0'; \
+        strlcpy(config.mqtt.field, _s, sizeof(config.mqtt.field)); \
+    } } while (0)
     COPY_MQTT_STRING("uri", uri);
     COPY_MQTT_STRING("client_id", client_id);
-    COPY_MQTT_STRING("username", username);
-    COPY_MQTT_STRING("password", password);
     COPY_MQTT_STRING("topic_prefix", data_prefix);
     COPY_MQTT_STRING("command_prefix", command_prefix);
     COPY_MQTT_STRING("lwt_topic", lwt_topic);
     COPY_MQTT_STRING("lwt_payload", lwt_payload);
 #undef COPY_MQTT_STRING
+
+    /* platform_type */
+    cJSON *plat = cJSON_GetObjectItem(root, "platform_type");
+    if (cJSON_IsString(plat)) {
+        if (strcmp(plat->valuestring, "thingscloud") == 0)
+            config.mqtt.platform_type = MQTT_PLATFORM_THINGSCLOUD;
+        else
+            config.mqtt.platform_type = MQTT_PLATFORM_CUSTOM;
+    }
+
+    /* report_mode: sub-device vs gateway aggregation (ThingsCloud only) */
+    cJSON *rmode = cJSON_GetObjectItem(root, "report_mode");
+    if (cJSON_IsString(rmode)) {
+        if (strcmp(rmode->valuestring, "gateway") == 0)
+            config.mqtt.report_mode = MQ_REPORT_GATEWAY;
+        else
+            config.mqtt.report_mode = MQ_REPORT_SUBDEVICE;
+    }
+
+    /* username / password handling:
+       - empty string  -> keep existing value (do NOT clear)
+       - "********"     -> keep existing value (mask placeholder echoed back)
+       - clear_username / clear_password = true -> explicitly clear */
+    bool clear_user = false, clear_pass = false;
+    cJSON *cv = cJSON_GetObjectItem(root, "clear_username");
+    if (cJSON_IsBool(cv)) clear_user = cJSON_IsTrue(cv);
+    cv = cJSON_GetObjectItem(root, "clear_password");
+    if (cJSON_IsBool(cv)) clear_pass = cJSON_IsTrue(cv);
+
+    cJSON *ui = cJSON_GetObjectItem(root, "username");
+    if (cJSON_IsString(ui)) {
+        if (clear_user) config.mqtt.username[0] = '\0';
+        else if (ui->valuestring[0] != '\0' && strcmp(ui->valuestring, "********") != 0)
+            strlcpy(config.mqtt.username, ui->valuestring, sizeof(config.mqtt.username));
+    }
+    cJSON *pi = cJSON_GetObjectItem(root, "password");
+    if (cJSON_IsString(pi)) {
+        if (clear_pass) config.mqtt.password[0] = '\0';
+        else if (pi->valuestring[0] != '\0' && strcmp(pi->valuestring, "********") != 0)
+            strlcpy(config.mqtt.password, pi->valuestring, sizeof(config.mqtt.password));
+    }
+
     cJSON *value = cJSON_GetObjectItem(root, "enabled");
     if (cJSON_IsBool(value)) config.mqtt.enabled = cJSON_IsTrue(value);
     value = cJSON_GetObjectItem(root, "keepalive");
@@ -499,10 +575,141 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
         config.mqtt.lwt_qos = value->valueint;
     value = cJSON_GetObjectItem(root, "lwt_retain");
     if (cJSON_IsBool(value)) config.mqtt.lwt_retain = cJSON_IsTrue(value);
+
+    /* ThingsCloud mandates QoS 0, no retain, and disables the custom LWT. */
+    if (config.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) {
+        config.mqtt.qos = 0;
+        config.mqtt.retain = false;
+        config.mqtt.lwt_enabled = false;
+        config.mqtt.lwt_retain = false;
+    }
+
     esp_err_t err = runtime_config_set(&config);
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+    }
+
+    /* Re-establish the broker connection with the new settings, but in a
+       background task so this HTTP request returns immediately (stopping a
+       client that was dialing an unreachable broker can take seconds). */
+    if (!s_mqtt_restart_pending) {
+        s_mqtt_restart_pending = true;
+        xTaskCreate(mqtt_restart_task, "mqtt_restart", 4096, NULL, 6, NULL);
+    }
+
     cJSON_Delete(root);
-    return err == ESP_OK ? send_json(req, "{\"status\":\"ok\",\"restart_required\":true}")
-                         : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+    return send_json(req, "{\"status\":\"ok\",\"restart_required\":false}");
+}
+
+/* ================================================================
+ * POST /api/mqtt/test
+ *  Actually probe the broker URI (with credentials) using a
+ *  throwaway MQTT client, so the Web UI "Test Connection" button
+ *  reports the REAL result instead of always claiming success.
+ * ================================================================ */
+static esp_err_t mqtt_test_post_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+    cJSON *root = parse_request_json(req);
+    if (!root) {
+        httpd_resp_send_400(req);
+        return ESP_FAIL;
+    }
+
+    char uri[128] = {0};
+    char username[64] = {0};
+    char password[96] = {0};
+    int timeout_ms = MQTT_PUBLISH_TIMEOUT_MS;
+
+    cJSON *item = cJSON_GetObjectItem(root, "uri");
+    if (!cJSON_IsString(item) || item->valuestring[0] == '\0') {
+        cJSON_Delete(root);
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "success", false);
+        cJSON_AddStringToObject(resp, "error", "Missing broker URI");
+        char *json = cJSON_PrintUnformatted(resp);
+        send_json(req, json);
+        free(json);
+        cJSON_Delete(resp);
+        return ESP_OK;
+    }
+    strlcpy(uri, item->valuestring, sizeof(uri));
+
+    item = cJSON_GetObjectItem(root, "username");
+    if (cJSON_IsString(item)) strlcpy(username, item->valuestring, sizeof(username));
+    item = cJSON_GetObjectItem(root, "password");
+    if (cJSON_IsString(item) && strcmp(item->valuestring, "********") != 0)
+        strlcpy(password, item->valuestring, sizeof(password));
+    item = cJSON_GetObjectItem(root, "timeout_ms");
+    if (cJSON_IsNumber(item) && item->valueint > 0) timeout_ms = item->valueint;
+
+    /* Quick gate: if the board itself has no internet uplink (no Ethernet IP
+       and WiFi STA not connected to a router), a public broker can never be
+       reached - report that directly instead of a generic failure. */
+    if (!network_manager_is_online()) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "success", false);
+        cJSON_AddStringToObject(resp, "error",
+            "board has no internet connection (no Ethernet IP and WiFi STA not connected to a router)");
+        char *json = cJSON_PrintUnformatted(resp);
+        send_json(req, json);
+        free(json);
+        cJSON_Delete(resp);
+        cJSON_Delete(root);
+        return ESP_OK;
+    }
+
+    char reason[160] = {0};
+    esp_err_t res = mqtt_test_connection(uri,
+                                         username[0] ? username : NULL,
+                                         password[0] ? password : NULL,
+                                         timeout_ms, reason, sizeof(reason));
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", res == ESP_OK);
+    if (res == ESP_OK) {
+        cJSON_AddStringToObject(resp, "message", reason[0] ? reason : "Connected to broker");
+    } else {
+        cJSON_AddStringToObject(resp, "error",
+            reason[0] ? reason :
+            (res == ESP_ERR_INVALID_ARG ? "Invalid broker URI" :
+             res == ESP_ERR_TIMEOUT ? "Connection timeout (broker unreachable)" :
+             "Connection failed (auth or network error)"));
+    }
+    char *json = cJSON_PrintUnformatted(resp);
+    send_json(req, json);
+    free(json);
+    cJSON_Delete(resp);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* ================================================================
+ * POST /api/mqtt/disconnect
+ *  Drop the current broker connection on demand. The client is stopped
+ *  (no auto-reconnect) but the configuration and subscription table are
+ *  preserved, so saving the settings again (or a reboot) will reconnect.
+ * ================================================================ */
+static esp_err_t mqtt_disconnect_post_handler(httpd_req_t *req)
+{
+    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = mqtt_disconnect();
+    cJSON *resp = cJSON_CreateObject();
+    if (err == ESP_OK) {
+        cJSON_AddBoolToObject(resp, "success", true);
+        cJSON_AddStringToObject(resp, "message", "MQTT connection disconnected");
+    } else {
+        cJSON_AddBoolToObject(resp, "success", false);
+        cJSON_AddStringToObject(resp, "error",
+            err == ESP_ERR_INVALID_STATE ? "MQTT client is not connected" : "Failed to disconnect");
+    }
+    char *json = cJSON_PrintUnformatted(resp);
+    send_json(req, json);
+    free(json);
+    cJSON_Delete(resp);
+    return ESP_OK;
 }
 
 /* ================================================================
@@ -616,6 +823,44 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
 }
 
+/* Compute the effective gateway-mode property key for a mapping entry: the
+ * custom gateway_property_key when set, else the auto-generated
+ * "p{port}_s{slave}_{point}" form. */
+static void mapping_effective_gw_key(const amm_mapping_entry_t *e, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+    if (e == NULL) return;
+    if (e->gateway_property_key[0] != '\0') {
+        strlcpy(out, e->gateway_property_key, out_size);
+    } else {
+        build_gateway_property_key((uint8_t)(e->channel_id + 1), e->slave_id,
+                                   e->point_id, out, out_size);
+    }
+}
+
+/* Returns true when `key` collides with another mapping's effective gateway
+ * key, ignoring the same physical point (protocol/channel/slave/register). */
+static bool gateway_key_conflicts(const amm_mapping_entry_t *new_entry, const char *key)
+{
+    if (new_entry == NULL || key == NULL || key[0] == '\0') return false;
+    int n = amm_get_mapping_count();
+    for (int i = 0; i < n; ++i) {
+        amm_mapping_entry_t e;
+        if (amm_get_entry_at(i, &e) != ESP_OK) continue;
+        if (e.source_protocol == new_entry->source_protocol &&
+            e.channel_id == new_entry->channel_id &&
+            e.slave_id == new_entry->slave_id &&
+            e.register_address == new_entry->register_address) {
+            continue;   /* same physical point (overwrite in place) */
+        }
+        char other[64];
+        mapping_effective_gw_key(&e, other, sizeof(other));
+        if (other[0] != '\0' && strcmp(other, key) == 0) return true;
+    }
+    return false;
+}
+
 /* ================================================================
  * GET /api/mappings -List all mapping entries
  * ================================================================ */
@@ -673,6 +918,7 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddStringToObject(obj, "measurement_name", e->measurement_name);
         cJSON_AddStringToObject(obj, "unit", e->unit);
         cJSON_AddStringToObject(obj, "mqtt_topic", e->mqtt_topic);
+        cJSON_AddStringToObject(obj, "gateway_property_key", e->gateway_property_key);
         cJSON_AddBoolToObject(obj, "writable", e->constraint.writable);
         cJSON_AddNumberToObject(obj, "range_min", e->constraint.valid_range_min);
         cJSON_AddNumberToObject(obj, "range_max", e->constraint.valid_range_max);
@@ -804,6 +1050,8 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         strncpy(entry.unit, v->valuestring, AMM_MAX_UNIT_LEN - 1);
     if ((v = cJSON_GetObjectItem(root, "mqtt_topic")) && cJSON_IsString(v))
         strncpy(entry.mqtt_topic, v->valuestring, AMM_MAX_TOPIC_LEN - 1);
+    if ((v = cJSON_GetObjectItem(root, "gateway_property_key")) && cJSON_IsString(v))
+        strlcpy(entry.gateway_property_key, v->valuestring, sizeof(entry.gateway_property_key));
 
     /* Constraint */
     if ((v = cJSON_GetObjectItem(root, "writable")) && cJSON_IsBool(v))
@@ -814,6 +1062,31 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         entry.constraint.valid_range_max = (float)v->valuedouble;
 
     entry.active = true;
+
+    /* Gateway-mode property key checks: a custom key must be well-formed, and
+       the effective key (custom or auto-generated) must be unique. Enforced at
+       the backend because the frontend is not trusted. */
+    if (entry.gateway_property_key[0] != '\0' &&
+        !thingscloud_gateway_key_valid(entry.gateway_property_key)) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"status\":\"error\",\"reason\":\"invalid gateway_property_key\"}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+    {
+        char eff_key[64];
+        mapping_effective_gw_key(&entry, eff_key, sizeof(eff_key));
+        if (gateway_key_conflicts(&entry, eff_key)) {
+            cJSON_Delete(root);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_send(req, "{\"status\":\"error\",\"reason\":\"duplicate gateway property key\"}",
+                            HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+    }
 
     esp_err_t err = amm_add_mapping(&entry);
     if (err == ESP_OK && old_slave != 0 &&
@@ -909,6 +1182,8 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     if (cJSON_IsString(value)) strlcpy(entry->unit, value->valuestring, sizeof(entry->unit));
     value = cJSON_GetObjectItem(root, "mqtt_topic");
     if (cJSON_IsString(value)) strlcpy(entry->mqtt_topic, value->valuestring, sizeof(entry->mqtt_topic));
+    value = cJSON_GetObjectItem(root, "gateway_property_key");
+    if (cJSON_IsString(value)) strlcpy(entry->gateway_property_key, value->valuestring, sizeof(entry->gateway_property_key));
     value = cJSON_GetObjectItem(root, "semantic_profile_id");
     if (cJSON_IsString(value)) {
         strlcpy(entry->semantic_profile_id, value->valuestring,
@@ -935,6 +1210,9 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     value = cJSON_GetObjectItem(root, "range_max");
     if (cJSON_IsNumber(value)) entry->constraint.valid_range_max = (float)value->valuedouble;
     entry->active = true;
+
+    if (entry->gateway_property_key[0] != '\0' &&
+        !thingscloud_gateway_key_valid(entry->gateway_property_key)) return false;
 
     return entry->slave_id >= 1 &&
            entry->function_code >= 1 && entry->function_code <= 4 &&
@@ -1368,9 +1646,13 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
             err = send_json_string_chunk(req, reg->inferred_unit);
             if (err != ESP_OK) break;
             length = snprintf(chunk, sizeof(chunk),
-                              ",\"writable\":%s,\"valid\":%s}",
+                              ",\"writable\":%s,\"valid\":%s,"
+                              "\"range_min\":%.9g,\"range_max\":%.9g,"
+                              "\"user_edited\":%s}",
                               reg->writable ? "true" : "false",
-                              reg->valid ? "true" : "false");
+                              reg->valid ? "true" : "false",
+                              (double)reg->range_min, (double)reg->range_max,
+                              reg->user_edited ? "true" : "false");
             if (length < 0 || length >= sizeof(chunk) ||
                 (err = httpd_resp_send_chunk(req, chunk, length)) != ESP_OK) break;
         }
@@ -1640,10 +1922,28 @@ static esp_err_t discover_register_put_handler(httpd_req_t *req)
     }
     if ((v = cJSON_GetObjectItem(body, "writable")) && cJSON_IsBool(v))
         writable = cJSON_IsTrue(v);
-    if ((v = cJSON_GetObjectItem(body, "range_min")) && cJSON_IsNumber(v))
+    bool has_range_min = false, has_range_max = false;
+    if ((v = cJSON_GetObjectItem(body, "range_min")) && cJSON_IsNumber(v)) {
         range_min = (float)v->valuedouble;
-    if ((v = cJSON_GetObjectItem(body, "range_max")) && cJSON_IsNumber(v))
+        has_range_min = true;
+    }
+    if ((v = cJSON_GetObjectItem(body, "range_max")) && cJSON_IsNumber(v)) {
         range_max = (float)v->valuedouble;
+        has_range_max = true;
+    }
+    /*
+     * The edit form may omit the range fields. Fall back to the register's
+     * current range so the AMM write-through does not clobber a previously
+     * configured valid range with handler defaults.
+     */
+    if (!has_range_min || !has_range_max) {
+        const discovered_register_t *cur =
+            modbus_discover_find_register(slave_id, reg_addr);
+        if (cur) {
+            if (!has_range_min) range_min = cur->range_min;
+            if (!has_range_max) range_max = cur->range_max;
+        }
+    }
 
     esp_err_t err = modbus_discover_update_register(slave_id, reg_addr,
                                                       name, unit, dtype,
@@ -1984,6 +2284,12 @@ esp_err_t web_server_start(uint16_t port)
     const httpd_uri_t mqtt_put = {
         .uri = "/api/mqtt/config", .method = HTTP_PUT, .handler = mqtt_config_put_handler,
     };
+    const httpd_uri_t mqtt_test_post = {
+        .uri = "/api/mqtt/test", .method = HTTP_POST, .handler = mqtt_test_post_handler,
+    };
+    const httpd_uri_t mqtt_disconnect_post = {
+        .uri = "/api/mqtt/disconnect", .method = HTTP_POST, .handler = mqtt_disconnect_post_handler,
+    };
     const httpd_uri_t modbus_get = {
         .uri = "/api/modbus/config", .method = HTTP_GET, .handler = modbus_config_get_handler,
     };
@@ -2087,6 +2393,8 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &wifi_put);
     httpd_register_uri_handler(s_server, &mqtt_get);
     httpd_register_uri_handler(s_server, &mqtt_put);
+    httpd_register_uri_handler(s_server, &mqtt_test_post);
+    httpd_register_uri_handler(s_server, &mqtt_disconnect_post);
     httpd_register_uri_handler(s_server, &modbus_get);
     httpd_register_uri_handler(s_server, &modbus_put);
     httpd_register_uri_handler(s_server, &modbus_logs_get);

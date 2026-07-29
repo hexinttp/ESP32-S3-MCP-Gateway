@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "modbus/modbus_access.h"
 #include "modbus/modbus_discover.h"
 #include "modbus/modbus_tcp_server.h"
@@ -42,7 +43,7 @@ static void init_nvs(void)
     ESP_ERROR_CHECK(err);
 }
 
-static void mqtt_command_callback(const char *topic, const char *payload, int length)
+void mqtt_command_callback(const char *topic, const char *payload, int length)
 {
     (void)topic;
     char json[TCM_MAX_JSON_LEN];
@@ -181,15 +182,22 @@ void app_main(void)
     }
 
     scheduler_init(raw, context, mqtt_out);
-    xTaskCreate(mqtt_publish_task, "mqtt_out", 4096, mqtt_out,
+    xTaskCreate(mqtt_publish_task, "mqtt_out", 8192, mqtt_out,
                 TASK_PRIORITY_MQTT, NULL);
-    char command_topic[128];
-    snprintf(command_topic, sizeof(command_topic), "%s%s", config.mqtt.command_prefix,
-             config.gateway_id);
-    mqtt_subscribe(command_topic, 1, mqtt_command_callback);
+    if (config.mqtt.platform_type == MQTT_PLATFORM_CUSTOM) {
+        char command_topic[128];
+        snprintf(command_topic, sizeof(command_topic), "%s%s", config.mqtt.command_prefix,
+                 config.gateway_id);
+        mqtt_subscribe(command_topic, 1, mqtt_command_callback);
+    }
     ESP_ERROR_CHECK(web_server_start(80));
     ESP_ERROR_CHECK(modbus_tcp_server_start());
     scheduler_start();
+    ESP_LOGI(TAG, "Boot mem: internal free=%lu total=%lu, spiram free=%lu total=%lu",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned long)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     ESP_ERROR_CHECK(automation_start());
     if (config.lcd_enabled && board_get_status()->lcd_ready) {
         xTaskCreate(lcd_menu_task, "lcd_menu", 4096, NULL, 2, NULL);

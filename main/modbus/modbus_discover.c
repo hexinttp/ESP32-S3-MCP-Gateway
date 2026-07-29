@@ -4,6 +4,7 @@
  */
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -82,6 +83,51 @@ static esp_err_t discover_read_registers(source_protocol_t protocol, uint8_t cha
     uint16_t offset = discover_register_offset(function_code, configured_address);
     return modbus_read_channel(protocol, channel_id, slave_id, function_code,
                                offset, reg_count, raw_regs);
+}
+
+/* Defined in the apply section; used by the profile-guided probe. */
+static data_type_t profile_data_type(const char *name);
+static uint8_t profile_type_width(data_type_t type);
+static bool discovered_has_register(const discovered_device_t *device,
+                                    uint16_t address, uint8_t function_code);
+
+/*
+ * Append one discovered register word to a device, including the
+ * address-range-based semantic guess and suggested engineering range.
+ * `origin` distinguishes linear-scan hits from profile-guided probes in logs.
+ */
+static void discover_append_register(discovered_device_t *dev,
+                                     uint8_t function_code,
+                                     uint16_t point_address,
+                                     uint16_t raw_value,
+                                     uint16_t read_start,
+                                     uint8_t read_count,
+                                     uint8_t value_index,
+                                     const char *origin)
+{
+    discovered_register_t *reg = &dev->registers[dev->reg_count++];
+    memset(reg, 0, sizeof(*reg));
+    reg->register_address = point_address;
+    reg->function_code = function_code;
+    reg->raw_value = raw_value;
+    reg->inferred_type = function_code <= 2 ? DT_BOOL :
+        (((int16_t)raw_value < 0) ? DT_INT16 : DT_UINT16);
+    reg->sample_value = reg->inferred_type == DT_INT16 ?
+                        (float)(int16_t)raw_value : (float)raw_value;
+    reg->read_start_address = read_start;
+    reg->read_register_count = read_count;
+    reg->value_register_index = value_index;
+    reg->writable = false;
+    reg->valid = true;
+    modbus_discover_infer_semantics(point_address, reg->sample_value,
+                                    reg->inferred_name, reg->inferred_unit,
+                                    &reg->range_min, &reg->range_max);
+    ESP_LOGI(TAG, "  FC%02u [%u] raw=%u window=%u+%u index=%u%s",
+             function_code, point_address, raw_value, read_start, read_count,
+             value_index, origin ? origin : "");
+    taskENTER_CRITICAL(&s_result_lock);
+    ++s_result.registers_found;
+    taskEXIT_CRITICAL(&s_result_lock);
 }
 
 static void discover_default_functions(discover_scan_params_t *params)
@@ -682,36 +728,9 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
              dev->reg_count < DISCOVER_MAX_REGS_PER_SLAVE; ++i) {
             uint16_t point_address = probe.address + i;
             if (point_address > reg_end) break;
-
-            discovered_register_t *reg = &dev->registers[dev->reg_count++];
-            memset(reg, 0, sizeof(*reg));
-            reg->register_address = point_address;
-            reg->function_code = probe.function_code;
-            reg->raw_value = probe.values[i];
-            reg->inferred_type = probe.function_code <= 2 ? DT_BOOL :
-                (((int16_t)probe.values[i] < 0) ? DT_INT16 : DT_UINT16);
-            reg->sample_value = reg->inferred_type == DT_INT16 ?
-                                (float)(int16_t)probe.values[i] :
-                                (float)probe.values[i];
-            reg->read_start_address = probe.address;
-            reg->read_register_count = probe.register_count;
-            reg->value_register_index = i;
-            reg->writable = false;
-            reg->valid = true;
-
-            float range_min;
-            float range_max;
-            modbus_discover_infer_semantics(point_address, reg->sample_value,
-                                            reg->inferred_name,
-                                            reg->inferred_unit,
-                                            &range_min, &range_max);
-            ESP_LOGI(TAG, "  FC%02u [%u] raw=%u window=%u+%u index=%u",
-                     reg->function_code, point_address, reg->raw_value,
-                     reg->read_start_address, reg->read_register_count,
-                     reg->value_register_index);
-            taskENTER_CRITICAL(&s_result_lock);
-            ++s_result.registers_found;
-            taskEXIT_CRITICAL(&s_result_lock);
+            discover_append_register(dev, probe.function_code, point_address,
+                                     probe.values[i], probe.address,
+                                     probe.register_count, i, NULL);
         }
         address += probe.register_count;
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -723,6 +742,105 @@ esp_err_t modbus_discover_scan_device(uint8_t slave_id,
 }
 
 /* ======================== Full Scan ======================== */
+
+/*
+ * Transport scoping for semantic profiles. A profile device may declare
+ * "protocols": ["RTU", ...] and the profile root may declare
+ * "source_protocol". When either is present it must match the discovered
+ * device's transport, otherwise an RTU profile would also claim TCP
+ * endpoints that happen to share the same slave ID (duplicate semantics).
+ */
+static bool profile_protocol_allows(const cJSON *profile_device,
+                                    const char *default_protocol,
+                                    source_protocol_t protocol)
+{
+    const char *want = protocol == SRC_MODBUS_TCP ? "TCP" : "RTU";
+    cJSON *protocols = cJSON_GetObjectItem(profile_device, "protocols");
+    if (cJSON_IsArray(protocols) && cJSON_GetArraySize(protocols) > 0) {
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, protocols) {
+            if (cJSON_IsString(item) && item->valuestring != NULL &&
+                strcasecmp(item->valuestring, want) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (default_protocol != NULL) {
+        return strcasecmp(default_protocol, want) == 0;
+    }
+    return true;
+}
+
+/*
+ * Profile-guided register probe. The linear scan covers a single contiguous
+ * window per device, so devices with sparse or multi-section register maps
+ * can end up with too few discovered registers to reach the profile-match
+ * overlap threshold, silently falling back to unit-less raw points. While
+ * the scan task still owns the bus, probe every register the embedded
+ * profile declares for this slave (same transport only) that the linear
+ * scan did not already find.
+ */
+static void profile_guided_register_probe(const cJSON *profile_devices,
+                                          const char *default_protocol,
+                                          discovered_device_t *dev)
+{
+    if (!cJSON_IsArray(profile_devices) || dev == NULL || !dev->active) {
+        return;
+    }
+
+    cJSON *profile_device = NULL;
+    cJSON_ArrayForEach(profile_device, profile_devices) {
+        if (dev->reg_count >= DISCOVER_MAX_REGS_PER_SLAVE) break;
+        cJSON *slave = cJSON_GetObjectItem(profile_device, "slave_id");
+        if (!cJSON_IsNumber(slave) ||
+            (uint8_t)slave->valuedouble != dev->slave_id) {
+            continue;
+        }
+        if (!profile_protocol_allows(profile_device, default_protocol,
+                                     dev->source_protocol)) {
+            continue;
+        }
+        cJSON *registers = cJSON_GetObjectItem(profile_device, "registers");
+        if (!cJSON_IsArray(registers)) continue;
+
+        cJSON *reg = NULL;
+        cJSON_ArrayForEach(reg, registers) {
+            if (dev->reg_count >= DISCOVER_MAX_REGS_PER_SLAVE) break;
+            cJSON *address = cJSON_GetObjectItem(reg, "address");
+            cJSON *function = cJSON_GetObjectItem(reg, "function_code");
+            cJSON *type = cJSON_GetObjectItem(reg, "data_type");
+            if (!cJSON_IsNumber(address)) continue;
+            uint16_t addr = (uint16_t)address->valuedouble;
+            uint8_t fc = cJSON_IsNumber(function)
+                ? (uint8_t)function->valuedouble : 3;
+            if (fc < 1 || fc > 4) continue;
+            if (discovered_has_register(dev, addr, fc)) continue;
+
+            uint8_t width = profile_type_width(profile_data_type(
+                cJSON_IsString(type) ? type->valuestring : NULL));
+            if (width == 0) width = 1;
+            if (width > DISCOVER_MAX_BLOCK_REGS) width = DISCOVER_MAX_BLOCK_REGS;
+            if ((uint32_t)addr + width > 65536U) continue;
+
+            uint16_t values[DISCOVER_MAX_BLOCK_REGS] = {0};
+            esp_err_t err = discover_read_registers(
+                dev->source_protocol, dev->channel_id, dev->slave_id,
+                fc, addr, width, values);
+            if (err != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
+            for (uint8_t i = 0; i < width &&
+                 dev->reg_count < DISCOVER_MAX_REGS_PER_SLAVE; ++i) {
+                discover_append_register(dev, fc, (uint16_t)(addr + i),
+                                         values[i], addr, width, i,
+                                         " (profile-guided)");
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+}
 
 static esp_err_t full_scan_sync(const discover_scan_params_t *params)
 {
@@ -737,6 +855,24 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
     /* Phase 1: bus / endpoint scan */
     esp_err_t err = scan_bus_sync(params);
     if (err != ESP_OK) return err;
+
+    /*
+     * Parse the embedded semantic profile once so the register scan can
+     * re-probe profile-declared addresses the linear window missed.
+     */
+    cJSON *profile_root = cJSON_ParseWithLength(
+        (const char *)lab_profile_json_start,
+        (size_t)(lab_profile_json_end - lab_profile_json_start));
+    cJSON *profile_devices = profile_root
+        ? cJSON_GetObjectItem(profile_root, "devices") : NULL;
+    cJSON *profile_proto = profile_root
+        ? cJSON_GetObjectItem(profile_root, "source_protocol") : NULL;
+    const char *default_protocol =
+        cJSON_IsString(profile_proto) ? profile_proto->valuestring : NULL;
+    if (!cJSON_IsArray(profile_devices)) {
+        profile_devices = NULL;
+        default_protocol = NULL;
+    }
 
     /* Phase 2: Register scan for each discovered device */
     for (int i = 0; i < s_device_count; i++) {
@@ -759,10 +895,16 @@ static esp_err_t full_scan_sync(const discover_scan_params_t *params)
                 ++s_result.slaves_skipped;
                 taskEXIT_CRITICAL(&s_result_lock);
             } else if (scan_err != ESP_OK) {
+                cJSON_Delete(profile_root);
                 return scan_err;
+            } else if (profile_devices != NULL) {
+                profile_guided_register_probe(profile_devices,
+                                              default_protocol,
+                                              &s_devices[i]);
             }
         }
     }
+    cJSON_Delete(profile_root);
 
     uint16_t active_count = 0;
     for (uint16_t i = 0; i < s_device_count; ++i) {
@@ -920,14 +1062,21 @@ static bool discovered_has_register(const discovered_device_t *device,
 /*
  * A profile match requires at least two semantic register starts. This is a
  * lightweight fingerprint: slave ID alone is not enough to claim semantics.
+ * The profile's transport scope ("protocols"/"source_protocol") must also
+ * match, so an RTU profile never claims a TCP endpoint with the same ID.
  */
 static bool profile_matches_discovered_device(const cJSON *profile_device,
-                                              const discovered_device_t *device)
+                                              const discovered_device_t *device,
+                                              const char *default_protocol)
 {
     cJSON *slave = cJSON_GetObjectItem(profile_device, "slave_id");
     cJSON *registers = cJSON_GetObjectItem(profile_device, "registers");
     if (!cJSON_IsNumber(slave) || !cJSON_IsArray(registers) ||
         (uint8_t)slave->valuedouble != device->slave_id) {
+        return false;
+    }
+    if (!profile_protocol_allows(profile_device, default_protocol,
+                                 device->source_protocol)) {
         return false;
     }
 
@@ -947,11 +1096,13 @@ static bool profile_matches_discovered_device(const cJSON *profile_device,
 }
 
 static cJSON *find_profile_device(cJSON *profile_devices,
-                                  const discovered_device_t *device)
+                                  const discovered_device_t *device,
+                                  const char *default_protocol)
 {
     cJSON *profile_device = NULL;
     cJSON_ArrayForEach(profile_device, profile_devices) {
-        if (profile_matches_discovered_device(profile_device, device)) {
+        if (profile_matches_discovered_device(profile_device, device,
+                                              default_protocol)) {
             return profile_device;
         }
     }
@@ -987,6 +1138,9 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
     cJSON *profile_devices = cJSON_GetObjectItem(root, "devices");
     cJSON *profile_name = cJSON_GetObjectItem(root, "name");
     cJSON *profile_version = cJSON_GetObjectItem(root, "profile_version");
+    cJSON *profile_proto = cJSON_GetObjectItem(root, "source_protocol");
+    const char *default_protocol =
+        cJSON_IsString(profile_proto) ? profile_proto->valuestring : NULL;
     int capacity = amm_get_capacity();
     amm_mapping_entry_t *entries = heap_caps_calloc(
         (size_t)capacity, sizeof(entries[0]),
@@ -1008,7 +1162,8 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
         const discovered_device_t *device = &s_devices[i];
         if (!device->active) continue;
 
-        cJSON *profile_device = find_profile_device(profile_devices, device);
+        cJSON *profile_device = find_profile_device(profile_devices, device,
+                                                    default_protocol);
         if (profile_device == NULL) continue;
 
         matched_devices[i] = true;
@@ -1231,6 +1386,17 @@ int modbus_discover_apply_mappings(void)
                 .read_start_address = reg->read_start_address,
                 .read_register_count = reg->read_register_count,
                 .value_register_index = reg->value_register_index,
+                /*
+                 * Only user-confirmed edits flow into the raw mapping;
+                 * scan-time semantic guesses stay display-only hints.
+                 */
+                .user_edited = reg->user_edited,
+                .name = reg->inferred_name,
+                .unit = reg->inferred_unit,
+                .data_type = reg->inferred_type,
+                .writable = reg->writable,
+                .range_min = reg->range_min,
+                .range_max = reg->range_max,
             };
             semantic_inference_build_raw_mapping(
                 &features, &identity, &point, dev->device_id,
@@ -1331,6 +1497,8 @@ esp_err_t modbus_discover_update_register(uint8_t slave_id,
                                            float range_min,
                                            float range_max)
 {
+    discovered_device_t *dev = modbus_discover_find_device(slave_id);
+    if (!dev) return ESP_ERR_NOT_FOUND;
     discovered_register_t *reg = modbus_discover_find_register(slave_id, reg_addr);
     if (!reg) return ESP_ERR_NOT_FOUND;
 
@@ -1344,10 +1512,43 @@ esp_err_t modbus_discover_update_register(uint8_t slave_id,
     }
     reg->inferred_type = dtype;
     reg->writable = writable;
-    /* range_min/max stored in AMM constraint, not in register struct currently;
-       they are noted for future AMM update */
-    (void)range_min;
-    (void)range_max;
+    reg->range_min = range_min;
+    reg->range_max = range_max;
+    reg->user_edited = true;
+
+    /*
+     * Write through to the AMM mapping when this point is already mapped.
+     * Without this, the edit only lived in the volatile discovery table and
+     * the next "apply mappings" silently rebuilt the point with profile or
+     * raw defaults, dropping the user's unit/scale/range. The entry is
+     * promoted to USER/VERIFIED so later re-imports preserve it.
+     */
+    amm_mapping_entry_t amm_entry;
+    if (amm_find_mapping_for_object(dev->source_protocol, dev->channel_id,
+                                    slave_id, reg->function_code, reg_addr,
+                                    &amm_entry) == ESP_OK) {
+        if (name && name[0]) {
+            strlcpy(amm_entry.measurement_name, name,
+                    sizeof(amm_entry.measurement_name));
+        }
+        if (unit) {
+            strlcpy(amm_entry.unit, unit, sizeof(amm_entry.unit));
+        }
+        amm_entry.data_type = dtype;
+        amm_entry.constraint.writable = writable;
+        amm_entry.constraint.valid_range_min = range_min;
+        amm_entry.constraint.valid_range_max = range_max;
+        amm_entry.semantic_source = SEMANTIC_SOURCE_USER;
+        amm_entry.semantic_status = SEMANTIC_STATUS_VERIFIED;
+        amm_entry.semantic_confidence = 100;
+        strlcpy(amm_entry.semantic_evidence, "user edit via discovery editor",
+                sizeof(amm_entry.semantic_evidence));
+        esp_err_t amm_err = amm_add_mapping(&amm_entry);
+        if (amm_err != ESP_OK) {
+            ESP_LOGW(TAG, "AMM write-through failed for slave %u reg %u: %s",
+                     slave_id, reg_addr, esp_err_to_name(amm_err));
+        }
+    }
 
     ESP_LOGI(TAG, "Register updated: slave %u addr %u name='%s'",
              slave_id, reg_addr, reg->inferred_name);

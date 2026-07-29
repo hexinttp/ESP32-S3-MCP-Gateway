@@ -28,6 +28,29 @@
 #define ONENET_DEVICE_KEY        "YOUR_DEVICE_KEY"
 #define ONENET_TOPIC_FORMAT      1
 
+/* ======================== MQTT Platform / ThingsCloud ======================== */
+/* Selectable cloud platform for the MQTT transport layer. */
+typedef enum {
+    MQTT_PLATFORM_CUSTOM = 0,      /* Generic / custom MQTT broker */
+    MQTT_PLATFORM_THINGSCLOUD = 1  /* ThingsCloud MQTT gateway & sub-device protocol */
+} mqtt_platform_type_t;
+
+/* How Modbus data is reported to the cloud (ThingsCloud mode). */
+typedef enum {
+    MQ_REPORT_SUBDEVICE = 0,      /* Each Modbus slave appears as a ThingsCloud
+                                     sub-device: published to gateway/attributes,
+                                     keyed by point_id. */
+    MQ_REPORT_GATEWAY           /* All data aggregated as the gateway's own
+                                     attributes: published to attributes, keyed by
+                                     "<slave_id>_<point_id>". */
+} mqtt_report_mode_t;
+
+/* ThingsCloud aggregated payload size limit; packets larger than this are split. */
+#define THINGSCLOUD_MAX_PAYLOAD_BYTES   1024
+#define THINGSCLOUD_SUBDEVICE_MAX       64
+/* Per-cycle aggregation buffer capacity. */
+#define THINGSCLOUD_AGG_BUFFER_MAX      96
+
 /* ======================== MODBUS Configuration ======================== */
 #define MODBUS_RTU_UART_PORT     UART_NUM_1
 #define MODBUS_RTU_UART_TXD      39
@@ -63,11 +86,11 @@
 #define UIF_REPLAY_INTERVAL_MS   100
 
 /* ======================== Scheduler Configuration ======================== */
-#define TASK_STACK_SIZE_MODBUS   4096
-#define TASK_STACK_SIZE_TCM      8192
-#define TASK_STACK_SIZE_MQTT     12288
-#define TASK_STACK_SIZE_SCHED    4096
-#define TASK_STACK_SIZE_EVAL     4096
+#define TASK_STACK_SIZE_MODBUS   12288
+#define TASK_STACK_SIZE_TCM      16384
+#define TASK_STACK_SIZE_MQTT     24576
+#define TASK_STACK_SIZE_SCHED    8192
+#define TASK_STACK_SIZE_EVAL     8192
 
 #define TASK_PRIORITY_MODBUS    5
 #define TASK_PRIORITY_TCM       4

@@ -1,6 +1,6 @@
 # ESP32-S3 TCM/AMM/UIF Industrial Gateway
 
-本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 和 FreeRTOS 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。
+本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 和 FreeRTOS 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。当前版本新增 ThingsCloud 云平台适配层，支持以"网关 + 子设备"模型将 TCM 数据聚合上报到 ThingsCloud。
 
 当前版本已经在带 16 MB Flash、8 MB PSRAM 的 ESP32-S3 实物开发板上完成烧录，并使用真实 RS485 温湿度传感器、PC 端 RTU 仿真器和 Modbus TCP 仿真器完成设备发现与寄存器读取测试。
 
@@ -46,6 +46,8 @@
 - NTP 时间同步、时间质量标记、运行健康指标、HTTPS OTA、镜像哈希校验和失败回滚。
 - MCP JSON-RPC 工具入口：`POST /mcp`。
 - 运行指标：轮询、TCM 验证、MQTT、缓存、回放、命令和数据丢失计数。
+- ThingsCloud 云平台适配：统一云数据对象（`cloud_adapter`）+ ThingsCloud 官方 MQTT 网关协议（`attributes`、`gateway/attributes`、`gateway/connect|disconnect`、`gateway/command/send|reply` 等 Topic）；支持子设备地址编码/解析、子设备在线/离线状态机与重连后批量补报、按周期聚合的属性上报、网关模式属性键 `p{port}_s{slave}_{point}` 及键名合法性校验、下行属性推送与命令回调、凭据脱敏日志。
+- 发布管线稳定性：`publish_task` 采用 PSRAM 64 KB 静态栈（`xTaskCreateStatic`），规避内部 DRAM 紧张导致的任务创建失败和深层 esp-mqtt 调用链栈溢出；离线缓存写入解耦到独立 `cache_writer_task` 异步执行，SPI Flash 慢写不再阻塞实时发布路径；MQTT 断线重连退避 10 s。
 
 设备发现表优先分配到 PSRAM：检测到外部 PSRAM 时单次最多保留 100 台设备、每台 32 个原始寄存器字；PSRAM 不可用时自动降级为 8 台设备。扫描任务栈也优先放入 PSRAM，并在不可用时回退内部 RAM，避免大量活动映射造成内部 RAM 碎片后无法启动扫描。AMM 和 TCM 最新状态池最多保留 1000 个活动点位；无 PSRAM 时 AMM 自动降级为 64 点。自动化规则最多 16 条。设备发现容量和 AMM 活动映射容量相互独立。
 
@@ -340,6 +342,8 @@ main/
   uif/         离线缓存和有序会话恢复
   automation/  离线规则引擎与 Web API
   services/    统一受控写入服务
+  cloud_adapter/  统一云数据对象定义（平台无关）
+  thingscloud/    ThingsCloud MQTT 网关协议适配（Topic、子设备、命令）
   mcp/         MCP JSON-RPC 工具接口
   web/         HTTP REST 服务
   eval/        研究指标与日志
@@ -369,6 +373,9 @@ profiles/
 - 公平调度修复后，146 个映射全部完成首轮轮询且状态为正常，没有点位长期停留在等待状态。
 - 全量清空事务通过：映射清空后接口返回空表，随后从实验模板批量恢复 146 点成功。
 - 持续轮询 1045 次成功、0 次失败，空闲堆约 7.36 MB；MQTT 保持默认占位配置时不写离线缓存，缓存记录和数据丢失计数均为 0。
+- ThingsCloud 实测：启用 ThingsCloud 平台后 MQTT 约 13 s 完成连接，90 秒窗口内成功上报 146 条聚合属性、发布失败 0 次，全程无栈溢出、无重启；数据丢失仅发生在启动初期尚未联网的离线窗口。
+- 发布管线回归：`publish_task` PSRAM 64 KB 栈修复了此前 12 KB 栈溢出崩溃循环与 32 KB 内部 RAM 分配失败两类故障；离线缓存写入改为 `cache_writer_task` 异步处理后，上下文队列不再溢出。
+- 已知遗留：MQTT 离线窗口内 SPI Flash 离线缓存写入（`offline_store_put`）偶发失败，在线上报不受影响，待后续排查缓存分区。
 - TF 卡未插入时可以正常降级运行；TF 实卡写入、满盘覆盖和长时间耐久测试仍需后续验证。
 
 以上耗时来自当前开发环境的一次局域网测试，不作为所有网络条件下的硬实时保证。

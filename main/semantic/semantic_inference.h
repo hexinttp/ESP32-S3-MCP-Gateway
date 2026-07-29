@@ -50,6 +50,18 @@ typedef struct {
     uint16_t read_start_address;
     uint8_t read_register_count;
     uint8_t value_register_index;
+    /*
+     * User-confirmed semantics from the discovery register editor. Only
+     * consulted when user_edited is true; auto-guessed scan hints are never
+     * forwarded so unknown devices stay conservative by default.
+     */
+    bool        user_edited;
+    const char *name;
+    const char *unit;
+    data_type_t data_type;
+    bool        writable;
+    float       range_min;
+    float       range_max;
 } semantic_raw_point_t;
 
 /**

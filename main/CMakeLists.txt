@@ -17,6 +17,10 @@
          "modbus/modbus_tcp_server.c"
          "amm/amm_mapping.c"
          "mqtt_comm/mqtt_handler.c"
+         "thingscloud/thingscloud_topics.c"
+         "thingscloud/thingscloud_adapter.c"
+         "thingscloud/thingscloud_subdevice.c"
+         "thingscloud/thingscloud_command.c"
          "uif/uif_persistence.c"
          "scheduler/scheduler.c"
          "eval/eval_logger.c"
@@ -28,7 +32,7 @@
          "automation/automation_web.c"
          "mcp/mcp_http.c"
          "web/web_server.c"
-    INCLUDE_DIRS "." "web"
+    INCLUDE_DIRS "." "web" "cloud_adapter" "thingscloud"
     REQUIRES driver esp_wifi esp_event esp_netif esp_eth lwip nvs_flash mqtt esp-modbus esp_timer
              fatfs wear_levelling sdmmc esp_driver_sdmmc esp_http_server json esp_psram
              app_update esp_https_ota mbedtls efuse
