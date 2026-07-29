@@ -14,7 +14,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_timer.h"
@@ -25,6 +24,7 @@
 #include "config/runtime_config.h"
 #include "cloud_adapter/cloud_adapter.h"
 #include "thingscloud/thingscloud_topics.h"
+#include "web/web_server.h"
 
 /* ======================== Logging Tag ======================== */
 
@@ -47,6 +47,7 @@ typedef struct {
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static mqtt_conn_state_t        s_conn_state  = MQTT_STATE_DISCONNECTED;
+static char                     s_last_connect_reason[160] = "not connected";
 static mqtt_mode_t              s_mqtt_mode   = MQTT_MODE_STANDARD;
 static const char              *s_broker_uri  = MQTT_BROKER_URI;
 static const char              *s_client_id   = MQTT_CLIENT_ID;
@@ -114,6 +115,14 @@ static void mqtt_set_state(mqtt_conn_state_t state)
     mqtt_unlock();
 }
 
+static void mqtt_set_connect_reason(const char *reason)
+{
+    mqtt_lock();
+    strlcpy(s_last_connect_reason, reason ? reason : "",
+            sizeof(s_last_connect_reason));
+    mqtt_unlock();
+}
+
 /**
  * @brief Find a registered subscription whose topic filter matches an
  *        incoming topic string. Returns the subscription index, or -1
@@ -174,6 +183,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "Connected to MQTT broker: %s", s_broker_uri);
         mqtt_set_state(MQTT_STATE_CONNECTED);
+        mqtt_set_connect_reason("connected to broker");
 
         /* Re-subscribe to all registered topics on (re)connect */
         mqtt_lock();
@@ -262,11 +272,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         if (event->error_handle) {
             esp_mqtt_error_codes_t *err = event->error_handle;
             if (err->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                char reason[160];
+                snprintf(reason, sizeof(reason),
+                         "network/TCP error (sock_errno=%d esp_err=0x%x)",
+                         err->esp_transport_sock_errno,
+                         (unsigned int)err->esp_tls_last_esp_err);
+                mqtt_set_connect_reason(reason);
                 ESP_LOGE(TAG, "Transport error: esp_tls=%d (0x%x), tls_err=%d (0x%x), sock_errno=%d",
                          err->esp_tls_last_esp_err, err->esp_tls_last_esp_err,
                          err->esp_tls_stack_err, err->esp_tls_stack_err,
                          err->esp_transport_sock_errno);
             } else if (err->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                char reason[160];
+                if (err->connect_return_code == 5) {
+                    strlcpy(reason,
+                            "broker rejected authentication (CONNACK 5): verify AccessToken and ProjectKey",
+                            sizeof(reason));
+                } else {
+                    snprintf(reason, sizeof(reason),
+                             "broker refused connection (CONNACK %d)",
+                             err->connect_return_code);
+                }
+                mqtt_set_connect_reason(reason);
                 ESP_LOGE(TAG, "Connection refused, error code: 0x%x",
                          err->connect_return_code);
             } else {
@@ -337,18 +364,22 @@ void mqtt_init(void)
         strlcpy(s_runtime_broker, runtime.mqtt.uri, sizeof(s_runtime_broker));
         s_broker_uri = s_runtime_broker;
         ESP_LOGI(TAG, "ThingsCloud broker (as configured): %s", s_broker_uri);
-        if (runtime.mqtt.client_id[0] == '\0') {
+        if (s_runtime_client_id[0] == '\0') {
             uint8_t mac[6];
             if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-                snprintf(runtime.mqtt.client_id, sizeof(runtime.mqtt.client_id),
+                snprintf(s_runtime_client_id, sizeof(s_runtime_client_id),
                          "GW_%02X%02X%02X%02X%02X%02X",
                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                strlcpy(s_runtime_client_id, runtime.mqtt.client_id,
+            } else {
+                strlcpy(s_runtime_client_id, MQTT_CLIENT_ID,
                         sizeof(s_runtime_client_id));
-                ESP_LOGI(TAG, "ThingsCloud client id derived from MAC: %s",
-                         runtime.mqtt.client_id);
             }
+            s_client_id = s_runtime_client_id;
         }
+        /* Keep a stable device-scoped ClientId across reconnects. ThingsCloud
+           permits arbitrary ClientIds, but an industrial gateway should not
+           rely on broker-assigned transient session identity. */
+        ESP_LOGI(TAG, "ThingsCloud MQTT ClientId: %s", s_client_id);
     }
 #endif
 
@@ -407,16 +438,18 @@ void mqtt_init(void)
             },
         },
         .network = {
-            .timeout_ms = MQTT_PUBLISH_TIMEOUT_MS,
+            .timeout_ms = MQTT_CONNECT_TIMEOUT_MS,
             /* Back off reconnects modestly: long enough to avoid hammering a
                broker that is flow-controlling this client, but short enough to
                recover quickly once the link is usable. */
-            .reconnect_timeout_ms = 10000,
+            /* app_main requests the first reconnect after an interface has an
+               IP address. Keep the client's automatic retry outside that
+               window so two CONNECT attempts cannot race each other. */
+            .reconnect_timeout_ms = 30000,
         },
-        /* The MQTT event handler (esp_mqtt_task context) runs our CONNECTED
-           callback, which builds cJSON payloads and calls esp_mqtt_client_publish
-           (a deep call chain). The default MQTT task stack is only 6 KB and
-           overflows here, crashing the device in a reboot loop. Enlarge it. */
+        /* The ThingsCloud CONNECTED callback builds JSON, publishes initial
+           state and registers sub-device state. Hardware testing showed that
+           smaller stacks can fail during the broker handshake/callback path. */
         .task = {
             .stack_size = 20480,
         },
@@ -507,12 +540,22 @@ esp_err_t mqtt_publish(const char *topic, const char *payload, int qos)
         mqtt_unlock();
         ESP_LOGD(TAG, "Published to '%s' (msg_id=%d, qos=%d, %d bytes)",
                  topic, msg_id, qos, payload_len);
+        char log_text[128];
+        snprintf(log_text, sizeof(log_text),
+                 "[MQTT TX] topic=%s bytes=%d payload=%.48s%s",
+                 topic, payload_len, payload,
+                 payload_len > 48 ? "..." : "");
+        web_server_add_log("ok", log_text);
         return ESP_OK;
     } else {
         s_publish_fail_count++;
         mqtt_unlock();
         ESP_LOGW(TAG, "Failed to publish to '%s' (qos=%d, %d bytes)",
                  topic, qos, payload_len);
+        char log_text[128];
+        snprintf(log_text, sizeof(log_text),
+                 "[MQTT TX FAIL] topic=%s bytes=%d", topic, payload_len);
+        web_server_add_log("error", log_text);
         return ESP_FAIL;
     }
 }
@@ -636,89 +679,7 @@ bool mqtt_is_connected(void)
     return mqtt_get_connection_state() == MQTT_STATE_CONNECTED;
 }
 
-/* ============================================================
- * mqtt_test_connection
- * ------------------------------------------------------------
- * Spin up a throwaway esp_mqtt_client to verify that the given
- * broker URI (plus optional credentials) is actually reachable
- * and accepts the connection. This is used by the Web UI
- * "Test Connection" button so it reports the REAL result instead
- * of always claiming success. The temporary client is destroyed
- * before returning.
- * ============================================================ */
-typedef struct {
-    EventGroupHandle_t eg;
-    bool               connected;
-    int                error_type;          /* esp_mqtt_error_type_t */
-    int                esp_tls_last_esp_err;
-    int                esp_tls_stack_err;
-    int                sock_errno;
-    int                connect_return_code;
-} mqtt_test_ctx_t;
-
-static void mqtt_test_event_handler(void *handler_args, esp_event_base_t base,
-                                    int32_t event_id, void *event_data)
-{
-    mqtt_test_ctx_t *ctx = (mqtt_test_ctx_t *)handler_args;
-    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-    switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        ctx->connected = true;
-        xEventGroupSetBits(ctx->eg, BIT0);
-        break;
-    case MQTT_EVENT_ERROR:
-        ctx->connected = false;
-        if (event->error_handle) {
-            esp_mqtt_error_codes_t *e = event->error_handle;
-            ctx->error_type           = e->error_type;
-            ctx->esp_tls_last_esp_err = e->esp_tls_last_esp_err;
-            ctx->esp_tls_stack_err    = e->esp_tls_stack_err;
-            ctx->sock_errno           = e->esp_transport_sock_errno;
-            ctx->connect_return_code  = e->connect_return_code;
-        }
-        xEventGroupSetBits(ctx->eg, BIT0);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ctx->connected = false;
-        xEventGroupSetBits(ctx->eg, BIT0);
-        break;
-    default:
-        break;
-    }
-}
-
-/* Map the captured error context to a short human-readable reason. */
-static void mqtt_test_reason(const mqtt_test_ctx_t *ctx, bool timed_out,
-                             char *reason, size_t reason_len)
-{
-    if (reason == NULL || reason_len == 0) return;
-    if (timed_out) {
-        snprintf(reason, reason_len,
-                 "no response from broker (DNS, no internet route, or broker unreachable)");
-        return;
-    }
-    if (ctx->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-        switch (ctx->connect_return_code) {
-        case 4: snprintf(reason, reason_len, "broker rejected login: bad username or password (connack 4)"); break;
-        case 5: snprintf(reason, reason_len, "broker rejected: not authorized (connack 5)"); break;
-        case 2: snprintf(reason, reason_len, "broker rejected client ID (connack 2)"); break;
-        case 1: snprintf(reason, reason_len, "broker rejected protocol version (connack 1)"); break;
-        case 3: snprintf(reason, reason_len, "broker unavailable (connack 3)"); break;
-        default: snprintf(reason, reason_len, "broker refused connection (connack %d)", ctx->connect_return_code); break;
-        }
-        return;
-    }
-    if (ctx->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-        /* sock_errno 0 + esp_tls esp_err set typically means hostname/DNS
-           resolution failed; non-zero sock_errno means a socket-level error. */
-        snprintf(reason, reason_len,
-                 "network/TCP error (sock_errno=%d esp_err=0x%x) - likely DNS resolution failed or no internet route",
-                 ctx->sock_errno, (unsigned int)ctx->esp_tls_last_esp_err);
-        return;
-    }
-    snprintf(reason, reason_len, "connection failed (error_type=%d)", ctx->error_type);
-}
-
+/* Reconnect the configured client and return its actual broker result. */
 esp_err_t mqtt_test_connection(const char *uri, const char *username,
                                const char *password, int timeout_ms,
                                char *reason, size_t reason_len)
@@ -730,70 +691,56 @@ esp_err_t mqtt_test_connection(const char *uri, const char *username,
         return ESP_ERR_INVALID_ARG;
     }
 
-    EventGroupHandle_t eg = xEventGroupCreate();
-    if (eg == NULL) {
-        return ESP_ERR_NO_MEM;
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
+    if (strcmp(uri, runtime.mqtt.uri) != 0 ||
+        (username && strcmp(username, runtime.mqtt.username) != 0) ||
+        (password && strcmp(password, runtime.mqtt.password) != 0)) {
+        if (reason && reason_len) {
+            snprintf(reason, reason_len,
+                     "save the MQTT settings before testing the active connection");
+        }
+        return ESP_ERR_INVALID_STATE;
     }
 
-    mqtt_test_ctx_t ctx = { .eg = eg, .connected = false };
-
-    esp_mqtt_client_config_t cfg = {
-        .broker = {
-            .address = { .uri = uri },
-            .verification = { .crt_bundle_attach = esp_crt_bundle_attach },
-        },
-        .credentials = {
-            .username = (username != NULL && username[0] != '\0') ? username : NULL,
-            .authentication = {
-                .password = (password != NULL && password[0] != '\0') ? password : NULL,
-            },
-        },
-        .network = {
-            .timeout_ms = (uint32_t)(timeout_ms > 0 ? timeout_ms : MQTT_PUBLISH_TIMEOUT_MS),
-        },
-    };
-
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
-    if (client == NULL) {
-        vEventGroupDelete(eg);
-        return ESP_FAIL;
-    }
-
-    esp_err_t err = esp_mqtt_client_register_event(client, MQTT_EVENT_ANY,
-                                                   mqtt_test_event_handler, &ctx);
+    /* Reuse the persistent client instead of allocating a second MQTT task. */
+    mqtt_set_connect_reason("connection test in progress");
+    esp_err_t err = mqtt_reconnect();
     if (err != ESP_OK) {
-        esp_mqtt_client_destroy(client);
-        vEventGroupDelete(eg);
+        if (reason && reason_len) {
+            snprintf(reason, reason_len, "unable to start MQTT reconnect: %s",
+                     esp_err_to_name(err));
+        }
         return err;
     }
 
-    err = esp_mqtt_client_start(client);
-    if (err != ESP_OK) {
-        esp_mqtt_client_destroy(client);
-        vEventGroupDelete(eg);
-        return err;
+    int wait_ms = timeout_ms > 0 ? timeout_ms : MQTT_CONNECT_TIMEOUT_MS;
+    for (int elapsed_ms = 0; elapsed_ms < wait_ms; elapsed_ms += 100) {
+        mqtt_conn_state_t state = mqtt_get_connection_state();
+        if (state == MQTT_STATE_CONNECTED) {
+            if (reason && reason_len) strlcpy(reason, "connected to broker", reason_len);
+            return ESP_OK;
+        }
+
+        mqtt_lock();
+        bool completed = strcmp(s_last_connect_reason,
+                                "connection test in progress") != 0;
+        if (completed && reason && reason_len) {
+            strlcpy(reason, s_last_connect_reason, reason_len);
+        }
+        mqtt_unlock();
+        if (completed && state == MQTT_STATE_ERROR) return ESP_FAIL;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    EventBits_t bits = xEventGroupWaitBits(eg, BIT0, pdTRUE, pdFALSE,
-                                           pdMS_TO_TICKS(timeout_ms > 0 ? timeout_ms : MQTT_PUBLISH_TIMEOUT_MS));
-    bool connected = ctx.connected;
-    bool timed_out = ((bits & BIT0) == 0);
-
-    if (connected) {
-        if (reason != NULL && reason_len > 0)
-            snprintf(reason, reason_len, "connected to broker");
-    } else {
-        mqtt_test_reason(&ctx, timed_out, reason, reason_len);
+    mqtt_lock();
+    if (reason && reason_len) strlcpy(reason, s_last_connect_reason, reason_len);
+    mqtt_unlock();
+    if (reason && reason_len &&
+        strcmp(reason, "connection test in progress") == 0) {
+        strlcpy(reason, "broker connection timed out", reason_len);
     }
-
-    /* Tear down the temporary test client before returning. */
-    esp_mqtt_client_destroy(client);
-    vEventGroupDelete(eg);
-
-    if (timed_out) {
-        return ESP_ERR_TIMEOUT;
-    }
-    return connected ? ESP_OK : ESP_FAIL;
+    return ESP_ERR_TIMEOUT;
 }
 
 mqtt_mode_t mqtt_get_mode(void)
@@ -837,6 +784,13 @@ esp_err_t mqtt_restart(void)
     mqtt_destroy();
     mqtt_init(); /* guarded by s_initialized; reads fresh runtime config */
     return ESP_OK;
+}
+
+esp_err_t mqtt_reconnect(void)
+{
+    if (!s_initialized || s_mqtt_client == NULL) return ESP_ERR_INVALID_STATE;
+    ESP_LOGI(TAG, "Requesting MQTT reconnect on active client");
+    return esp_mqtt_client_reconnect(s_mqtt_client);
 }
 
 esp_err_t mqtt_disconnect(void)

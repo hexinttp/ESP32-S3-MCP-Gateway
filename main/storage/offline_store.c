@@ -31,6 +31,27 @@ static uint32_t s_tf_oldest;
 static bool s_flash_oldest_valid;
 static bool s_tf_oldest_valid;
 
+static esp_err_t mount_flash_cache(const esp_vfs_fat_mount_config_t *config)
+{
+    return esp_vfs_fat_spiflash_mount_rw_wl(FLASH_MOUNT_POINT, UIF_CACHE_PARTITION,
+                                             config, &s_wl);
+}
+
+static esp_err_t recreate_flash_cache(const esp_vfs_fat_mount_config_t *config)
+{
+    ESP_LOGW(TAG, "Cache partition contains no valid records but has no usable space; rebuilding it");
+    esp_err_t err = esp_vfs_fat_spiflash_unmount_rw_wl(FLASH_MOUNT_POINT, s_wl);
+    s_wl = WL_INVALID_HANDLE;
+    if (err != ESP_OK) return err;
+
+    err = esp_vfs_fat_spiflash_format_rw_wl(FLASH_MOUNT_POINT, UIF_CACHE_PARTITION);
+    if (err != ESP_OK) return err;
+    err = mount_flash_cache(config);
+    if (err != ESP_OK) return err;
+    if (mkdir(FLASH_CACHE_DIR, 0775) != 0 && errno != EEXIST) return ESP_FAIL;
+    return ESP_OK;
+}
+
 static void record_path(char *out, size_t size, const char *directory, uint32_t sequence_id)
 {
     /* Eight hexadecimal characters keep the filename compatible with FAT 8.3. */
@@ -181,8 +202,7 @@ esp_err_t offline_store_init(void)
         .max_files = 8,
         .allocation_unit_size = 4096,
     };
-    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(FLASH_MOUNT_POINT, UIF_CACHE_PARTITION,
-                                                      &config, &s_wl);
+    esp_err_t err = mount_flash_cache(&config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI Flash cache mount failed: %s", esp_err_to_name(err));
         return err;
@@ -195,6 +215,19 @@ esp_err_t offline_store_init(void)
     s_flash_ready = true;
     load_store_state(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,
                      &s_flash_oldest_valid);
+    uint64_t total = 0;
+    uint64_t free = 0;
+    if (s_flash_count == 0 &&
+        esp_vfs_fat_info(FLASH_MOUNT_POINT, &total, &free) == ESP_OK &&
+        free <= FLASH_RESERVE_BYTES) {
+        err = recreate_flash_cache(&config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Cache partition rebuild failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        load_store_state(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,
+                         &s_flash_oldest_valid);
+    }
     int pruned = 0;
     while (s_flash_count > UIF_CACHE_MAX_RECORDS &&
            remove_oldest(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,

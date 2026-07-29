@@ -1,15 +1,94 @@
 #include "mcp/mcp_http.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "amm/amm_mapping.h"
+#include "automation/automation_engine.h"
 #include "cJSON.h"
 #include "config/runtime_config.h"
+#include "esp_timer.h"
+#include "mbedtls/sha256.h"
 #include "modbus/modbus_discover.h"
 #include "services/control_service.h"
 #include "tcm/tcm_context.h"
 #include "tcm/tcm_state_pool.h"
 #include "uif/uif_persistence.h"
+
+#define MCP_AUTH_MAX_FAILURES 5
+#define MCP_AUTH_LOCKOUT_MS 30000
+
+static uint8_t s_auth_failures;
+static uint32_t s_authorized_requests;
+static uint32_t s_auth_failure_total;
+static int64_t s_last_authorized_ms;
+static int64_t s_auth_locked_until_ms;
+
+static void sha256_hex(const char *text, char output[65])
+{
+    uint8_t digest[32];
+    mbedtls_sha256((const unsigned char *)text, strlen(text), digest, 0);
+    for (int i = 0; i < 32; ++i) {
+        snprintf(output + i * 2, 3, "%02x", digest[i]);
+    }
+    output[64] = '\0';
+}
+
+static bool constant_time_equal(const char *left, const char *right, size_t size)
+{
+    unsigned char difference = 0;
+    for (size_t i = 0; i < size; ++i) {
+        difference |= (unsigned char)left[i] ^ (unsigned char)right[i];
+    }
+    return difference == 0;
+}
+
+static esp_err_t require_mcp_authorization(httpd_req_t *req)
+{
+    runtime_config_t config;
+    runtime_config_get(&config);
+    if (!config.security.auth_enabled ||
+        strlen(config.security.password_sha256) != 64) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_sendstr(req, "MCP access is disabled until authentication is configured");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms < s_auth_locked_until_ms) {
+        httpd_resp_set_status(req, "429 Too Many Requests");
+        httpd_resp_set_hdr(req, "Retry-After", "30");
+        httpd_resp_sendstr(req, "MCP authentication is temporarily locked");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    char authorization[192] = {0};
+    bool accepted =
+        httpd_req_get_hdr_value_str(req, "Authorization", authorization,
+                                    sizeof(authorization)) == ESP_OK &&
+        strncmp(authorization, "Bearer ", 7) == 0;
+    char digest[65] = {0};
+    if (accepted) {
+        sha256_hex(authorization + 7, digest);
+        accepted = constant_time_equal(digest, config.security.password_sha256, 64);
+    }
+    if (!accepted) {
+        ++s_auth_failure_total;
+        if (++s_auth_failures >= MCP_AUTH_MAX_FAILURES) {
+            s_auth_failures = 0;
+            s_auth_locked_until_ms = now_ms + MCP_AUTH_LOCKOUT_MS;
+        }
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+        httpd_resp_sendstr(req, "Unauthorized");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    s_auth_failures = 0;
+    s_auth_locked_until_ms = 0;
+    ++s_authorized_requests;
+    s_last_authorized_ms = now_ms;
+    return ESP_OK;
+}
 
 static cJSON *read_body(httpd_req_t *req)
 {
@@ -43,7 +122,6 @@ static esp_err_t send_rpc(httpd_req_t *req, const cJSON *id, cJSON *result,
     }
     char *text = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "MCP-Protocol-Version", "2025-03-26");
     esp_err_t err = httpd_resp_sendstr(req, text);
     free(text);
@@ -83,6 +161,24 @@ static cJSON *tools_list_result(void)
              "{\"slave_start\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247},\"slave_end\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247}}", NULL);
     add_tool(tools, "get_gateway_config", "Read non-secret gateway runtime configuration", "{}", NULL);
     add_tool(tools, "get_cache_status", "Read UIF offline cache and replay status", "{}", NULL);
+    add_tool(tools, "configure_rule_from_natural_language",
+             "Translate the user's natural-language request into this structured rule. "
+             "Call first with confirmed=false, show the returned preview to the user, "
+             "and call again with confirmed=true only after explicit user confirmation.",
+             "{\"rule_name\":{\"type\":\"string\"},"
+             "\"source_device\":{\"type\":\"string\"},\"source_point\":{\"type\":\"string\"},"
+             "\"operator\":{\"type\":\"string\",\"enum\":[\"gt\",\"gte\",\"lt\",\"lte\",\"eq\",\"neq\"]},"
+             "\"threshold\":{\"type\":\"number\"},\"hysteresis\":{\"type\":\"number\",\"minimum\":0},"
+             "\"hold_ms\":{\"type\":\"integer\",\"minimum\":0},"
+             "\"cooldown_ms\":{\"type\":\"integer\",\"minimum\":200},"
+             "\"action\":{\"type\":\"string\",\"enum\":[\"mqtt_alert\",\"write_point\"]},"
+             "\"target_device\":{\"type\":\"string\"},\"target_point\":{\"type\":\"string\"},"
+             "\"target_value\":{\"type\":\"number\"},\"alert_topic\":{\"type\":\"string\"},"
+             "\"alert_message\":{\"type\":\"string\"},\"interlock_device\":{\"type\":\"string\"},"
+             "\"interlock_point\":{\"type\":\"string\"},\"interlock_required_state\":{\"type\":\"boolean\"},"
+             "\"enabled\":{\"type\":\"boolean\"},\"confirmed\":{\"type\":\"boolean\"}}",
+             "[\"rule_name\",\"source_device\",\"source_point\",\"operator\",\"threshold\","
+             "\"action\",\"confirmed\"]");
     return result;
 }
 
@@ -127,6 +223,180 @@ static cJSON *call_list_points(void)
     }
     free(mappings);
     return array;
+}
+
+static bool json_string(cJSON *root, const char *key, char *out, size_t size,
+                        bool required)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (!cJSON_IsString(item)) return !required;
+    strlcpy(out, item->valuestring, size);
+    return !required || out[0] != '\0';
+}
+
+static bool parse_rule_operator(const char *value, automation_operator_t *out)
+{
+    static const char *names[] = {"gt", "gte", "lt", "lte", "eq", "neq"};
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); ++i) {
+        if (strcmp(value, names[i]) == 0) {
+            *out = (automation_operator_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static cJSON *rule_response(const automation_rule_t *rule, bool valid,
+                            bool applied, const char *reason, uint32_t id)
+{
+    static const char *operators[] = {"gt", "gte", "lt", "lte", "eq", "neq"};
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddBoolToObject(response, "valid", valid);
+    cJSON_AddBoolToObject(response, "applied", applied);
+    cJSON_AddStringToObject(response, "reason", reason);
+    if (id != 0) cJSON_AddNumberToObject(response, "rule_id", id);
+    cJSON *preview = cJSON_AddObjectToObject(response, "preview");
+    cJSON_AddStringToObject(preview, "name", rule->name);
+    cJSON_AddStringToObject(preview, "source_device", rule->source_device);
+    cJSON_AddStringToObject(preview, "source_point", rule->source_point);
+    cJSON_AddStringToObject(preview, "operator", operators[rule->condition_operator]);
+    cJSON_AddNumberToObject(preview, "threshold", rule->threshold);
+    cJSON_AddNumberToObject(preview, "hysteresis", rule->hysteresis);
+    cJSON_AddNumberToObject(preview, "hold_ms", rule->hold_ms);
+    cJSON_AddNumberToObject(preview, "cooldown_ms", rule->cooldown_ms);
+    cJSON_AddStringToObject(preview, "action",
+                            rule->action == RULE_ACTION_WRITE_POINT
+                                ? "write_point" : "mqtt_alert");
+    if (rule->action == RULE_ACTION_WRITE_POINT) {
+        cJSON_AddStringToObject(preview, "target_device", rule->target_device);
+        cJSON_AddStringToObject(preview, "target_point", rule->target_point);
+        cJSON_AddNumberToObject(preview, "target_value", rule->target_value);
+    } else {
+        cJSON_AddStringToObject(preview, "alert_topic", rule->alert_topic);
+        cJSON_AddStringToObject(preview, "alert_message", rule->alert_message);
+    }
+    cJSON_AddBoolToObject(preview, "enabled", rule->enabled);
+    return response;
+}
+
+static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
+{
+    automation_rule_t rule = {
+        .enabled = true,
+        .cooldown_ms = 1000,
+        .action = RULE_ACTION_MQTT_ALERT,
+    };
+    char operator_name[8] = {0};
+    char action_name[16] = {0};
+    if (!json_string(arguments, "rule_name", rule.name, sizeof(rule.name), true) ||
+        !json_string(arguments, "source_device", rule.source_device,
+                     sizeof(rule.source_device), true) ||
+        !json_string(arguments, "source_point", rule.source_point,
+                     sizeof(rule.source_point), true) ||
+        !json_string(arguments, "operator", operator_name,
+                     sizeof(operator_name), true) ||
+        !json_string(arguments, "action", action_name, sizeof(action_name), true)) {
+        *is_error = true;
+        return rule_response(&rule, false, false, "missing required rule field", 0);
+    }
+    cJSON *threshold = cJSON_GetObjectItem(arguments, "threshold");
+    if (!cJSON_IsNumber(threshold) ||
+        !parse_rule_operator(operator_name, &rule.condition_operator)) {
+        *is_error = true;
+        return rule_response(&rule, false, false, "invalid threshold or operator", 0);
+    }
+    rule.threshold = (float)threshold->valuedouble;
+    cJSON *item = cJSON_GetObjectItem(arguments, "hysteresis");
+    if (cJSON_IsNumber(item)) rule.hysteresis = (float)item->valuedouble;
+    item = cJSON_GetObjectItem(arguments, "hold_ms");
+    if (cJSON_IsNumber(item)) rule.hold_ms = (uint32_t)item->valuedouble;
+    item = cJSON_GetObjectItem(arguments, "cooldown_ms");
+    if (cJSON_IsNumber(item)) rule.cooldown_ms = (uint32_t)item->valuedouble;
+    item = cJSON_GetObjectItem(arguments, "enabled");
+    if (cJSON_IsBool(item)) rule.enabled = cJSON_IsTrue(item);
+    json_string(arguments, "interlock_device", rule.interlock_device,
+                sizeof(rule.interlock_device), false);
+    json_string(arguments, "interlock_point", rule.interlock_point,
+                sizeof(rule.interlock_point), false);
+    item = cJSON_GetObjectItem(arguments, "interlock_required_state");
+    rule.interlock_required_state = cJSON_IsTrue(item);
+
+    amm_mapping_entry_t source;
+    if (amm_find_mapping_by_point(rule.source_device, rule.source_point, &source) != ESP_OK) {
+        *is_error = true;
+        return rule_response(&rule, false, false, "source point is not mapped", 0);
+    }
+    if ((rule.interlock_device[0] == '\0') != (rule.interlock_point[0] == '\0')) {
+        *is_error = true;
+        return rule_response(&rule, false, false,
+                             "interlock device and point must be provided together", 0);
+    }
+    if (rule.interlock_device[0] != '\0') {
+        amm_mapping_entry_t interlock;
+        if (amm_find_mapping_by_point(rule.interlock_device, rule.interlock_point,
+                                      &interlock) != ESP_OK) {
+            *is_error = true;
+            return rule_response(&rule, false, false, "interlock point is not mapped", 0);
+        }
+    }
+
+    if (strcmp(action_name, "write_point") == 0) {
+        rule.action = RULE_ACTION_WRITE_POINT;
+        if (!json_string(arguments, "target_device", rule.target_device,
+                         sizeof(rule.target_device), true) ||
+            !json_string(arguments, "target_point", rule.target_point,
+                         sizeof(rule.target_point), true)) {
+            *is_error = true;
+            return rule_response(&rule, false, false, "missing write target", 0);
+        }
+        item = cJSON_GetObjectItem(arguments, "target_value");
+        amm_mapping_entry_t target;
+        if (!cJSON_IsNumber(item) ||
+            amm_find_mapping_by_point(rule.target_device, rule.target_point,
+                                      &target) != ESP_OK) {
+            *is_error = true;
+            return rule_response(&rule, false, false, "write target is not mapped", 0);
+        }
+        rule.target_value = (float)item->valuedouble;
+        if (!target.constraint.writable ||
+            rule.target_value < target.constraint.valid_range_min ||
+            rule.target_value > target.constraint.valid_range_max) {
+            *is_error = true;
+            return rule_response(&rule, false, false,
+                                 "write target is read-only or value is outside its safe range", 0);
+        }
+    } else if (strcmp(action_name, "mqtt_alert") == 0) {
+        json_string(arguments, "alert_topic", rule.alert_topic,
+                    sizeof(rule.alert_topic), false);
+        json_string(arguments, "alert_message", rule.alert_message,
+                    sizeof(rule.alert_message), false);
+    } else {
+        *is_error = true;
+        return rule_response(&rule, false, false, "invalid rule action", 0);
+    }
+    if (rule.hysteresis < 0 || rule.cooldown_ms < 200) {
+        *is_error = true;
+        return rule_response(&rule, false, false,
+                             "hysteresis must be non-negative and cooldown at least 200 ms", 0);
+    }
+
+    item = cJSON_GetObjectItem(arguments, "confirmed");
+    if (!cJSON_IsTrue(item)) {
+        return rule_response(&rule, true, false,
+                             "preview only; obtain explicit user confirmation before applying", 0);
+    }
+    runtime_config_t config;
+    runtime_config_get(&config);
+    if (!config.mcp_write_enabled) {
+        *is_error = true;
+        return rule_response(&rule, true, false,
+                             "MCP configuration writes are disabled", 0);
+    }
+    uint32_t id = 0;
+    esp_err_t err = automation_upsert_rule(&rule, &id);
+    *is_error = err != ESP_OK;
+    return rule_response(&rule, true, err == ESP_OK,
+                         err == ESP_OK ? "rule saved" : esp_err_to_name(err), id);
 }
 
 static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
@@ -201,12 +471,16 @@ static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
         cJSON_AddNumberToObject(response, "data_loss", uif_get_data_loss_count());
         return response;
     }
+    if (strcmp(name, "configure_rule_from_natural_language") == 0) {
+        return call_configure_rule(arguments, is_error);
+    }
     *is_error = true;
     return cJSON_Parse("{\"error\":\"unknown tool\"}");
 }
 
 static esp_err_t mcp_post_handler(httpd_req_t *req)
 {
+    if (require_mcp_authorization(req) != ESP_OK) return ESP_OK;
     cJSON *request = read_body(req);
     if (request == NULL) return send_rpc(req, NULL, NULL, -32700, "Parse error");
     cJSON *id = cJSON_GetObjectItem(request, "id");
@@ -256,16 +530,56 @@ static esp_err_t mcp_post_handler(httpd_req_t *req)
 
 static esp_err_t mcp_options_handler(httpd_req_t *req)
 {
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, MCP-Protocol-Version");
     return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t mcp_status_get_handler(httpd_req_t *req)
+{
+    runtime_config_t config;
+    runtime_config_get(&config);
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int64_t lock_remaining_ms = s_auth_locked_until_ms > now_ms
+        ? s_auth_locked_until_ms - now_ms : 0;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "access_enabled",
+                          config.security.auth_enabled &&
+                          strlen(config.security.password_sha256) == 64);
+    cJSON_AddBoolToObject(root, "auth_enabled", config.security.auth_enabled);
+    cJSON_AddBoolToObject(root, "token_configured",
+                          strlen(config.security.password_sha256) == 64);
+    cJSON_AddBoolToObject(root, "write_enabled", config.mcp_write_enabled);
+    cJSON_AddStringToObject(root, "endpoint", "/mcp");
+    cJSON_AddNumberToObject(root, "authorized_requests", s_authorized_requests);
+    cJSON_AddNumberToObject(root, "authentication_failures", s_auth_failure_total);
+    cJSON_AddNumberToObject(root, "last_authorized_uptime_ms",
+                            (double)s_last_authorized_ms);
+    cJSON_AddNumberToObject(root, "lock_remaining_ms",
+                            (double)lock_remaining_ms);
+    cJSON_AddNumberToObject(root, "tool_count", 7);
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (text == NULL) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Unable to serialize MCP status");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_sendstr(req, text);
+    free(text);
+    return err;
 }
 
 esp_err_t mcp_http_register(httpd_handle_t server)
 {
     const httpd_uri_t post = {.uri = "/mcp", .method = HTTP_POST, .handler = mcp_post_handler};
     const httpd_uri_t options = {.uri = "/mcp", .method = HTTP_OPTIONS, .handler = mcp_options_handler};
+    const httpd_uri_t status = {
+        .uri = "/api/mcp/status", .method = HTTP_GET,
+        .handler = mcp_status_get_handler,
+    };
     esp_err_t err = httpd_register_uri_handler(server, &post);
-    return err == ESP_OK ? httpd_register_uri_handler(server, &options) : err;
+    if (err == ESP_OK) err = httpd_register_uri_handler(server, &options);
+    return err == ESP_OK ? httpd_register_uri_handler(server, &status) : err;
 }

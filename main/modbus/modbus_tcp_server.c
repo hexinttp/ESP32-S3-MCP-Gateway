@@ -19,6 +19,9 @@ static int s_listen_fd = -1;
 static modbus_tcp_server_status_t s_status;
 static uint8_t s_max_clients = 4;
 
+#define MB_TCP_SERVER_STACK_SIZE 8192
+#define MB_TCP_CLIENT_STACK_SIZE 8192
+
 static int receive_all(int fd, uint8_t *buffer, size_t size)
 {
     size_t received = 0;
@@ -297,7 +300,7 @@ static void server_task(void *argument)
         bool full = s_status.active_clients >= s_max_clients;
         if (!full) ++s_status.active_clients;
         xSemaphoreGive(s_mutex);
-        if (full || xTaskCreate(client_task, "mbtcp_client", 4096,
+        if (full || xTaskCreate(client_task, "mbtcp_client", MB_TCP_CLIENT_STACK_SIZE,
                                 (void *)(intptr_t)fd, 4, NULL) != pdPASS) {
             close(fd);
             if (!full) {
@@ -323,7 +326,7 @@ esp_err_t modbus_tcp_server_start(void)
     s_status.port = config.modbus_tcp_server.port;
     s_max_clients = config.modbus_tcp_server.max_clients > 0
         ? config.modbus_tcp_server.max_clients : 4;
-    return xTaskCreate(server_task, "mb_tcp_server", 4096, NULL, 4,
+    return xTaskCreate(server_task, "mb_tcp_server", MB_TCP_SERVER_STACK_SIZE, NULL, 4,
                        &s_server_task) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

@@ -8,47 +8,26 @@
 #include <stdlib.h>
 #include "cJSON.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
 
 static const char *TAG = "TC_CMD";
 
-#define TC_CMD_SNAPSHOT_MAX 256
-
-/* Lazily PSRAM-allocated AMM snapshot buffer (only on first downlink). */
-static amm_mapping_entry_t *s_snapshot = NULL;
-
-static bool snapshot_ensure(void)
-{
-    if (s_snapshot != NULL) return true;
-    s_snapshot = heap_caps_calloc(TC_CMD_SNAPSHOT_MAX, sizeof(amm_mapping_entry_t),
-                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_snapshot == NULL) {
-        s_snapshot = heap_caps_calloc(TC_CMD_SNAPSHOT_MAX, sizeof(amm_mapping_entry_t),
-                                      MALLOC_CAP_8BIT);
-    }
-    if (s_snapshot == NULL) {
-        ESP_LOGE(TAG, "AMM snapshot allocation failed");
-        return false;
-    }
-    return true;
-}
-
 /* Find the active AMM entry matching a ThingsCloud sub-device address + property key. */
-static const amm_mapping_entry_t *find_entry(uint8_t channel_id, uint8_t slave_id,
-                                             const char *property_key)
+static bool find_entry(uint8_t channel_id, uint8_t slave_id,
+                       const char *property_key, amm_mapping_entry_t *out)
 {
-    if (!snapshot_ensure()) return NULL;
-    amm_mapping_entry_t *snapshot = s_snapshot;
-    int n = amm_get_entries(snapshot, TC_CMD_SNAPSHOT_MAX);
+    if (property_key == NULL || out == NULL) return false;
+    int n = amm_get_mapping_count();
     for (int i = 0; i < n; ++i) {
-        if (!snapshot[i].active) continue;
-        if (snapshot[i].slave_id != slave_id) continue;
-        if (channel_id != 0 && snapshot[i].channel_id != channel_id) continue;
-        if (strcmp(snapshot[i].point_id, property_key) == 0) {
-            return &snapshot[i];
+        amm_mapping_entry_t entry;
+        if (amm_get_entry_at(i, &entry) != ESP_OK) continue;
+        if (!entry.active || entry.source_protocol != SRC_MODBUS_RTU) continue;
+        if (entry.channel_id != channel_id || entry.slave_id != slave_id) continue;
+        if (strcmp(entry.point_id, property_key) == 0) {
+            *out = entry;
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
 /* Parse one property value into an engineering double. Returns true on success. */
@@ -110,8 +89,8 @@ static void handle_subdevice_downlink(const char *data, int data_len, cJSON *roo
                 cJSON_AddItemToArray(results, r);
                 continue;
             }
-            const amm_mapping_entry_t *e = find_entry(channel_id, slave_id, key);
-            if (e == NULL) {
+            amm_mapping_entry_t entry;
+            if (!find_entry(channel_id, slave_id, key, &entry)) {
                 cJSON *r = cJSON_CreateObject();
                 cJSON_AddStringToObject(r, "property", key ? key : "");
                 cJSON_AddStringToObject(r, "status", "fail");
@@ -119,6 +98,7 @@ static void handle_subdevice_downlink(const char *data, int data_len, cJSON *roo
                 cJSON_AddItemToArray(results, r);
                 continue;
             }
+            const amm_mapping_entry_t *e = &entry;
             if (!e->constraint.writable) {
                 cJSON *r = cJSON_CreateObject();
                 cJSON_AddStringToObject(r, "property", key ? key : "");
@@ -157,19 +137,32 @@ static void handle_subdevice_downlink(const char *data, int data_len, cJSON *roo
         }
     } else if (id != NULL && cJSON_IsString(id)) {
         double eng;
-        if (parse_property_value(value, &eng)) {
-            const amm_mapping_entry_t *e = find_entry(channel_id, slave_id, id->valuestring);
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "property", id->valuestring);
+        if (!parse_property_value(value, &eng)) {
+            cJSON_AddStringToObject(r, "status", "fail");
+            cJSON_AddStringToObject(r, "message", "invalid value");
+        } else {
+            amm_mapping_entry_t entry;
             control_result_t result;
             esp_err_t err = ESP_FAIL;
-            if (e != NULL && e->constraint.writable) {
-                err = control_service_write_point(e->device_id, e->point_id,
+            const char *message = "no such point";
+            if (find_entry(channel_id, slave_id, id->valuestring, &entry)) {
+                if (!entry.constraint.writable) {
+                    message = "read-only";
+                } else if (eng < (double)entry.constraint.valid_range_min ||
+                           eng > (double)entry.constraint.valid_range_max) {
+                    message = "out of range";
+                } else {
+                    err = control_service_write_point(entry.device_id, entry.point_id,
                                                   eng, CONTROL_SOURCE_MQTT, &result);
+                    message = err == ESP_OK ? "" : result.reason;
+                }
             }
-            cJSON *r = cJSON_CreateObject();
-            cJSON_AddStringToObject(r, "property", id->valuestring);
             cJSON_AddStringToObject(r, "status", err == ESP_OK ? "ok" : "fail");
-            cJSON_AddItemToArray(results, r);
+            if (err != ESP_OK) cJSON_AddStringToObject(r, "message", message);
         }
+        cJSON_AddItemToArray(results, r);
     }
 
     char *json = cJSON_PrintUnformatted(reply);

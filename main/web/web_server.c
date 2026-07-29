@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -352,13 +353,23 @@ static esp_err_t system_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "boot_count", health.boot_count);
     cJSON_AddNumberToObject(root, "reset_reason", health.reset_reason);
     cJSON_AddNumberToObject(root, "minimum_free_heap", health.minimum_free_heap);
+    cJSON_AddNumberToObject(root, "free_internal_heap", health.free_internal_heap);
+    cJSON_AddNumberToObject(root, "largest_internal_block",
+                           health.largest_internal_block);
+    cJSON_AddNumberToObject(root, "free_dma_heap", health.free_dma_heap);
     cJSON_AddNumberToObject(root, "free_psram", health.free_psram);
+    cJSON_AddNumberToObject(root, "largest_psram_block",
+                           health.largest_psram_block);
     cJSON_AddBoolToObject(root, "time_synchronized", health.time_synchronized);
     cJSON_AddBoolToObject(root, "ota_capable", health.ota_capable);
     cJSON_AddBoolToObject(root, "secure_boot_enabled", health.secure_boot_enabled);
     cJSON_AddBoolToObject(root, "flash_encryption_enabled",
                           health.flash_encryption_enabled);
     cJSON_AddNumberToObject(root, "watchdog_resets", health.watchdog_resets);
+    cJSON_AddNumberToObject(root, "online_devices",
+                            thingscloud_subdev_online_count());
+    cJSON_AddNumberToObject(root, "offline_devices",
+                            thingscloud_subdev_offline_count());
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -475,6 +486,20 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
         (config.mqtt.report_mode == MQ_REPORT_GATEWAY) ? "gateway" : "subdevice");
     cJSON_AddNumberToObject(root, "config_generation",
                             (double)thingscloud_get_config_generation());
+    thingscloud_runtime_status_t tc_status;
+    thingscloud_get_runtime_status(&tc_status);
+    cJSON_AddNumberToObject(root, "cloud_pending_points",
+                            (double)tc_status.pending_points);
+    cJSON_AddNumberToObject(root, "cloud_throttled_count",
+                            (double)tc_status.throttled_count);
+    cJSON_AddNumberToObject(root, "cloud_dropped_count",
+                            (double)tc_status.dropped_count);
+    cJSON_AddNumberToObject(root, "cloud_last_publish_ms",
+                            (double)tc_status.last_publish_ms);
+    cJSON_AddNumberToObject(root, "cloud_cached_records",
+                            (double)uif_get_cached_count());
+    cJSON_AddNumberToObject(root, "cloud_online_devices",
+                            (double)thingscloud_subdev_online_count());
 
     char *json = cJSON_PrintUnformatted(root);
     send_json(req, json);
@@ -497,6 +522,7 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
 
     runtime_config_t config;
     runtime_config_get(&config);
+    mqtt_report_mode_t previous_report_mode = config.mqtt.report_mode;
 #define COPY_MQTT_STRING(key, field) do { cJSON *item = cJSON_GetObjectItem(root, key); \
     if (cJSON_IsString(item) && strcmp(item->valuestring, "********") != 0) { \
         char _t[sizeof(config.mqtt.field)]; \
@@ -584,6 +610,11 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
         config.mqtt.lwt_retain = false;
     }
 
+    bool report_mode_changed = previous_report_mode != config.mqtt.report_mode;
+    if (report_mode_changed) {
+        /* Stop the old data route before committing the new ownership model. */
+        mqtt_disconnect();
+    }
     esp_err_t err = runtime_config_set(&config);
     if (err != ESP_OK) {
         cJSON_Delete(root);
@@ -595,7 +626,15 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
        client that was dialing an unreachable broker can take seconds). */
     if (!s_mqtt_restart_pending) {
         s_mqtt_restart_pending = true;
-        xTaskCreate(mqtt_restart_task, "mqtt_restart", 4096, NULL, 6, NULL);
+        BaseType_t created = xTaskCreate(mqtt_restart_task, "mqtt_restart",
+                                         6144, NULL, 6, NULL);
+        if (created != pdPASS) {
+            s_mqtt_restart_pending = false;
+            ESP_LOGE(TAG, "Unable to create MQTT restart task");
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "MQTT restart unavailable: low internal memory");
+        }
     }
 
     cJSON_Delete(root);
@@ -658,6 +697,19 @@ static esp_err_t mqtt_test_post_handler(httpd_req_t *req)
         cJSON_Delete(resp);
         cJSON_Delete(root);
         return ESP_OK;
+    }
+
+    /* Configuration reads intentionally mask secrets. Reuse the stored
+       credentials when the UI tests the active URI without retyping them. */
+    runtime_config_t saved;
+    runtime_config_get(&saved);
+    if ((username[0] == '\0' || strstr(username, "****") != NULL) &&
+        strcmp(uri, saved.mqtt.uri) == 0) {
+        strlcpy(username, saved.mqtt.username, sizeof(username));
+    }
+    if ((password[0] == '\0' || strstr(password, "****") != NULL) &&
+        strcmp(uri, saved.mqtt.uri) == 0) {
+        strlcpy(password, saved.mqtt.password, sizeof(password));
     }
 
     char reason[160] = {0};
@@ -730,7 +782,8 @@ static esp_err_t modbus_config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "tx_pin", MODBUS_RTU_UART_TXD);
     cJSON_AddNumberToObject(root, "rx_pin", MODBUS_RTU_UART_RXD);
     cJSON_AddNumberToObject(root, "rts_pin", MODBUS_RTU_UART_RTS);
-    cJSON_AddNumberToObject(root, "poll_interval", POLL_INTERVAL_MS);
+    cJSON_AddNumberToObject(root, "poll_interval",
+                           amm_get_default_poll_interval());
     modbus_tcp_server_status_t server_status = {0};
     modbus_tcp_server_get_status(&server_status);
     cJSON *server = cJSON_AddObjectToObject(root, "tcp_server");
@@ -784,6 +837,16 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
     if (cJSON_IsNumber(value)) config.modbus_rtu.parity = value->valueint;
     value = cJSON_GetObjectItem(root, "timeout");
     if (cJSON_IsNumber(value)) config.modbus_rtu.timeout_ms = value->valueint;
+    value = cJSON_GetObjectItem(root, "poll_interval");
+    uint32_t poll_interval = amm_get_default_poll_interval();
+    if (cJSON_IsNumber(value)) {
+        poll_interval = (uint32_t)value->valuedouble;
+        if (poll_interval < 100 || poll_interval > 3600000) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Poll interval must be 100..3600000 ms");
+        }
+    }
     cJSON *server = cJSON_GetObjectItem(root, "tcp_server");
     if (cJSON_IsObject(server)) {
         value = cJSON_GetObjectItem(server, "enabled");
@@ -818,6 +881,9 @@ static esp_err_t modbus_config_put_handler(httpd_req_t *req)
         }
     }
     esp_err_t err = runtime_config_set(&config);
+    if (err == ESP_OK) {
+        err = amm_set_poll_interval_all(poll_interval);
+    }
     cJSON_Delete(root);
     return err == ESP_OK ? send_json(req, "{\"status\":\"ok\",\"restart_required\":true}")
                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
@@ -918,7 +984,23 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
         cJSON_AddStringToObject(obj, "measurement_name", e->measurement_name);
         cJSON_AddStringToObject(obj, "unit", e->unit);
         cJSON_AddStringToObject(obj, "mqtt_topic", e->mqtt_topic);
+        cJSON_AddStringToObject(obj, "mqtt_topic_mode",
+                                e->mqtt_topic_mode == MQTT_TOPIC_CUSTOM
+                                    ? "custom" : "auto");
+        char effective_topic[AMM_MAX_TOPIC_LEN] = {0};
+        if (amm_resolve_mqtt_topic(e, effective_topic,
+                                   sizeof(effective_topic)) == ESP_OK) {
+            cJSON_AddStringToObject(obj, "effective_mqtt_topic",
+                                    effective_topic);
+        } else {
+            cJSON_AddStringToObject(obj, "effective_mqtt_topic", "");
+        }
         cJSON_AddStringToObject(obj, "gateway_property_key", e->gateway_property_key);
+        char effective_gateway_key[64] = {0};
+        mapping_effective_gw_key(e, effective_gateway_key,
+                                 sizeof(effective_gateway_key));
+        cJSON_AddStringToObject(obj, "effective_gateway_property_key",
+                                effective_gateway_key);
         cJSON_AddBoolToObject(obj, "writable", e->constraint.writable);
         cJSON_AddNumberToObject(obj, "range_min", e->constraint.valid_range_min);
         cJSON_AddNumberToObject(obj, "range_max", e->constraint.valid_range_max);
@@ -988,6 +1070,7 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
     entry.semantic_source = SEMANTIC_SOURCE_USER;
     entry.semantic_status = SEMANTIC_STATUS_VERIFIED;
     entry.semantic_confidence = 100;
+    entry.mqtt_topic_mode = MQTT_TOPIC_AUTO;
     strlcpy(entry.semantic_profile_id, "user-confirmed",
             sizeof(entry.semantic_profile_id));
     entry.semantic_profile_version = 1;
@@ -1050,6 +1133,9 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         strncpy(entry.unit, v->valuestring, AMM_MAX_UNIT_LEN - 1);
     if ((v = cJSON_GetObjectItem(root, "mqtt_topic")) && cJSON_IsString(v))
         strncpy(entry.mqtt_topic, v->valuestring, AMM_MAX_TOPIC_LEN - 1);
+    if ((v = cJSON_GetObjectItem(root, "mqtt_topic_mode")) && cJSON_IsString(v))
+        entry.mqtt_topic_mode = strcmp(v->valuestring, "custom") == 0
+            ? MQTT_TOPIC_CUSTOM : MQTT_TOPIC_AUTO;
     if ((v = cJSON_GetObjectItem(root, "gateway_property_key")) && cJSON_IsString(v))
         strlcpy(entry.gateway_property_key, v->valuestring, sizeof(entry.gateway_property_key));
 
@@ -1062,6 +1148,17 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
         entry.constraint.valid_range_max = (float)v->valuedouble;
 
     entry.active = true;
+
+    if (entry.mqtt_topic_mode == MQTT_TOPIC_CUSTOM &&
+        entry.mqtt_topic[0] == '\0') {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req,
+            "{\"status\":\"error\",\"reason\":\"custom MQTT topic is required\"}",
+            HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
 
     /* Gateway-mode property key checks: a custom key must be well-formed, and
        the effective key (custom or auto-generated) must be unique. Enforced at
@@ -1182,6 +1279,11 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     if (cJSON_IsString(value)) strlcpy(entry->unit, value->valuestring, sizeof(entry->unit));
     value = cJSON_GetObjectItem(root, "mqtt_topic");
     if (cJSON_IsString(value)) strlcpy(entry->mqtt_topic, value->valuestring, sizeof(entry->mqtt_topic));
+    value = cJSON_GetObjectItem(root, "mqtt_topic_mode");
+    if (cJSON_IsString(value)) {
+        entry->mqtt_topic_mode = strcmp(value->valuestring, "custom") == 0
+            ? MQTT_TOPIC_CUSTOM : MQTT_TOPIC_AUTO;
+    }
     value = cJSON_GetObjectItem(root, "gateway_property_key");
     if (cJSON_IsString(value)) strlcpy(entry->gateway_property_key, value->valuestring, sizeof(entry->gateway_property_key));
     value = cJSON_GetObjectItem(root, "semantic_profile_id");
@@ -1213,6 +1315,8 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
 
     if (entry->gateway_property_key[0] != '\0' &&
         !thingscloud_gateway_key_valid(entry->gateway_property_key)) return false;
+    if (entry->mqtt_topic_mode == MQTT_TOPIC_CUSTOM &&
+        entry->mqtt_topic[0] == '\0') return false;
 
     return entry->slave_id >= 1 &&
            entry->function_code >= 1 && entry->function_code <= 4 &&
@@ -1368,6 +1472,8 @@ static esp_err_t mappings_rollback_post_handler(httpd_req_t *req)
 typedef struct {
     char  text[WEB_LOG_MAX_TEXT_LEN];
     char  level; /* 'i'=info, 'w'=warn, 'e'=error, 'o'=ok */
+    int64_t timestamp_ms;
+    int64_t uptime_ms;
 } web_log_entry_t;
 
 static web_log_entry_t s_log_buf[WEB_LOG_MAX_ENTRIES];
@@ -1383,6 +1489,9 @@ void web_server_add_log(const char *level_str, const char *text)
     web_log_entry_t *e = &s_log_buf[s_log_head];
     e->level = (level_str && *level_str) ? *level_str : 'i';
     snprintf(e->text, WEB_LOG_MAX_TEXT_LEN, "%s", text ? text : "");
+    time_t now = time(NULL);
+    e->timestamp_ms = now >= 1577836800 ? (int64_t)now * 1000 : 0;
+    e->uptime_ms = esp_timer_get_time() / 1000LL;
     s_log_head = (s_log_head + 1) % WEB_LOG_MAX_ENTRIES;
     if (s_log_count < WEB_LOG_MAX_ENTRIES) s_log_count++;
 
@@ -1409,6 +1518,10 @@ static esp_err_t system_logs_get_handler(httpd_req_t *req)
             else if (e->level == 'o') lvl = "ok";
             cJSON_AddStringToObject(obj, "level", lvl);
             cJSON_AddStringToObject(obj, "text", e->text);
+            cJSON_AddNumberToObject(obj, "timestamp_ms",
+                                    (double)e->timestamp_ms);
+            cJSON_AddNumberToObject(obj, "uptime_ms",
+                                    (double)e->uptime_ms);
             cJSON_AddItemToArray(arr, obj);
         }
         xSemaphoreGive(s_log_mutex);
@@ -1430,6 +1543,9 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
     char output[2048];
     size_t output_used = 0;
     output[output_used++] = '[';
+    time_t wall_now = time(NULL);
+    int64_t wall_now_ms = wall_now >= 1577836800 ? (int64_t)wall_now * 1000 : 0;
+    int64_t boot_now_ms = esp_timer_get_time() / 1000LL;
     int count = modbus_comm_log_count();
     for (int i = 0; i < count; ++i) {
         modbus_comm_log_entry_t entry;
@@ -1468,11 +1584,13 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
         int length = snprintf(
             chunk, sizeof(chunk),
             "%s{\"sequence\":%lu,\"timestamp_ms\":%" PRId64
+            ",\"uptime_ms\":%" PRId64
             ",\"direction\":\"%s\",\"slave_id\":%u,\"function_code\":%u,"
             "\"register_address\":%u,\"register_count\":%u,"
             "\"status_code\":%ld,\"status\":\"%s\",\"truncated\":%s,"
             "\"frame_hex\":\"%s\",\"register_values\":[%s]}",
             i == 0 ? "" : ",", (unsigned long)entry.sequence,
+            wall_now_ms > 0 ? wall_now_ms - boot_now_ms + entry.timestamp_ms : 0,
             entry.timestamp_ms,
             entry.direction == MODBUS_COMM_TX ? "TX" : "RX",
             entry.slave_id, entry.function_code, entry.register_address,
@@ -2217,7 +2335,7 @@ esp_err_t web_server_start(uint16_t port)
     config.server_port = port;
     config.stack_size = 8192;
     config.task_priority = 5;
-    config.max_uri_handlers = 56;
+    config.max_uri_handlers = 60;
     config.max_open_sockets = 4;
     config.backlog_conn = 2;
     config.lru_purge_enable = true;

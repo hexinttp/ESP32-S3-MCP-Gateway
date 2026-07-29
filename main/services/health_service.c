@@ -48,7 +48,14 @@ void health_service_get(gateway_health_t *out)
     out->uptime_ms = esp_timer_get_time() / 1000;
     out->free_heap = esp_get_free_heap_size();
     out->minimum_free_heap = esp_get_minimum_free_heap_size();
+    out->free_internal_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    out->largest_internal_block =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    out->free_dma_heap =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     out->free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    out->largest_psram_block =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     out->flash_encryption_enabled = esp_flash_encryption_enabled();
     out->secure_boot_enabled = esp_secure_boot_enabled();
     out->ota_capable = esp_ota_get_next_update_partition(NULL) != NULL;

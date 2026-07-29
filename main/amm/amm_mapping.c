@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <stddef.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -22,8 +23,10 @@
 #include "amm/amm_mapping.h"
 #include "gateway_config.h"
 #include "tcm/tcm_context.h"
+#include "config/runtime_config.h"
 
 static const char *TAG = "AMM";
+static uint32_t s_default_poll_interval_ms = POLL_INTERVAL_MS;
 
 /* ======================== Private State ======================== */
 
@@ -150,6 +153,9 @@ static uint8_t amm_point_register_count(data_type_t data_type)
 
 static void amm_normalize_read_window(amm_mapping_entry_t *entry)
 {
+    if (entry->mqtt_topic_mode != MQTT_TOPIC_CUSTOM) {
+        entry->mqtt_topic_mode = MQTT_TOPIC_AUTO;
+    }
     if (entry->object_type < MODBUS_OBJECT_COIL ||
         entry->object_type > MODBUS_OBJECT_INPUT_REGISTER) {
         entry->object_type = entry->function_code >= 1 && entry->function_code <= 4
@@ -631,6 +637,7 @@ static void amm_overlay_user_semantics(const amm_mapping_entry_t *user_entry,
     strlcpy(entry->unit, user_entry->unit, sizeof(entry->unit));
     strlcpy(entry->mqtt_topic, user_entry->mqtt_topic,
             sizeof(entry->mqtt_topic));
+    entry->mqtt_topic_mode = user_entry->mqtt_topic_mode;
     entry->semantic_source = user_entry->semantic_source;
     entry->semantic_status = user_entry->semantic_status;
     entry->semantic_confidence = user_entry->semantic_confidence;
@@ -1045,9 +1052,68 @@ esp_err_t amm_copy_mqtt_topic(source_protocol_t protocol, uint8_t channel_id,
     if (out == NULL || out_size == 0) return ESP_ERR_INVALID_ARG;
     amm_mapping_entry_t entry;
     esp_err_t err = amm_find_mapping_for_channel(protocol, channel_id, slave_id, reg_addr, &entry);
-    if (err != ESP_OK || entry.mqtt_topic[0] == '\0') return ESP_ERR_NOT_FOUND;
-    strlcpy(out, entry.mqtt_topic, out_size);
-    return ESP_OK;
+    if (err != ESP_OK) return err;
+    return amm_resolve_mqtt_topic(&entry, out, out_size);
+}
+
+esp_err_t amm_set_poll_interval_all(uint32_t poll_interval_ms)
+{
+    if (poll_interval_ms < 100 || poll_interval_ms > 3600000) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    amm_lock();
+    esp_err_t err = amm_save_rollback_unlocked();
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        amm_unlock();
+        return err;
+    }
+    s_default_poll_interval_ms = poll_interval_ms;
+    uint32_t version = ++s_model_version;
+    for (int i = 0; i < s_mapping_count; ++i) {
+        if (!s_mapping_table[i].active) continue;
+        s_mapping_table[i].poll_interval_ms = poll_interval_ms;
+        s_mapping_table[i].mapping_version = version;
+    }
+    err = amm_save_to_nvs_unlocked();
+    amm_unlock();
+    return err;
+}
+
+uint32_t amm_get_default_poll_interval(void)
+{
+    return s_default_poll_interval_ms;
+}
+
+esp_err_t amm_resolve_mqtt_topic(const amm_mapping_entry_t *entry,
+                                 char *out, size_t out_size)
+{
+    if (entry == NULL || out == NULL || out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    if (entry->mqtt_topic_mode == MQTT_TOPIC_CUSTOM) {
+        if (entry->mqtt_topic[0] == '\0') return ESP_ERR_NOT_FOUND;
+        strlcpy(out, entry->mqtt_topic, out_size);
+        return strlen(entry->mqtt_topic) < out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    }
+
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
+    const char *parts[] = {
+        runtime.mqtt.data_prefix,
+        runtime.gateway_id,
+        entry->device_id,
+        entry->point_id,
+    };
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+        if (parts[i] == NULL || parts[i][0] == '\0') continue;
+        size_t length = strlen(out);
+        if (length > 0 && out[length - 1] != '/') strlcat(out, "/", out_size);
+        while (*parts[i] == '/') parts[i]++;
+        strlcat(out, parts[i], out_size);
+    }
+    return out[0] != '\0' && strlen(out) < out_size - 1
+        ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
 
 /* ======================== NVS Persistence ======================== */
@@ -1115,6 +1181,14 @@ static esp_err_t amm_save_to_nvs_unlocked(void)
     ret = nvs_set_u32(handle, AMM_NVS_KEY_SCHEMA, AMM_NVS_SCHEMA_VERSION);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS set schema version failed: %s", esp_err_to_name(ret));
+        nvs_close(handle);
+        return ret;
+    }
+    ret = nvs_set_u32(handle, AMM_NVS_KEY_POLL_MS,
+                      s_default_poll_interval_ms);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS set poll interval failed: %s",
+                 esp_err_to_name(ret));
         nvs_close(handle);
         return ret;
     }
@@ -1234,6 +1308,11 @@ esp_err_t amm_load_from_nvs(void)
 
     int32_t stored_count = 0;
     s_loaded_schema_version = 0;
+    uint32_t stored_poll_ms = POLL_INTERVAL_MS;
+    if (nvs_get_u32(handle, AMM_NVS_KEY_POLL_MS, &stored_poll_ms) == ESP_OK &&
+        stored_poll_ms >= 100 && stored_poll_ms <= 3600000) {
+        s_default_poll_interval_ms = stored_poll_ms;
+    }
     esp_err_t schema_ret = nvs_get_u32(handle, AMM_NVS_KEY_SCHEMA,
                                        &s_loaded_schema_version);
     if (schema_ret != ESP_OK && schema_ret != ESP_ERR_NVS_NOT_FOUND) {
@@ -1265,8 +1344,21 @@ esp_err_t amm_load_from_nvs(void)
 
         size_t blob_len = 0;
         ret = nvs_get_blob(handle, key, NULL, &blob_len);
-        if (ret == ESP_OK && blob_len == sizeof(amm_mapping_entry_t)) {
+        if (ret == ESP_OK && blob_len == sizeof(amm_mapping_entry_t) &&
+            s_loaded_schema_version == AMM_NVS_SCHEMA_VERSION) {
             ret = nvs_get_blob(handle, key, &s_mapping_table[i], &blob_len);
+        } else if (ret == ESP_OK &&
+                   blob_len == offsetof(amm_mapping_entry_t, mqtt_topic_mode) &&
+                   s_loaded_schema_version == 6) {
+            memset(&s_mapping_table[i], 0, sizeof(s_mapping_table[i]));
+            size_t legacy_len = blob_len;
+            ret = nvs_get_blob(handle, key, &s_mapping_table[i], &legacy_len);
+            if (ret == ESP_OK) {
+                s_mapping_table[i].mqtt_topic_mode =
+                    s_mapping_table[i].semantic_source == SEMANTIC_SOURCE_USER &&
+                    s_mapping_table[i].mqtt_topic[0] != '\0'
+                    ? MQTT_TOPIC_CUSTOM : MQTT_TOPIC_AUTO;
+            }
         } else if (ret == ESP_OK &&
                    blob_len == sizeof(amm_mapping_entry_v5_t) &&
                    s_loaded_schema_version == 5) {

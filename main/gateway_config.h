@@ -16,6 +16,7 @@
 #define MQTT_USERNAME            ""
 #define MQTT_PASSWORD            ""
 #define MQTT_KEEPALIVE_SEC       60
+#define MQTT_CONNECT_TIMEOUT_MS  15000
 #define MQTT_PUBLISH_TIMEOUT_MS  5000
 #define MQTT_CMD_TOPIC_PREFIX    "factory/cmd/"
 #define MQTT_DATA_TOPIC_PREFIX   "factory/data/"
@@ -47,7 +48,7 @@ typedef enum {
 
 /* ThingsCloud aggregated payload size limit; packets larger than this are split. */
 #define THINGSCLOUD_MAX_PAYLOAD_BYTES   1024
-#define THINGSCLOUD_SUBDEVICE_MAX       64
+#define THINGSCLOUD_SUBDEVICE_MAX       100
 /* Per-cycle aggregation buffer capacity. */
 #define THINGSCLOUD_AGG_BUFFER_MAX      96
 

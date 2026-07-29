@@ -12,7 +12,11 @@ typedef struct {
     int64_t uptime_ms;
     uint32_t free_heap;
     uint32_t minimum_free_heap;
+    uint32_t free_internal_heap;
+    uint32_t largest_internal_block;
+    uint32_t free_dma_heap;
     uint32_t free_psram;
+    uint32_t largest_psram_block;
     bool flash_encryption_enabled;
     bool secure_boot_enabled;
     bool ota_capable;

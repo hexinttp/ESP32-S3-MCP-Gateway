@@ -10,6 +10,7 @@ __pycache__/
 
 # Local temporary/debug artifacts (serial captures, build/flash scripts, etc.)
 temp/
+/test_logs/
 
 # Editor and operating-system metadata
 .vscode/

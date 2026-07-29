@@ -520,7 +520,11 @@ tbody tr:last-child td { border-bottom: none; }
     </li>
     <li class="nav-item" data-page="automation">
       <span class="icon">&#9889;</span>
-      <span data-i18n="nav.automation">Automation Rules</span>
+      <span data-i18n="nav.automation">Rule Engine</span>
+    </li>
+    <li class="nav-item" data-page="mcp">
+      <span class="icon">&#128279;</span>
+      <span data-i18n="nav.mcp">MCP Management</span>
     </li>
     <li class="nav-item" data-page="logs">
       <span class="icon">&#9997;</span>
@@ -593,6 +597,20 @@ tbody tr:last-child td { border-bottom: none; }
           <div class="stat-info">
             <h3 id="statDataLoss">--</h3>
             <p data-i18n="dashboard.data_loss">Data Loss Events</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">&#10003;</div>
+          <div class="stat-info">
+            <h3 id="statOnlineDevices">--</h3>
+            <p data-i18n="dashboard.online_devices">Online Devices</p>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red">&#10005;</div>
+          <div class="stat-info">
+            <h3 id="statOfflineDevices">--</h3>
+            <p data-i18n="dashboard.offline_devices">Offline Devices</p>
           </div>
         </div>
       </div>
@@ -809,6 +827,14 @@ tbody tr:last-child td { border-bottom: none; }
 
           <div class="tc-only" style="display:none; margin-top:12px;">
             <div class="hint" data-i18n="mqtt.tc.fixed">ThingsCloud mode: QoS is fixed to 0, Retain is off, and the custom LWT is disabled (managed by connection state).</div>
+            <div class="form-grid" style="margin-top:12px;">
+              <div class="form-group"><label data-i18n="mqtt.status.online_devices">Online Devices</label><div id="tcOnlineDevices">0</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.pending">Pending Points</label><div id="tcPendingPoints">0</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.cached">Offline Cache</label><div id="tcCachedRecords">0</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.throttled">Rate-limited</label><div id="tcThrottledCount">0</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.deferred">Deferred to Cache</label><div id="tcDroppedCount">0</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.last_publish">Last Publish</label><div id="tcLastPublish">-</div></div>
+            </div>
           </div>
 
           <div style="margin-top:16px; display:flex; gap:8px;">
@@ -964,12 +990,11 @@ tbody tr:last-child td { border-bottom: none; }
                   <th data-i18n="th.data_type">Data Type</th>
                   <th data-i18n="th.device_id">Device ID</th>
                   <th data-i18n="th.point_id">Point ID</th>
-                  <th data-i18n="mapping.semantic_status">Semantic Status</th>
-                  <th data-i18n="th.unit">Unit</th>
                   <th data-i18n="mapping.raw_value">Raw Value</th>
                   <th data-i18n="mapping.current_value">Engineering Value</th>
+                  <th data-i18n="th.unit">Unit</th>
                   <th data-i18n="mapping.poll_status">Poll Status</th>
-                  <th data-i18n="th.mqtt_topic">MQTT Topic</th>
+                  <th id="mappingRouteHeader" data-i18n="th.mqtt_topic">MQTT Topic</th>
                   <th data-i18n="th.writable">Writable</th>
                   <th data-i18n="th.range">Range</th>
                   <th data-i18n="th.actions">Actions</th>
@@ -1170,7 +1195,7 @@ tbody tr:last-child td { border-bottom: none; }
     <section class="page-section" id="page-automation">
       <div class="card">
         <div class="card-header">
-          <span data-i18n="automation.title">Offline Automation Rules</span>
+          <span data-i18n="automation.title">Offline Rule Engine</span>
           <button class="btn btn-primary btn-sm" onclick="saveAutomationRule()" data-i18n="automation.add">Add Rule</button>
         </div>
         <div class="card-body">
@@ -1199,6 +1224,74 @@ tbody tr:last-child td { border-bottom: none; }
       <div class="card">
         <div class="card-header"><span data-i18n="automation.configured">Configured Rules</span><span id="ruleStats" class="badge badge-info"></span></div>
         <div class="table-wrap"><table><thead><tr><th data-i18n="automation.name">Rule Name</th><th data-i18n="automation.condition">Condition</th><th data-i18n="automation.action">Action</th><th data-i18n="status.active">Active</th><th data-i18n="th.actions">Actions</th></tr></thead><tbody id="automationRulesBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ========== MCP MANAGEMENT ========== -->
+    <section class="page-section" id="page-mcp">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon blue">&#128279;</div>
+          <div class="stat-info"><h3 id="mcpAccessStatus">--</h3><p data-i18n="mcp.access_status">Access Status</p></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">&#128274;</div>
+          <div class="stat-info"><h3 id="mcpAuthRequests">0</h3><p data-i18n="mcp.authorized_requests">Authorized Requests</p></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red">&#9888;</div>
+          <div class="stat-info"><h3 id="mcpAuthFailures">0</h3><p data-i18n="mcp.auth_failures">Authentication Failures</p></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon yellow">&#9201;</div>
+          <div class="stat-info"><h3 id="mcpLockStatus">--</h3><p data-i18n="mcp.lock_status">Lock Status</p></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span data-i18n="mcp.configuration">MCP Access Configuration</span>
+          <span id="mcpEndpointBadge" class="badge badge-info">/mcp</span>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="mcp.endpoint">Endpoint</label>
+              <input id="mcpEndpoint" type="text" value="/mcp" readonly>
+            </div>
+            <div class="form-group">
+              <label data-i18n="mcp.new_token">New Bearer Token</label>
+              <input id="mcpBearerToken" type="password" autocomplete="new-password" data-i18n-placeholder="mcp.token_placeholder" placeholder="Leave blank to keep the current token">
+            </div>
+          </div>
+          <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:12px;">
+            <label><input id="mcpAccessEnabled" type="checkbox"> <span data-i18n="mcp.enable_access">Enable authenticated MCP access</span></label>
+            <label><input id="mcpWriteEnabled" type="checkbox"> <span data-i18n="mcp.enable_write">Allow point writes and rule changes</span></label>
+            <span id="mcpTokenStatus" class="muted"></span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:16px;">
+            <button class="btn btn-primary" onclick="saveMcpManagement()" data-i18n="btn.save">Save Configuration</button>
+            <span id="mcpLastAccess" class="muted"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><span data-i18n="mcp.tools">Available MCP Tools</span><span class="badge badge-info">7</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th data-i18n="mcp.tool">Tool</th><th data-i18n="mcp.permission">Permission</th><th data-i18n="mcp.purpose">Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>list_points</code></td><td data-i18n="mcp.read_only">Read only</td><td data-i18n="mcp.list_points_desc">List mapped industrial points and current values</td></tr>
+              <tr><td><code>read_point</code></td><td data-i18n="mcp.read_only">Read only</td><td data-i18n="mcp.read_point_desc">Read one TCM semantic point</td></tr>
+              <tr><td><code>get_gateway_config</code></td><td data-i18n="mcp.read_only">Read only</td><td data-i18n="mcp.gateway_desc">Read non-secret gateway configuration</td></tr>
+              <tr><td><code>get_cache_status</code></td><td data-i18n="mcp.read_only">Read only</td><td data-i18n="mcp.cache_desc">Read UIF offline-cache status</td></tr>
+              <tr><td><code>discover_modbus_devices</code></td><td data-i18n="mcp.operation">Operation</td><td data-i18n="mcp.discovery_desc">Start controlled Modbus discovery</td></tr>
+              <tr><td><code>write_point</code></td><td data-i18n="mcp.write_required">Write permission</td><td data-i18n="mcp.write_desc">Write through AMM safety constraints</td></tr>
+              <tr><td><code>configure_rule_from_natural_language</code></td><td data-i18n="mcp.confirm_required">Write + confirmation</td><td data-i18n="mcp.rule_desc">Preview and apply a rule generated from natural language</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -1370,9 +1463,19 @@ tbody tr:last-child td { border-bottom: none; }
           <input type="text" id="mUnit" placeholder="e.g. degC">
         </div>
       </div>
-      <div class="form-group">
-        <label data-i18n="th.mqtt_topic">MQTT Topic</label>
-        <input type="text" id="mMqttTopic" placeholder="e.g. factory/line1/plc01/motor/temp">
+      <div class="form-grid">
+        <div class="form-group">
+          <label data-i18n="mapping.topic_mode">Topic Mode</label>
+          <select id="mMqttTopicMode" onchange="updateMappingTopicModeUI()">
+            <option value="auto" data-i18n="mapping.topic_auto">Automatic</option>
+            <option value="custom" data-i18n="mapping.topic_custom">Custom</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="th.mqtt_topic">MQTT Topic</label>
+          <input type="text" id="mMqttTopic" placeholder="e.g. factory/line1/plc01/motor/temp">
+          <span class="hint" id="mMqttTopicHint" data-i18n="mapping.topic_auto_hint"></span>
+        </div>
       </div>
       <div class="form-group">
         <label data-i18n="th.gateway_key">Gateway Key</label>
@@ -1423,7 +1526,8 @@ const I18N = {
     "nav.modbus": "MODBUS \u8bbe\u7f6e",
     "nav.mapping": "\u6620\u5c04\u8868",
     "nav.discover": "\u8bbe\u5907\u53d1\u73b0",
-    "nav.automation": "\u81ea\u52a8\u5316\u89c4\u5219",
+    "nav.automation": "\u89c4\u5219\u5f15\u64ce",
+    "nav.mcp": "MCP \u7ba1\u7406",
     "nav.logs": "\u7cfb\u7edf\u65e5\u5fd7",
     "btn.save": "\u4fdd\u5b58\u914d\u7f6e",
     "btn.cancel": "\u53d6\u6d88",
@@ -1437,6 +1541,8 @@ const I18N = {
     "dashboard.cached_records": "\u7f13\u5b58\u8bb0\u5f55",
     "dashboard.free_heap": "\u53ef\u7528\u5806\u5185\u5b58",
     "dashboard.data_loss": "\u6570\u636e\u4e22\u5931\u4e8b\u4ef6",
+    "dashboard.online_devices": "\u5728\u7ebf\u8bbe\u5907",
+    "dashboard.offline_devices": "\u79bb\u7ebf\u8bbe\u5907",
     "dashboard.sys_info": "\u7cfb\u7edf\u4fe1\u606f",
     "dashboard.firmware_ver": "\u56fa\u4ef6\u7248\u672c\uff1a",
     "dashboard.idf_ver": "ESP-IDF \u7248\u672c\uff1a",
@@ -1469,6 +1575,12 @@ const I18N = {
     "th.point_id": "\u70b9\u4f4d ID",
     "th.unit": "\u5355\u4f4d",
     "th.mqtt_topic": "MQTT \u4e3b\u9898",
+    "mapping.topic_mode": "Topic 模式",
+    "mapping.topic_auto": "自动",
+    "mapping.topic_custom": "自定义",
+    "mapping.topic_auto_hint": "自动模式使用最新 MQTT 前缀生成有效 Topic",
+    "mapping.topic_custom_hint": "自定义模式固定使用此完整 Topic",
+    "mapping.cloud_property": "云端属性 Key",
     "th.gateway_key": "网关属性 Key",
     "th.gateway_key.hint": "网关模式下的属性名：留空自动生成 p{端口}_s{从站}_{属性}；填写则使用该值（仅字母/数字/下划线，保存时校验唯一性）",
     "th.writable": "\u53ef\u5199",
@@ -1496,7 +1608,7 @@ const I18N = {
     "mqtt.report_mode.gw.desc": "所有 Modbus 点位作为网关设备自身属性，经 attributes 上报。\n属性名自动生成为 p{端口}_s{从站}_{属性}（如 p1_s1_temperature）；网关在本地检测从站离线并上传在线状态属性；云端不显示独立的 ThingsCloud 子设备实体。",
     "mqtt.report_mode.effective": "当前生效模式",
     "mqtt.report_mode.warn_change": "切换上报模式会改变云端数据归属，且旧模式待发送数据将被丢弃。确认保存？",
-    "mqtt.report_mode.restart_hint": "保存后云端模块将按新模式重新初始化（无需重启设备，MQTT 连接复用）。",
+    "mqtt.report_mode.restart_hint": "保存后先断开现有 MQTT 连接，再按新的上报模式和 Topic 重新连接。",
     "mqtt.access_token": "AccessToken（网关设备）",
     "mqtt.project_key": "ProjectKey（项目密钥）",
     "mqtt.tc.hint": "ESP32-S3 使用网关设备凭证连接 ThingsCloud，Modbus 从机作为子设备上报。",
@@ -1508,6 +1620,12 @@ const I18N = {
     "mqtt.tc.t6": "属性下发（下行）：gateway/attributes/push",
     "mqtt.tc.t7": "命令下发（下行）：gateway/command/send",
     "mqtt.tc.fixed": "ThingsCloud 模式：QoS 固定为 0，Retain 关闭，自定义遗嘱（LWT）禁用（由连接状态管理）。",
+    "mqtt.status.online_devices": "在线设备",
+    "mqtt.status.pending": "待发送点位",
+    "mqtt.status.cached": "离线缓存",
+    "mqtt.status.throttled": "限流次数",
+    "mqtt.status.deferred": "转存缓存次数",
+    "mqtt.status.last_publish": "最近成功上报",
     "mqtt.broker_uri": "Broker URI",
     "mqtt.uri": "Broker URI",
     "mqtt.client_id": "\u5ba2\u6237\u7aef ID",
@@ -1652,7 +1770,7 @@ const I18N = {
     "discover.rtu_hint": "RTU \u53d1\u73b0\u4f1a\u626b\u63cf MODBUS \u8bbe\u7f6e\u4e2d\u7684 RS485 \u603b\u7ebf\uff1bTCP \u8bbe\u5907\u8bf7\u5728 MODBUS TCP Endpoints \u4e2d\u914d\u7f6e\u3002",
     "discover.valid": "\u6709\u6548",
     "discover.invalid": "\u65e0\u6548",
-    "automation.title": "\u79bb\u7ebf\u81ea\u52a8\u5316\u89c4\u5219",
+    "automation.title": "\u79bb\u7ebf\u89c4\u5219\u5f15\u64ce",
     "automation.add": "\u6dfb\u52a0\u89c4\u5219",
     "automation.name": "\u89c4\u5219\u540d\u79f0",
     "automation.source_device": "\u6761\u4ef6\u8bbe\u5907",
@@ -1675,6 +1793,31 @@ const I18N = {
     "automation.message": "\u544a\u8b66\u6d88\u606f",
     "automation.configured": "\u5df2\u914d\u7f6e\u89c4\u5219",
     "automation.condition": "\u89e6\u53d1\u6761\u4ef6",
+    "mcp.access_status": "\u8bbf\u95ee\u72b6\u6001",
+    "mcp.authorized_requests": "\u5df2\u6388\u6743\u8bf7\u6c42",
+    "mcp.auth_failures": "\u8ba4\u8bc1\u5931\u8d25",
+    "mcp.lock_status": "\u9501\u5b9a\u72b6\u6001",
+    "mcp.configuration": "MCP \u8bbf\u95ee\u914d\u7f6e",
+    "mcp.endpoint": "\u670d\u52a1\u7aef\u70b9",
+    "mcp.new_token": "\u65b0 Bearer Token",
+    "mcp.token_placeholder": "\u7559\u7a7a\u4fdd\u7559\u5f53\u524d Token",
+    "mcp.enable_access": "\u542f\u7528\u9700\u8ba4\u8bc1\u7684 MCP \u8bbf\u95ee",
+    "mcp.enable_write": "\u5141\u8bb8\u5199\u70b9\u4f4d\u548c\u4fee\u6539\u89c4\u5219",
+    "mcp.tools": "\u53ef\u7528 MCP \u5de5\u5177",
+    "mcp.tool": "\u5de5\u5177",
+    "mcp.permission": "\u6743\u9650",
+    "mcp.purpose": "\u7528\u9014",
+    "mcp.read_only": "\u53ea\u8bfb",
+    "mcp.operation": "\u64cd\u4f5c",
+    "mcp.write_required": "\u9700\u5199\u6743\u9650",
+    "mcp.confirm_required": "\u5199\u6743\u9650 + \u7528\u6237\u786e\u8ba4",
+    "mcp.list_points_desc": "\u5217\u51fa\u6620\u5c04\u7684\u5de5\u4e1a\u70b9\u4f4d\u548c\u5f53\u524d\u503c",
+    "mcp.read_point_desc": "\u8bfb\u53d6\u5355\u4e2a TCM \u8bed\u4e49\u70b9\u4f4d",
+    "mcp.gateway_desc": "\u8bfb\u53d6\u4e0d\u542b\u5bc6\u94a5\u7684\u7f51\u5173\u914d\u7f6e",
+    "mcp.cache_desc": "\u8bfb\u53d6 UIF \u79bb\u7ebf\u7f13\u5b58\u72b6\u6001",
+    "mcp.discovery_desc": "\u542f\u52a8\u53d7\u63a7 Modbus \u8bbe\u5907\u53d1\u73b0",
+    "mcp.write_desc": "\u901a\u8fc7 AMM \u5b89\u5168\u7ea6\u675f\u5199\u5165\u70b9\u4f4d",
+    "mcp.rule_desc": "\u9884\u89c8\u5e76\u5e94\u7528\u7531\u81ea\u7136\u8bed\u8a00\u751f\u6210\u7684\u89c4\u5219",
     "logs.title": "\u7cfb\u7edf\u65e5\u5fd7",
     "logs.modbus_title": "RS485 \u901a\u4fe1\u65e5\u5fd7",
     "logs.clear": "\u6e05\u7a7a",
@@ -1687,7 +1830,7 @@ const I18N = {
     "logs.success": "\u6210\u529f",
     "logs.error": "\u5931\u8d25",
     "logs.sequence": "\u5e8f\u53f7",
-    "logs.time": "\u8fd0\u884c\u65f6\u95f4",
+    "logs.time": "\u65e5\u671f\u65f6\u95f4",
     "logs.raw_registers": "\u539f\u59cb\u5bc4\u5b58\u5668",
     "logs.frame": "\u539f\u59cb\u5e27",
     "logs.empty": "\u6682\u65e0\u5339\u914d\u7684\u901a\u4fe1\u8bb0\u5f55",
@@ -1708,7 +1851,8 @@ const I18N = {
     'nav.modbus': 'MODBUS Settings',
     'nav.mapping': 'Mapping Table',
     'nav.discover': 'Device Discovery',
-    'nav.automation': 'Automation Rules',
+    'nav.automation': 'Rule Engine',
+    'nav.mcp': 'MCP Management',
     'nav.logs': 'System Logs',
     'btn.save': 'Save Configuration',
     'btn.cancel': 'Cancel',
@@ -1722,6 +1866,8 @@ const I18N = {
     'dashboard.cached_records': 'Cached Records',
     'dashboard.free_heap': 'Free Heap',
     'dashboard.data_loss': 'Data Loss Events',
+    'dashboard.online_devices': 'Online Devices',
+    'dashboard.offline_devices': 'Offline Devices',
     'dashboard.sys_info': 'System Information',
     'dashboard.firmware_ver': 'Firmware Version:',
     'dashboard.idf_ver': 'ESP-IDF Version:',
@@ -1747,6 +1893,12 @@ const I18N = {
     'th.slave_id': 'Slave ID', 'th.reg_addr': 'Register', 'th.data_type': 'Data Type',
     'th.device_id': 'Device ID', 'th.point_id': 'Point ID', 'th.unit': 'Unit',
     'th.mqtt_topic': 'MQTT Topic', 'th.writable': 'Writable', 'th.range': 'Range',
+    'mapping.topic_mode': 'Topic Mode',
+    'mapping.topic_auto': 'Automatic',
+    'mapping.topic_custom': 'Custom',
+    'mapping.topic_auto_hint': 'Automatic mode resolves the effective topic from the latest MQTT prefix',
+    'mapping.topic_custom_hint': 'Custom mode always uses this complete topic',
+    'mapping.cloud_property': 'Cloud Property Key',
     'th.gateway_key': 'Gateway Key',
     'th.gateway_key.hint': 'Gateway-mode attribute name. Leave empty to auto-generate p{port}_s{slave}_{property}; otherwise this value is used (letters/digits/underscore only, uniqueness checked on save)',
     'th.actions': 'Actions',
@@ -1772,7 +1924,7 @@ const I18N = {
     'mqtt.report_mode.gw.desc': 'All Modbus points are reported as the gateway device\'s own attributes via the attributes topic.\nProperty keys are auto-generated as p{port}_s{slave}_{property} (e.g. p1_s1_temperature); the gateway detects slave offline locally and uploads online-status attributes. No separate ThingsCloud sub-device entities appear in the cloud.',
     'mqtt.report_mode.effective': 'Effective mode',
     'mqtt.report_mode.warn_change': 'Changing the report mode changes data ownership in the cloud, and pending data from the old mode will be discarded. Save anyway?',
-    'mqtt.report_mode.restart_hint': 'After saving, the cloud module re-initializes with the new mode (no device reboot; the MQTT connection is reused).',
+    'mqtt.report_mode.restart_hint': 'After saving, the current MQTT session disconnects before reconnecting with the new report mode and Topic.',
     'mqtt.access_token': 'AccessToken (gateway device)',
     'mqtt.project_key': 'ProjectKey (project secret)',
     'mqtt.tc.hint': 'ESP32-S3 connects with gateway device credentials; Modbus slaves are reported as ThingsCloud sub-devices.',
@@ -1784,6 +1936,12 @@ const I18N = {
     'mqtt.tc.t6': 'Attribute push (downlink): gateway/attributes/push',
     'mqtt.tc.t7': 'Command send (downlink): gateway/command/send',
     'mqtt.tc.fixed': 'ThingsCloud mode: QoS fixed to 0, Retain off, custom LWT disabled (managed by connection state).',
+    'mqtt.status.online_devices': 'Online Devices',
+    'mqtt.status.pending': 'Pending Points',
+    'mqtt.status.cached': 'Offline Cache',
+    'mqtt.status.throttled': 'Rate-limited',
+    'mqtt.status.deferred': 'Deferred to Cache',
+    'mqtt.status.last_publish': 'Last Publish',
     'mqtt.broker_uri': 'Broker URI',
     'mqtt.uri': 'Broker URI',
     'mqtt.client_id': 'Client ID',
@@ -1928,7 +2086,7 @@ const I18N = {
     'discover.bridge_mode': 'Bridge Mode',
     'discover.virtual_mode': 'Virtual Mode',
     'discover.rtu_hint': 'RTU discovery scans the RS485 bus configured in MODBUS Settings; TCP devices are configured under MODBUS TCP Endpoints.',
-    'automation.title': 'Offline Automation Rules',
+    'automation.title': 'Offline Rule Engine',
     'automation.add': 'Add Rule',
     'automation.name': 'Rule Name',
     'automation.source_device': 'Source Device',
@@ -1951,6 +2109,31 @@ const I18N = {
     'automation.message': 'Message',
     'automation.configured': 'Configured Rules',
     'automation.condition': 'Condition',
+    'mcp.access_status': 'Access Status',
+    'mcp.authorized_requests': 'Authorized Requests',
+    'mcp.auth_failures': 'Authentication Failures',
+    'mcp.lock_status': 'Lock Status',
+    'mcp.configuration': 'MCP Access Configuration',
+    'mcp.endpoint': 'Endpoint',
+    'mcp.new_token': 'New Bearer Token',
+    'mcp.token_placeholder': 'Leave blank to keep the current token',
+    'mcp.enable_access': 'Enable authenticated MCP access',
+    'mcp.enable_write': 'Allow point writes and rule changes',
+    'mcp.tools': 'Available MCP Tools',
+    'mcp.tool': 'Tool',
+    'mcp.permission': 'Permission',
+    'mcp.purpose': 'Purpose',
+    'mcp.read_only': 'Read only',
+    'mcp.operation': 'Operation',
+    'mcp.write_required': 'Write permission',
+    'mcp.confirm_required': 'Write + confirmation',
+    'mcp.list_points_desc': 'List mapped industrial points and current values',
+    'mcp.read_point_desc': 'Read one TCM semantic point',
+    'mcp.gateway_desc': 'Read non-secret gateway configuration',
+    'mcp.cache_desc': 'Read UIF offline-cache status',
+    'mcp.discovery_desc': 'Start controlled Modbus discovery',
+    'mcp.write_desc': 'Write through AMM safety constraints',
+    'mcp.rule_desc': 'Preview and apply a rule generated from natural language',
     'logs.title': 'System Logs',
     'logs.modbus_title': 'RS485 Communication Log',
     'logs.clear': 'Clear',
@@ -1963,7 +2146,7 @@ const I18N = {
     'logs.success': 'Success',
     'logs.error': 'Error',
     'logs.sequence': 'Sequence',
-    'logs.time': 'Uptime',
+    'logs.time': 'Date/Time',
     'logs.raw_registers': 'Raw Registers',
     'logs.frame': 'Raw Frame',
     'logs.empty': 'No matching communication records',
@@ -2008,6 +2191,14 @@ function setLang(lang, persist = true) {
   if (typeof renderAutomationRules === 'function') renderAutomationRules();
   if (typeof renderModbusLogs === 'function') renderModbusLogs();
   if (typeof updateScanTransport === 'function') updateScanTransport();
+  const activeSection = document.querySelector('.page-section.active');
+  if (activeSection) {
+    const page = activeSection.id.replace('page-', '');
+    document.getElementById('topbarTitle').textContent = t('nav.' + page);
+    if (page === 'mcp' && typeof loadMcpManagement === 'function') {
+      loadMcpManagement();
+    }
+  }
   const tcpEndpointAction = document.getElementById('tcpEndpointAction');
   if (tcpEndpointAction && typeof tcpEndpointEditIndex !== 'undefined') {
     tcpEndpointAction.textContent = t(tcpEndpointEditIndex >= 0
@@ -2033,6 +2224,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     document.getElementById('topbarTitle').textContent = t(titleKey);
     if (page === 'logs') fetchModbusLogs();
     if (page === 'mapping') setTimeout(refreshAll, 0);
+    if (page === 'mcp') loadMcpManagement();
   });
 });
 
@@ -2193,6 +2385,8 @@ function updateDashboard() {
   document.getElementById('statCached').textContent = s.cached_records;
   document.getElementById('statHeap').textContent = (s.free_heap / 1000).toFixed(0) + ' KB';
   document.getElementById('statDataLoss').textContent = s.data_loss;
+  document.getElementById('statOnlineDevices').textContent = s.online_devices ?? 0;
+  document.getElementById('statOfflineDevices').textContent = s.offline_devices ?? 0;
 
   document.getElementById('infoMappings').textContent =
     systemState.mapping_count ?? mappings.length;
@@ -2259,9 +2453,23 @@ function mappingEngineeringValue(mapping) {
   const value = mapping.current_value_text
     ? escapeHtml(mapping.current_value_text)
     : formatNumericValue(mapping.current_value);
-  const unit = mapping.current_value === undefined || mapping.current_value_text
-    ? '' : ' ' + escapeHtml(displayUnit(mapping.unit));
-  return `<strong>${value}</strong>${unit}`;
+  return `<strong>${value}</strong>`;
+}
+
+function mappingRouteCell(mapping) {
+  if (window.__mqttPlatform === 'thingscloud') {
+    const gatewayMode = window.__mqttEffectiveMode === 'gateway';
+    const key = gatewayMode
+      ? (mapping.effective_gateway_property_key || mapping.gateway_property_key || '-')
+      : (mapping.point_id || '-');
+    const mode = gatewayMode ? t('mqtt.report_mode.gateway.short')
+                             : t('mqtt.report_mode.subdevice.short');
+    return `<span class="badge badge-info">${mode}</span> ${escapeHtml(key)}`;
+  }
+  const mode = mapping.mqtt_topic_mode === 'custom'
+    ? t('mapping.topic_custom') : t('mapping.topic_auto');
+  const topic = mapping.effective_mqtt_topic || mapping.mqtt_topic || '-';
+  return `<span class="badge badge-info">${mode}</span> ${escapeHtml(topic)}`;
 }
 
 function renderMappingTable() {
@@ -2292,12 +2500,11 @@ function renderMappingTable() {
       <td><span class="badge badge-info">${m.data_type}</span></td>
       <td>${escapeHtml(m.device_id)}</td>
       <td title="${escapeHtml(`${m.semantic_profile_id || ''} ${m.semantic_evidence || ''}`.trim())}">${escapeHtml(m.point_id)}</td>
-      <td>${semanticStatusBadge(m)}</td>
-      <td>${escapeHtml(displayUnit(m.unit) || '-')}</td>
       <td><span class="comm-frame">${formatNumericValue(m.current_raw_value)}</span></td>
       <td>${mappingEngineeringValue(m)}</td>
+      <td>${escapeHtml(displayUnit(m.unit) || '-')}</td>
       <td>${mappingStatusBadge(m)}</td>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(m.mqtt_topic)}">${escapeHtml(m.mqtt_topic)}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${mappingRouteCell(m)}</td>
       <td>${m.writable ? '<span class="badge badge-warning">'+(currentLang==='zh'?'\u53ef\u5199':'Yes')+'</span>' : '<span class="badge badge-success">'+(currentLang==='zh'?'\u53ea\u8bfb':'R/O')+'</span>'}</td>
       <td>[${m.range_min}, ${m.range_max}]</td>
       <td>
@@ -2306,6 +2513,13 @@ function renderMappingTable() {
       </td>
     </tr>`
   ).join('');
+  const routeHeader = document.getElementById('mappingRouteHeader');
+  if (routeHeader) {
+    const key = window.__mqttPlatform === 'thingscloud'
+      ? 'mapping.cloud_property' : 'th.mqtt_topic';
+    routeHeader.setAttribute('data-i18n', key);
+    routeHeader.textContent = t(key);
+  }
 }
 
 function changeMappingPage(delta) {
@@ -2440,6 +2654,8 @@ function openAddMapping() {
   document.getElementById('mRangeMin').value = '0';
   document.getElementById('mRangeMax').value = '100';
   document.getElementById('mDataType').value = 'FLOAT32';
+  document.getElementById('mMqttTopicMode').value = 'auto';
+  updateMappingTopicModeUI();
   document.getElementById('semanticReviewNotice').style.display = 'none';
   document.getElementById('mappingModal').classList.add('show');
 }
@@ -2464,6 +2680,9 @@ function editMapping(index) {
   document.getElementById('mMeasurement').value = m.measurement_name;
   document.getElementById('mUnit').value = m.unit;
   document.getElementById('mMqttTopic').value = m.mqtt_topic;
+  document.getElementById('mMqttTopicMode').value =
+    m.mqtt_topic_mode === 'custom' ? 'custom' : 'auto';
+  updateMappingTopicModeUI();
   document.getElementById('mGatewayKey').value = m.gateway_property_key || '';
   document.getElementById('mWritable').value = m.writable.toString();
   document.getElementById('mRangeMin').value = m.range_min;
@@ -2475,6 +2694,19 @@ function editMapping(index) {
 
 function closeMappingModal() {
   document.getElementById('mappingModal').classList.remove('show');
+}
+
+function updateMappingTopicModeUI() {
+  const custom = document.getElementById('mMqttTopicMode').value === 'custom';
+  const input = document.getElementById('mMqttTopic');
+  input.disabled = !custom;
+  if (!custom) input.value = '';
+  const hint = document.getElementById('mMqttTopicHint');
+  if (hint) {
+    const key = custom ? 'mapping.topic_custom_hint' : 'mapping.topic_auto_hint';
+    hint.setAttribute('data-i18n', key);
+    hint.textContent = t(key);
+  }
 }
 
 async function saveMapping() {
@@ -2495,6 +2727,7 @@ async function saveMapping() {
     measurement_name: document.getElementById('mMeasurement').value,
     unit: document.getElementById('mUnit').value,
     mqtt_topic: document.getElementById('mMqttTopic').value,
+    mqtt_topic_mode: document.getElementById('mMqttTopicMode').value,
     gateway_property_key: document.getElementById('mGatewayKey').value.trim(),
     writable: document.getElementById('mWritable').value === 'true',
     range_min: parseFloat(document.getElementById('mRangeMin').value),
@@ -2502,6 +2735,10 @@ async function saveMapping() {
   };
   if (!entry.device_id || !entry.point_id) {
     showToast(t('toast.error'), 'error');
+    return;
+  }
+  if (entry.mqtt_topic_mode === 'custom' && !entry.mqtt_topic.trim()) {
+    showToast(t('mapping.topic_custom_hint'), 'error');
     return;
   }
   const editIdx = parseInt(document.getElementById('editMappingIndex').value);
@@ -2616,7 +2853,7 @@ function applyReportModeUI() {
   document.getElementById('rmGwDesc').style.display = gw ? '' : 'none';
 }
 
-function saveMqttConfig() {
+async function saveMqttConfig() {
   const isTC = document.getElementById('mqttPlatform').value === 'thingscloud';
   const reportMode = document.getElementById('rmGateway').checked ? 'gateway' : 'subdevice';
   if (reportMode !== 'subdevice' && reportMode !== 'gateway') {   // 前端枚举校验(不信任非法值)
@@ -2646,11 +2883,18 @@ function saveMqttConfig() {
     lwt_qos: parseInt(document.getElementById('mqttLwtQos').value),
     lwt_retain: document.getElementById('mqttLwtRetain').checked,
   };
-  apiPut('/api/mqtt/config', data);
+  const saved = await apiPut('/api/mqtt/config', data);
+  if (!saved) {
+    showToast(t('toast.error'), 'error');
+    return;
+  }
+  window.__mqttPlatform = data.platform_type;
+  window.__mqttEffectiveMode = data.report_mode;
+  mappings = await apiGet('/api/mappings', 20000) || mappings;
+  renderMappingTable();
   showToast(t('toast.saved'), 'success');
   addLog('info', `[MQTT] Configuration saved: platform=${data.platform_type} URI=${data.uri}`);
   addLog('info', t('mqtt.report_mode.restart_hint'));
-  window.__mqttEffectiveMode = data.report_mode;
   const effEl = document.getElementById('reportModeEffective');
   if (effEl) effEl.textContent = `${t('mqtt.report_mode.effective')}: ${t('mqtt.report_mode.' + data.report_mode + '.short')}`;
 }
@@ -2658,6 +2902,7 @@ function saveMqttConfig() {
 /* Show/hide ThingsCloud vs Custom-MQTT fields and enforce ThingsCloud constraints. */
 function applyMqttPlatformUI() {
   const isTC = document.getElementById('mqttPlatform').value === 'thingscloud';
+  window.__mqttPlatform = isTC ? 'thingscloud' : 'custom';
   document.querySelectorAll('.tc-only').forEach(e => { e.style.display = isTC ? '' : 'none'; });
   document.querySelectorAll('.custom-only').forEach(e => { e.style.display = isTC ? 'none' : ''; });
   const qosSel = document.getElementById('mqttQos');
@@ -2666,6 +2911,7 @@ function applyMqttPlatformUI() {
   } else {
     qosSel.disabled = false;
   }
+  if (typeof renderMappingTable === 'function') renderMappingTable();
 }
 
 function collectModbusConfig() {
@@ -2808,7 +3054,7 @@ function renderLogs() {
 }
 
 function addLog(level, text) {
-  const ts = new Date().toLocaleTimeString();
+  const ts = new Date().toLocaleString();
   logLines.push({ level, text: `[${ts}] ${text}` });
   if (logLines.length > 200) logLines.shift();
   renderLogs();
@@ -2819,7 +3065,11 @@ async function fetchServerLogs() {
   if (data && Array.isArray(data) && data.length > 0) {
     if (!serverLogsFetched) {
       // First fetch: prepend server startup logs before client logs
-      const serverLines = data.map(l => ({ level: l.level, text: l.text, _server: true }));
+      const serverLines = data.map(l => ({
+        level: l.level,
+        text: `[${formatDateTime(l.timestamp_ms, l.uptime_ms)}] ${l.text}`,
+        _server: true
+      }));
       logLines = serverLines.concat(logLines);
       serverLogsFetched = true;
     } else {
@@ -2827,7 +3077,11 @@ async function fetchServerLogs() {
       const existingCount = logLines.filter(l => l._server).length;
       const newEntries = data.slice(existingCount);
       newEntries.forEach(l => {
-        const entry = { level: l.level, text: l.text, _server: true };
+        const entry = {
+          level: l.level,
+          text: `[${formatDateTime(l.timestamp_ms, l.uptime_ms)}] ${l.text}`,
+          _server: true
+        };
         logLines.push(entry);
       });
     }
@@ -2862,13 +3116,19 @@ function filteredModbusLogs() {
   });
 }
 
-function formatUptimeMs(timestampMs) {
-  const total = Math.max(0, Number(timestampMs) || 0);
-  const hours = Math.floor(total / 3600000);
-  const minutes = Math.floor((total % 3600000) / 60000);
-  const seconds = Math.floor((total % 60000) / 1000);
-  const milliseconds = Math.floor(total % 1000);
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
+function formatDateTime(timestampMs, eventUptimeMs) {
+  let value = Number(timestampMs);
+  if (!Number.isFinite(value) || value < 1577836800000) {
+    const eventUptime = Number(eventUptimeMs);
+    const currentUptime = Number(systemState.uptime_seconds) * 1000;
+    value = Number.isFinite(eventUptime) && currentUptime >= eventUptime
+      ? Date.now() - currentUptime + eventUptime
+      : Date.now();
+  }
+  const date = new Date(value);
+  const pad = number => String(number).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function renderModbusLogs() {
@@ -2886,7 +3146,7 @@ function renderModbusLogs() {
     const directionClass = entry.direction === 'TX' ? 'badge-info' : 'badge-success';
     return `<tr>
       <td>${entry.sequence}</td>
-      <td class="comm-frame">${formatUptimeMs(entry.timestamp_ms)}</td>
+      <td class="comm-frame">${formatDateTime(entry.timestamp_ms, entry.uptime_ms)}</td>
       <td><span class="badge ${directionClass}">${entry.direction}</span></td>
       <td>${entry.slave_id}</td>
       <td>FC${String(entry.function_code).padStart(2, '0')}</td>
@@ -2928,11 +3188,11 @@ function csvCell(value) {
 }
 
 function exportModbusLogs() {
-  const headers = ['sequence', 'uptime_ms', 'direction', 'slave_id',
+  const headers = ['sequence', 'datetime', 'direction', 'slave_id',
     'function_code', 'register_address', 'register_count', 'raw_registers',
     'frame_hex', 'status'];
   const rows = filteredModbusLogs().map(entry => [
-    entry.sequence, entry.timestamp_ms, entry.direction, entry.slave_id,
+    entry.sequence, formatDateTime(entry.timestamp_ms, entry.uptime_ms), entry.direction, entry.slave_id,
     entry.function_code, entry.register_address, entry.register_count,
     Array.isArray(entry.register_values) ? entry.register_values.join('|') : '',
     entry.frame_hex || '', entry.status || ''
@@ -3015,6 +3275,9 @@ async function refreshAll() {
     }
     if (activePage === 'page-automation') {
       await loadAutomationRules();
+    }
+    if (activePage === 'page-mcp') {
+      await loadMcpManagement();
     }
   } finally {
     refreshInProgress = false;
@@ -3147,6 +3410,8 @@ async function loadRuntimeForms() {
     document.getElementById('mqttUri').value = mqtt.uri || '';
     document.getElementById('mqttClientId').value = mqtt.client_id || '';
     document.getElementById('mqttPlatform').value = mqtt.platform_type === 'thingscloud' ? 'thingscloud' : 'custom';
+    window.__mqttPlatform = mqtt.platform_type === 'thingscloud'
+      ? 'thingscloud' : 'custom';
     const mode = mqtt.report_mode === 'gateway' ? 'gateway' : 'subdevice';
     document.getElementById('rmSubdevice').checked = (mode === 'subdevice');
     document.getElementById('rmGateway').checked = (mode === 'gateway');
@@ -3173,6 +3438,15 @@ async function loadRuntimeForms() {
     document.getElementById('mqttLwtPayload').value = mqtt.lwt_payload || '';
     document.getElementById('mqttLwtQos').value = mqtt.lwt_qos ?? 1;
     document.getElementById('mqttLwtRetain').checked = mqtt.lwt_retain !== false;
+    document.getElementById('tcOnlineDevices').textContent = mqtt.cloud_online_devices ?? 0;
+    document.getElementById('tcPendingPoints').textContent = mqtt.cloud_pending_points ?? 0;
+    document.getElementById('tcCachedRecords').textContent = mqtt.cloud_cached_records ?? 0;
+    document.getElementById('tcThrottledCount').textContent = mqtt.cloud_throttled_count ?? 0;
+    document.getElementById('tcDroppedCount').textContent = mqtt.cloud_dropped_count ?? 0;
+    const lastPublish = Number(mqtt.cloud_last_publish_ms || 0);
+    document.getElementById('tcLastPublish').textContent = lastPublish > 0
+      ? `${Math.floor(lastPublish / 1000)} s`
+      : '-';
     applyMqttPlatformUI();
     applyReportModeUI();
   }
@@ -3827,6 +4101,92 @@ async function deleteAutomationRule(id) {
   const result = await apiJson('DELETE', '/api/automation/rules/' + id);
   if (result && !result.error) await loadAutomationRules();
   else showToast(result?.error || t('toast.error'), 'error');
+}
+
+/* ============================================================
+ * MCP Management
+ * ============================================================ */
+let mcpStatus = {
+  access_enabled: false,
+  auth_enabled: false,
+  token_configured: false,
+  write_enabled: false,
+  endpoint: '/mcp',
+  authorized_requests: 0,
+  authentication_failures: 0,
+  last_authorized_uptime_ms: 0,
+  lock_remaining_ms: 0
+};
+
+async function loadMcpManagement() {
+  const [status, gateway] = await Promise.all([
+    apiGet('/api/mcp/status'),
+    apiGet('/api/gateway/config')
+  ]);
+  if (status) Object.assign(mcpStatus, status);
+  if (gateway && typeof gateway.mcp_write_enabled === 'boolean') {
+    mcpStatus.write_enabled = gateway.mcp_write_enabled;
+  }
+  const endpoint = `${window.location.origin}${mcpStatus.endpoint || '/mcp'}`;
+  document.getElementById('mcpEndpoint').value = endpoint;
+  document.getElementById('mcpEndpointBadge').textContent = mcpStatus.endpoint || '/mcp';
+  document.getElementById('mcpAccessEnabled').checked = mcpStatus.auth_enabled === true;
+  document.getElementById('mcpWriteEnabled').checked = mcpStatus.write_enabled === true;
+  document.getElementById('mcpAccessStatus').textContent = mcpStatus.access_enabled
+    ? (currentLang === 'zh' ? '\u5df2\u542f\u7528' : 'Enabled')
+    : (currentLang === 'zh' ? '\u5df2\u7981\u7528' : 'Disabled');
+  document.getElementById('mcpAuthRequests').textContent =
+    Number(mcpStatus.authorized_requests || 0).toLocaleString();
+  document.getElementById('mcpAuthFailures').textContent =
+    Number(mcpStatus.authentication_failures || 0).toLocaleString();
+  const lockMs = Number(mcpStatus.lock_remaining_ms || 0);
+  document.getElementById('mcpLockStatus').textContent = lockMs > 0
+    ? `${Math.ceil(lockMs / 1000)} s`
+    : (currentLang === 'zh' ? '\u672a\u9501\u5b9a' : 'Unlocked');
+  document.getElementById('mcpTokenStatus').textContent = mcpStatus.token_configured
+    ? (currentLang === 'zh' ? 'Token \u5df2\u914d\u7f6e' : 'Token configured')
+    : (currentLang === 'zh' ? 'Token \u672a\u914d\u7f6e' : 'Token not configured');
+  const last = Number(mcpStatus.last_authorized_uptime_ms || 0);
+  document.getElementById('mcpLastAccess').textContent = last > 0
+    ? `${currentLang === 'zh' ? '\u6700\u540e\u6388\u6743\u8bbf\u95ee' : 'Last authorized access'}: ${formatDateTime(0, last)}`
+    : (currentLang === 'zh' ? '\u5c1a\u65e0\u6388\u6743\u8bbf\u95ee' : 'No authorized access yet');
+}
+
+async function saveMcpManagement() {
+  const enabled = document.getElementById('mcpAccessEnabled').checked;
+  const writeEnabled = document.getElementById('mcpWriteEnabled').checked;
+  const token = document.getElementById('mcpBearerToken').value.trim();
+  if (enabled && !mcpStatus.token_configured && !token) {
+    showToast(currentLang === 'zh'
+      ? '\u9996\u6b21\u542f\u7528 MCP \u5fc5\u987b\u8bbe\u7f6e Bearer Token'
+      : 'A Bearer Token is required when enabling MCP for the first time', 'error');
+    return;
+  }
+  if (token && token.length < 16) {
+    showToast(currentLang === 'zh'
+      ? 'Bearer Token \u81f3\u5c11\u9700\u8981 16 \u4e2a\u5b57\u7b26'
+      : 'Bearer Token must contain at least 16 characters', 'error');
+    return;
+  }
+  const securityPayload = { auth_enabled: enabled };
+  if (token) securityPayload.bearer_token = token;
+  const securityResult = await apiJson('PUT', '/api/security/config', securityPayload);
+  if (!securityResult || securityResult.error) {
+    showToast(securityResult?.error || t('toast.error'), 'error');
+    return;
+  }
+  if (token) sessionStorage.setItem('gateway_bearer_token', token);
+  const gatewayResult = await apiJson('PUT', '/api/gateway/config', {
+    mcp_write_enabled: writeEnabled
+  });
+  if (!gatewayResult || gatewayResult.error) {
+    showToast(gatewayResult?.error || t('toast.error'), 'error');
+    return;
+  }
+  if (!enabled) sessionStorage.removeItem('gateway_bearer_token');
+  document.getElementById('mcpBearerToken').value = '';
+  showToast(currentLang === 'zh' ? 'MCP \u914d\u7f6e\u5df2\u4fdd\u5b58' : 'MCP configuration saved', 'success');
+  await loadMcpManagement();
 }
 
 /* ============================================================

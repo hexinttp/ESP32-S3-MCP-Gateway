@@ -1,5 +1,56 @@
 # ESP32-S3 TCM/AMM/UIF Industrial Gateway
 
+## 2026-07-29 Development Status
+
+This revision consolidates the gateway, ThingsCloud, MCP management, AMM cloud
+routing, rule-engine, health-monitoring, and UIF recovery work completed during
+hardware integration on the ESP32-S3 board.
+
+### Verified on hardware
+
+- ESP32-S3 target with 8 MB PSRAM, SPI Flash, ST7735S LCD, W5500/Wi-Fi, TF and
+  MAX3485 RS485 hardware allocation.
+- MODBUS RTU polling and device discovery using a physical SHT20 sensor and a
+  PC RTU simulator.
+- Configurable MODBUS TCP endpoints, discovery, mapping and northbound server.
+- AMM mapping capacity of 1000 points with runtime tables allocated in PSRAM.
+- TCM semantic profiles, safe unresolved mappings and user-confirmed semantics.
+- ThingsCloud gateway/sub-device and gateway-attribute reporting modes.
+- SPI Flash offline queue with ordered replay after MQTT reconnection; TF is
+  used as overflow storage when present.
+- Chinese/English Web UI, MCP management, rule engine, MQTT logs and health
+  counters.
+- Firmware builds with ESP-IDF 5.3.1 and flashes successfully through COM9.
+
+### MQTT integration status
+
+- ThingsCloud plaintext MQTT currently uses `mqtt://<endpoint>:1883`, MQTT
+  3.1.1, `AccessToken` as Username and `ProjectKey` as Password.
+- Connection diagnostics reuse the persistent MQTT client; a second temporary
+  client is no longer allocated, preventing duplicate sessions and internal
+  SRAM exhaustion.
+- The firmware records TCP and CONNACK failures separately. `CONNACK 5` is
+  reported as an authentication rejection rather than a generic network error.
+- MQTT.fx and the gateway must not use the same ThingsCloud device credentials
+  simultaneously because the platform permits only one connection per device
+  identity.
+- Runtime MQTT reconfiguration still requires a production connection-manager
+  refactor. The present 20 KB MQTT task stack can be allocated during cold boot,
+  but internal SRAM fragmentation can prevent client recreation after a live
+  configuration change. The planned implementation uses one long-lived client
+  owner, a non-blocking command queue, explicit maintenance mode, and
+  error-class-specific exponential backoff.
+
+### Resource and reliability policy
+
+- Time-critical MODBUS tasks, UART buffers and control queues use internal SRAM.
+- Large AMM/TCM tables, discovery results and suitable worker stacks use PSRAM.
+- Flash stores firmware, Web assets, configuration, AMM snapshots and the UIF
+  queue; TF remains optional overflow/history storage.
+- Watchdog, reset reason, minimum heap, largest internal block, cache usage and
+  online/offline device counts are exposed through `/api/system/status`.
+- Local `test_logs/` artifacts are intentionally excluded from Git.
+
 本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 和 FreeRTOS 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。当前版本新增 ThingsCloud 云平台适配层，支持以"网关 + 子设备"模型将 TCM 数据聚合上报到 ThingsCloud。
 
 当前版本已经在带 16 MB Flash、8 MB PSRAM 的 ESP32-S3 实物开发板上完成烧录，并使用真实 RS485 温湿度传感器、PC 端 RTU 仿真器和 Modbus TCP 仿真器完成设备发现与寄存器读取测试。
@@ -47,6 +98,8 @@
 - MCP JSON-RPC 工具入口：`POST /mcp`。
 - 运行指标：轮询、TCM 验证、MQTT、缓存、回放、命令和数据丢失计数。
 - ThingsCloud 云平台适配：统一云数据对象（`cloud_adapter`）+ ThingsCloud 官方 MQTT 网关协议（`attributes`、`gateway/attributes`、`gateway/connect|disconnect`、`gateway/command/send|reply` 等 Topic）；支持子设备地址编码/解析、子设备在线/离线状态机与重连后批量补报、按周期聚合的属性上报、网关模式属性键 `p{port}_s{slave}_{point}` 及键名合法性校验、下行属性推送与命令回调、凭据脱敏日志。
+- ThingsCloud 可靠性：支持 100 台子设备和全部 1000 个 AMM 点位的严格通道下行匹配；离线 TCM 记录在重连后重新经过当前云平台上报模式；聚合数据按实际 JSON 字节拆包，限流或缓冲拥塞时转入 UIF 持久化缓存；Web 页面以中英文显示在线设备、待发送点位、离线缓存、限流次数和最近上报状态。
+- AMM 动态云路由：自定义 MQTT 点位支持 `AUTO`/`CUSTOM` Topic 策略；`AUTO` 在发布时根据最新 Topic 前缀、网关、设备和点位动态计算，修改 MQTT 配置后无需批量改写映射；`CUSTOM` 保留用户指定的完整 Topic。ThingsCloud 子设备模式使用 `point_id`，网关模式使用自定义或自动生成的 `gateway_property_key`，Web 映射表会随平台和模式切换显示当前有效路由。
 - 发布管线稳定性：`publish_task` 采用 PSRAM 64 KB 静态栈（`xTaskCreateStatic`），规避内部 DRAM 紧张导致的任务创建失败和深层 esp-mqtt 调用链栈溢出；离线缓存写入解耦到独立 `cache_writer_task` 异步执行，SPI Flash 慢写不再阻塞实时发布路径；MQTT 断线重连退避 10 s。
 
 设备发现表优先分配到 PSRAM：检测到外部 PSRAM 时单次最多保留 100 台设备、每台 32 个原始寄存器字；PSRAM 不可用时自动降级为 8 台设备。扫描任务栈也优先放入 PSRAM，并在不可用时回退内部 RAM，避免大量活动映射造成内部 RAM 碎片后无法启动扫描。AMM 和 TCM 最新状态池最多保留 1000 个活动点位；无 PSRAM 时 AMM 自动降级为 64 点。自动化规则最多 16 条。设备发现容量和 AMM 活动映射容量相互独立。
@@ -284,6 +337,24 @@ TCM JSON 使用可机读的 UCUM 风格单位 `degC`；中文 Web 显示层将�
 - `discover_modbus_devices`
 - `get_gateway_config`
 - `get_cache_status`
+- `configure_rule_from_natural_language`
+
+`configure_rule_from_natural_language` is a two-stage safety workflow. The MCP
+client converts the user's natural-language instruction into the tool's
+structured rule schema and first calls it with `confirmed=false`. The gateway
+validates the AMM source point, optional interlock, writable target, value
+range, hysteresis, and cooldown, then returns a normalized preview without
+changing configuration. Only after the user explicitly confirms that preview
+may the client repeat the call with `confirmed=true`. Applying the rule also
+requires `mcp_write_enabled`.
+
+MCP access is denied by default. Before any MCP client can connect, configure
+and enable the gateway Bearer Token under System Security. Every request to
+`POST /mcp` must send `Authorization: Bearer <token>`. Tokens are stored only
+as SHA-256 digests. Five consecutive authentication failures trigger a
+30-second lockout, and the MCP endpoint does not advertise unrestricted CORS.
+Keep `mcp_write_enabled` disabled for read-only clients; enable it only for
+trusted operators that must apply rules or write industrial points.
 
 入口：`POST http://<gateway-ip>/mcp`
 

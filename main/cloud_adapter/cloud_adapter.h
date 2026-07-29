@@ -86,6 +86,8 @@ typedef struct {
  * slaves written (<= max), or the total number of tracked slaves if that
  * exceeds max. Used by gateway mode to build per-slave status attributes. */
 int thingscloud_subdev_get_status(thingscloud_slave_status_t *out, int max);
+int thingscloud_subdev_online_count(void);
+int thingscloud_subdev_offline_count(void);
 
 /* Gateway mode: publish every slave's online/status attributes plus the RS485
  * bus summary to the "attributes" topic. */
@@ -99,15 +101,27 @@ uint32_t thingscloud_get_config_generation(void);
 void thingscloud_subdev_register_success(const char *device_address);
 void thingscloud_subdev_register_failure(const char *device_address);
 void thingscloud_subdev_republish_all_online(void);
-int thingscloud_subdev_online_count(void);
 int thingscloud_subdev_error_count(void);
 
 /* Ingest a single telemetry context from the publish pipeline.
  * Aggregates into the per-cycle buffer and flushes when it grows
  * too large; call thingscloud_flush() periodically to bound latency. */
 esp_err_t thingscloud_publish_context(const tcm_context_t *ctx);
+/* Replay one durable TCM record through the active ThingsCloud report mode.
+ * Returns ESP_OK only when every generated MQTT packet was accepted by the
+ * MQTT client, allowing UIF to remove the durable record. */
+esp_err_t thingscloud_replay_context(const tcm_context_t *ctx);
 /* Flush any pending aggregated sub-device attributes. */
 void thingscloud_flush(void);
+
+typedef struct {
+    uint32_t pending_points;
+    uint32_t throttled_count;
+    uint32_t dropped_count;
+    int64_t last_publish_ms;
+} thingscloud_runtime_status_t;
+
+void thingscloud_get_runtime_status(thingscloud_runtime_status_t *out);
 
 /* Called by the MQTT layer on (re)connect to re-report online sub-devices. */
 void thingscloud_on_mqtt_connected(void);

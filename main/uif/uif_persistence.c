@@ -6,6 +6,7 @@
 #include "mqtt_comm/mqtt_handler.h"
 #include "storage/offline_store.h"
 #include "config/runtime_config.h"
+#include "cloud_adapter/cloud_adapter.h"
 
 static const char *TAG = "UIF";
 static bool s_initialized;
@@ -81,6 +82,30 @@ esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue)
     if (!s_initialized || !mqtt_is_connected()) return ESP_ERR_INVALID_STATE;
     if (s_replay_outstanding) return ESP_OK;
 
+    runtime_config_t runtime;
+    runtime_config_get(&runtime);
+    if (runtime.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) {
+        offline_record_t record;
+        esp_err_t err = offline_store_peek_oldest(&record);
+        if (err == ESP_ERR_NOT_FOUND) return ESP_OK;
+        if (err != ESP_OK) return err;
+
+        tcm_context_t ctx;
+        if (tcm_deserialize_json(record.payload, &ctx) != 0) {
+            ESP_LOGE(TAG, "Invalid cached TCM record, retaining seq=%lu",
+                     (unsigned long)record.sequence_id);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        err = thingscloud_replay_context(&ctx);
+        if (err != ESP_OK) return err;
+        err = offline_store_remove(record.sequence_id);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "ThingsCloud replay accepted and removed: seq=%lu",
+                     (unsigned long)record.sequence_id);
+        }
+        return err;
+    }
+
     int scheduled = 0;
     while (scheduled < 16) {
         offline_record_t record;
@@ -103,4 +128,9 @@ esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue)
 
 int uif_get_cache_usage_percent(void) { return offline_store_usage_percent(); }
 int uif_get_data_loss_count(void) { return offline_store_data_loss_count(); }
+void uif_replay_connection_lost(void)
+{
+    s_replay_outstanding = false;
+    s_replay_sequence = 0;
+}
 void uif_destroy(void) { s_initialized = false; s_replay_outstanding = false; }

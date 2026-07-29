@@ -156,6 +156,22 @@ void app_main(void)
     ESP_ERROR_CHECK(time_service_init());
     ESP_ERROR_CHECK(ota_service_init());
 
+    /* Reserve/start the MQTT client only after an uplink has an IP address,
+       but before the rest of the gateway creates its long-lived tasks. This
+       avoids both a pre-DNS failed login and late 20 KB stack fragmentation. */
+    int mqtt_network_wait_ms = 0;
+    while (!network_manager_is_online() && mqtt_network_wait_ms < 20000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        mqtt_network_wait_ms += 100;
+    }
+    if (network_manager_is_online()) {
+        ESP_LOGI(TAG, "Network ready after %d ms; starting MQTT", mqtt_network_wait_ms);
+    } else {
+        ESP_LOGW(TAG, "Network not ready after %d ms; MQTT will use automatic reconnect",
+                 mqtt_network_wait_ms);
+    }
+    mqtt_init();
+
     tcm_init();
     amm_init();
     ESP_ERROR_CHECK(tcm_state_pool_init());
@@ -163,7 +179,6 @@ void app_main(void)
     ESP_ERROR_CHECK(automation_init());
     modbus_discover_init();
     eval_init();
-    mqtt_init();
     ESP_ERROR_CHECK(uif_init());
 
     if (config.modbus_rtu.enabled) {
@@ -184,12 +199,6 @@ void app_main(void)
     scheduler_init(raw, context, mqtt_out);
     xTaskCreate(mqtt_publish_task, "mqtt_out", 8192, mqtt_out,
                 TASK_PRIORITY_MQTT, NULL);
-    if (config.mqtt.platform_type == MQTT_PLATFORM_CUSTOM) {
-        char command_topic[128];
-        snprintf(command_topic, sizeof(command_topic), "%s%s", config.mqtt.command_prefix,
-                 config.gateway_id);
-        mqtt_subscribe(command_topic, 1, mqtt_command_callback);
-    }
     ESP_ERROR_CHECK(web_server_start(80));
     ESP_ERROR_CHECK(modbus_tcp_server_start());
     scheduler_start();

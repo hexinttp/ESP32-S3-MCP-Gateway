@@ -57,6 +57,7 @@ static QueueHandle_t s_cache_queue      = NULL;
 static StackType_t *s_publish_stack     = NULL;
 static StaticTask_t s_publish_tcb;
 #define PUBLISH_STACK_WORDS 16384  /* 64 KB (in PSRAM) */
+#define REPLAY_STACK_SIZE 16384    /* Must remain in internal RAM: task accesses SPI Flash. */
 
 static TaskHandle_t s_task_modbus_poll    = NULL;
 static TaskHandle_t s_task_context_build  = NULL;
@@ -102,9 +103,12 @@ static void modbus_poll_task(void *arg)
 
     int mapping_capacity = amm_get_capacity();
     uint32_t observed_model_version = 0;
-    int64_t *last_poll_ms = calloc((size_t)mapping_capacity, sizeof(*last_poll_ms));
-    amm_mapping_entry_t *mappings =
-        calloc((size_t)mapping_capacity, sizeof(*mappings));
+    int64_t *last_poll_ms = heap_caps_calloc(
+        (size_t)mapping_capacity, sizeof(*last_poll_ms),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    amm_mapping_entry_t *mappings = heap_caps_calloc(
+        (size_t)mapping_capacity, sizeof(*mappings),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (mapping_capacity <= 0 || mappings == NULL || last_poll_ms == NULL) {
         ESP_LOGE(TAG, "Unable to allocate AMM poll snapshot");
         free(last_poll_ms);
@@ -137,7 +141,8 @@ static void modbus_poll_task(void *arg)
         int64_t now_ms = esp_timer_get_time() / 1000;
         int selected = -1;
         for (int i = 0; i < mapping_count; ++i) {
-            uint32_t interval = mappings[i].poll_interval_ms ?: POLL_INTERVAL_MS;
+            uint32_t interval = mappings[i].poll_interval_ms ?:
+                                amm_get_default_poll_interval();
             if (now_ms - last_poll_ms[i] < interval) {
                 continue;
             }
@@ -295,7 +300,8 @@ static void context_build_task(void *arg)
     ESP_LOGI(TAG, "context_build_task started");
 
     modbus_read_result_t raw;
-    tcm_context_t *ctx = calloc(1, sizeof(*ctx));
+    tcm_context_t *ctx = heap_caps_calloc(
+        1, sizeof(*ctx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ctx == NULL) {
         ESP_LOGE(TAG, "Unable to allocate TCM context workspace");
         s_task_context_build = NULL;
@@ -447,8 +453,14 @@ static void publish_task(void *arg)
                                                       addr, sizeof(addr));
                     thingscloud_subdev_register_success(addr);
                 }
-                thingscloud_publish_context(&ctx);
-                eval_increment_metric("mqtt_published", 1);
+                esp_err_t tc_err = thingscloud_publish_context(&ctx);
+                if (tc_err == ESP_OK) {
+                    eval_increment_metric("mqtt_published", 1);
+                } else if (xQueueSend(s_cache_queue, &ctx, 0) != pdTRUE) {
+                    eval_increment_metric("data_loss_count", 1);
+                } else {
+                    eval_increment_metric("mqtt_failed", 1);
+                }
             } else {
                 /* Build MQTT output message with topic and serialized payload */
                 mqtt_out_msg_t out_msg;
@@ -557,13 +569,18 @@ static void replay_task(void *arg)
 
         if (uif_get_cached_count() == 0) continue;
 
+        int cached_before = uif_get_cached_count();
         esp_err_t replay_err = uif_replay_all(s_mqtt_out_queue);
         if (replay_err == ESP_OK) {
             int cached_count = uif_get_cached_count();
             ESP_LOGI(TAG, "Cache replay completed, %d records still cached", cached_count);
-            eval_increment_metric("replayed_records", (uint32_t)cached_count);
+            if (cached_count < cached_before) {
+                eval_increment_metric("replayed_records",
+                                      (uint32_t)(cached_before - cached_count));
+            }
         } else {
-            ESP_LOGE(TAG, "Cache replay failed (err=0x%x)", replay_err);
+            ESP_LOGW(TAG, "Cache replay deferred (err=0x%x)", replay_err);
+            vTaskDelay(pdMS_TO_TICKS(2000));
         }
     }
 
@@ -736,11 +753,11 @@ void scheduler_start(void)
         }
     }
 
-    ret = xTaskCreate(replay_task, "replay", TASK_STACK_SIZE_SCHED,
+    ret = xTaskCreate(replay_task, "replay", REPLAY_STACK_SIZE,
                       NULL, TASK_PRIORITY_SCHED, &s_task_replay);
     if (ret != pdPASS) {
         all_started = false;
-        ESP_LOGE(TAG, "Failed to create replay_task");
+        ESP_LOGE(TAG, "Failed to create replay_task (internal stack)");
     }
 
     ret = xTaskCreate(cache_writer_task, "cache_writer", TASK_STACK_SIZE_SCHED,
@@ -843,6 +860,12 @@ void scheduler_set_network_state(network_state_t state)
     }
 
     ESP_LOGI(TAG, "Network state transition: %d -> %d", prev, state);
+
+    if (state != NET_ONLINE) {
+        /* A QoS1 replay may lose its PUBACK with the connection. Keep the
+           Flash record and allow it to be scheduled again after reconnect. */
+        uif_replay_connection_lost();
+    }
 
     /* Trigger replay when transitioning to ONLINE from a non-online state */
     if (state == NET_ONLINE && prev != NET_ONLINE) {

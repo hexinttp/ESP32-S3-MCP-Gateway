@@ -113,12 +113,11 @@ mqtt_conn_state_t mqtt_get_connection_state(void);
 bool mqtt_is_connected(void);
 
 /**
- * @brief Probe a broker URI with a throwaway client to verify it is actually
- *        reachable and accepts the connection (with the given credentials).
+ * @brief Reconnect the configured MQTT client and report its broker result.
  *
- * Used by the Web UI "Test Connection" action. Creates a temporary esp_mqtt
- * client, attempts to connect, and tears it down before returning. Does NOT
- * affect the persistent (configured) client.
+ * The submitted values must match the saved runtime configuration. Reusing
+ * the persistent client keeps connection ownership deterministic and avoids
+ * allocating a competing MQTT task on resource-constrained hardware.
  *
  * @param uri      Broker URI, e.g. "mqtt://host:1883" (must not be empty)
  * @param username Optional username, or NULL/"" for anonymous
@@ -150,6 +149,12 @@ void mqtt_destroy(void);
  * @return ESP_OK if the restart was initiated
  */
 esp_err_t mqtt_restart(void);
+
+/**
+ * @brief Request a reconnect on the existing MQTT client after an uplink
+ *        becomes available. Does not destroy or re-create the MQTT task.
+ */
+esp_err_t mqtt_reconnect(void);
 
 /**
  * @brief Disconnect the MQTT client from the broker without destroying the

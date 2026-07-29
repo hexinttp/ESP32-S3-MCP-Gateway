@@ -11,6 +11,10 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "network/network_manager.h"
+#include "uif/uif_persistence.h"
 
 static const char *TAG = "TC_ADAPTER";
 
@@ -25,6 +29,24 @@ static int s_agg_count = 0;
  * sub-device buffer so the two reporting modes never interleave. */
 static cloud_property_update_t *s_gw_agg = NULL;
 static int s_gw_count = 0;
+static SemaphoreHandle_t s_adapter_mutex = NULL;
+static uint32_t s_throttled_count = 0;
+static uint32_t s_dropped_count = 0;
+static int64_t s_last_publish_ms = 0;
+
+static bool adapter_lock(void)
+{
+    if (s_adapter_mutex == NULL) {
+        s_adapter_mutex = xSemaphoreCreateMutex();
+    }
+    return s_adapter_mutex != NULL &&
+           xSemaphoreTake(s_adapter_mutex, pdMS_TO_TICKS(1000)) == pdTRUE;
+}
+
+static void adapter_unlock(void)
+{
+    if (s_adapter_mutex != NULL) xSemaphoreGive(s_adapter_mutex);
+}
 
 /* ---------------------------------------------------------------
  * Upstream publish rate limiter (ThingsCloud flow-control guard)
@@ -76,10 +98,13 @@ static bool tc_rate_allow(void)
 static esp_err_t tc_publish_telemetry(const char *topic, const char *payload)
 {
     if (!tc_rate_allow()) {
+        s_throttled_count++;
         ESP_LOGW(TAG, "Flow-control throttle: holding telemetry to '%s' (rate limited)", topic);
         return ESP_ERR_NO_MEM;
     }
-    return mqtt_publish(topic, payload, 0);
+    esp_err_t err = mqtt_publish(topic, payload, 0);
+    if (err == ESP_OK) s_last_publish_ms = esp_timer_get_time() / 1000;
+    return err;
 }
 
 /* ================= Gateway property key helpers ================= */
@@ -236,7 +261,22 @@ static void add_property_to_object(cJSON *obj, const cloud_property_update_t *p)
     }
 }
 
-/* Build { device: { key: value, ... }, ... } and publish to gateway/attributes. */
+static esp_err_t publish_json_object(cJSON *root, const char *topic)
+{
+    char *json = cJSON_PrintUnformatted(root);
+    if (json == NULL) return ESP_ERR_NO_MEM;
+    size_t length = strlen(json);
+    if (length > THINGSCLOUD_MAX_PAYLOAD_BYTES) {
+        free(json);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t err = tc_publish_telemetry(topic, json);
+    free(json);
+    return err;
+}
+
+/* Build { device: { key: value, ... }, ... } and publish complete JSON
+ * packets bounded by THINGSCLOUD_MAX_PAYLOAD_BYTES. */
 static esp_err_t publish_subdevice_aggregated(const cloud_property_update_t *props, int count)
 {
     if (count <= 0) return ESP_OK;
@@ -244,6 +284,8 @@ static esp_err_t publish_subdevice_aggregated(const cloud_property_update_t *pro
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t first_err = ESP_OK;
+    int in_pack = 0;
     for (int i = 0; i < count; ++i) {
         const cloud_property_update_t *p = &props[i];
         cJSON *dev = cJSON_GetObjectItem(root, p->device_address);
@@ -253,32 +295,63 @@ static esp_err_t publish_subdevice_aggregated(const cloud_property_update_t *pro
             cJSON_AddItemToObject(root, p->device_address, dev);
         }
         add_property_to_object(dev, p);
+        in_pack++;
+
+        char *probe = cJSON_PrintUnformatted(root);
+        if (probe == NULL) {
+            first_err = ESP_ERR_NO_MEM;
+            break;
+        }
+        size_t length = strlen(probe);
+        free(probe);
+        if (length <= THINGSCLOUD_MAX_PAYLOAD_BYTES) continue;
+
+        cJSON_DeleteItemFromObject(dev, p->property_key);
+        if (cJSON_GetArraySize(dev) == 0) {
+            cJSON_DeleteItemFromObject(root, p->device_address);
+        }
+        in_pack--;
+        if (in_pack > 0) {
+            esp_err_t err = publish_json_object(root, TC_TOPIC_GATEWAY_ATTR);
+            if (err != ESP_OK && first_err == ESP_OK) first_err = err;
+            if (err != ESP_OK) break;
+        }
+
+        cJSON_Delete(root);
+        root = cJSON_CreateObject();
+        if (root == NULL) return ESP_ERR_NO_MEM;
+        dev = cJSON_CreateObject();
+        if (dev == NULL) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON_AddItemToObject(root, p->device_address, dev);
+        add_property_to_object(dev, p);
+        in_pack = 1;
+
+        probe = cJSON_PrintUnformatted(root);
+        if (probe == NULL) {
+            first_err = ESP_ERR_NO_MEM;
+            break;
+        }
+        length = strlen(probe);
+        free(probe);
+        if (length > THINGSCLOUD_MAX_PAYLOAD_BYTES) {
+            first_err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
     }
-    char *json = cJSON_PrintUnformatted(root);
+    if (first_err == ESP_OK && in_pack > 0) {
+        first_err = publish_json_object(root, TC_TOPIC_GATEWAY_ATTR);
+    }
     cJSON_Delete(root);
-    if (json == NULL) return ESP_ERR_NO_MEM;
-    esp_err_t err = tc_publish_telemetry(TC_TOPIC_GATEWAY_ATTR, json);
-    ESP_LOGD(TAG, "Publish %s (%d props, %u bytes, err=%s)",
-             TC_TOPIC_GATEWAY_ATTR, count, (unsigned)strlen(json), esp_err_to_name(err));
-    free(json);
-    return err;
+    return first_err;
 }
 
 esp_err_t thingscloud_publish_subdevice_attributes(const cloud_property_update_t *props, int count)
 {
     if (!thingscloud_is_enabled()) return ESP_ERR_INVALID_STATE;
-    /* Split into chunks bounded by THINGSCLOUD_MAX_PAYLOAD_BYTES to avoid
-       oversized packets. We bound by count for simplicity and safety. */
-    esp_err_t last = ESP_OK;
-    int offset = 0;
-    while (offset < count) {
-        int chunk = count - offset;
-        if (chunk > THINGSCLOUD_AGG_BUFFER_MAX) chunk = THINGSCLOUD_AGG_BUFFER_MAX;
-        esp_err_t e = publish_subdevice_aggregated(props + offset, chunk);
-        if (e != ESP_OK) last = e;
-        offset += chunk;
-    }
-    return last;
+    return publish_subdevice_aggregated(props, count);
 }
 
 /* Publish gateway-mode attributes to the "attributes" topic, splitting into
@@ -366,17 +439,20 @@ esp_err_t thingscloud_publish_gateway_status(void)
 
     int rssi = 0;
     if (esp_wifi_sta_get_rssi(&rssi) != ESP_OK) rssi = 0;
+    network_status_t network = {0};
+    network_manager_get_status(&network);
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return ESP_ERR_NO_MEM;
     cJSON_AddStringToObject(root, "firmware_version", TC_FIRMWARE_VERSION);
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "uptime", (double)(esp_timer_get_time() / 1000000));
-    cJSON_AddStringToObject(root, "network_type", "wifi");
+    cJSON_AddStringToObject(root, "network_type",
+                            network.active_uplink[0] ? network.active_uplink : "offline");
     cJSON_AddNumberToObject(root, "wifi_rssi", (double)rssi);
     cJSON_AddNumberToObject(root, "rs485_online_count", (double)thingscloud_subdev_online_count());
     cJSON_AddNumberToObject(root, "rs485_error_count", (double)thingscloud_subdev_error_count());
-    cJSON_AddNumberToObject(root, "cache_count", 0);
+    cJSON_AddNumberToObject(root, "cache_count", (double)uif_get_cached_count());
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (json == NULL) return ESP_ERR_NO_MEM;
@@ -397,14 +473,23 @@ esp_err_t thingscloud_publish_gateway_slave_status(void)
     if (rt.mqtt.report_mode != MQ_REPORT_GATEWAY) return ESP_OK;  /* gateway mode only */
     if (!mqtt_is_connected()) return ESP_ERR_INVALID_STATE;
 
-    thingscloud_slave_status_t slaves[THINGSCLOUD_SUBDEVICE_MAX];
+    thingscloud_slave_status_t *slaves = heap_caps_calloc(
+        THINGSCLOUD_SUBDEVICE_MAX, sizeof(*slaves),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (slaves == NULL) {
+        slaves = calloc(THINGSCLOUD_SUBDEVICE_MAX, sizeof(*slaves));
+    }
+    if (slaves == NULL) return ESP_ERR_NO_MEM;
     int total = thingscloud_subdev_get_status(slaves, THINGSCLOUD_SUBDEVICE_MAX);
     if (total < 0) total = 0;
     if (total > THINGSCLOUD_SUBDEVICE_MAX) total = THINGSCLOUD_SUBDEVICE_MAX;
 
     static const char *const status_str[] = {"unknown", "online", "offline"};
     cJSON *root = cJSON_CreateObject();
-    if (root == NULL) return ESP_ERR_NO_MEM;
+    if (root == NULL) {
+        free(slaves);
+        return ESP_ERR_NO_MEM;
+    }
 
     int online = 0, offline = 0, unknown = 0;
     uint32_t err_sum = 0;
@@ -447,6 +532,7 @@ esp_err_t thingscloud_publish_gateway_slave_status(void)
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
+    free(slaves);
     if (json == NULL) return ESP_ERR_NO_MEM;
     esp_err_t err = tc_publish_telemetry(TC_TOPIC_ATTR, json);
     ESP_LOGD(TAG, "Slave status -> %s (%d slaves, %u bytes)",
@@ -474,8 +560,20 @@ static bool fill_property_value(const tcm_context_t *ctx, cloud_property_update_
     case DT_INT32:
     case DT_UINT32:
     case DT_BCD16:
-        p->value_type = CLOUD_VALUE_INTEGER;
-        p->value.integer_value = (int64_t)ctx->value;
+        if (!isfinite(ctx->value)) return false;
+        /*
+         * Modbus storage type and engineering-value type are different
+         * concerns. An integer register may produce a decimal engineering
+         * value after TCM scaling (for example 398 * 0.1 = 39.8 degC).
+         * Preserve that fraction in the cloud payload.
+         */
+        if (fabs(ctx->value - nearbyint(ctx->value)) > 1e-9) {
+            p->value_type = CLOUD_VALUE_NUMBER;
+            p->value.number_value = ctx->value;
+        } else {
+            p->value_type = CLOUD_VALUE_INTEGER;
+            p->value.integer_value = (int64_t)ctx->value;
+        }
         break;
     case DT_FLOAT32:
     case DT_FLOAT64:
@@ -566,18 +664,34 @@ esp_err_t thingscloud_publish_context(const tcm_context_t *ctx)
 
     runtime_config_t rt;
     runtime_config_get(&rt);
+    if (!adapter_lock()) return ESP_ERR_TIMEOUT;
     check_mode_change(rt.mqtt.report_mode);
+    bool full = rt.mqtt.report_mode == MQ_REPORT_GATEWAY
+        ? s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX
+        : s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX;
+    adapter_unlock();
+    if (full) thingscloud_flush();
+
+    if (!adapter_lock()) return ESP_ERR_TIMEOUT;
+    check_mode_change(rt.mqtt.report_mode);
+    full = rt.mqtt.report_mode == MQ_REPORT_GATEWAY
+        ? s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX
+        : s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX;
+    if (full) {
+        s_dropped_count++;
+        adapter_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    bool should_flush = false;
     if (rt.mqtt.report_mode == MQ_REPORT_GATEWAY) {
         add_context_to_gw_agg(ctx);
-        if (s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX) {
-            thingscloud_flush();
-        }
+        should_flush = s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX;
     } else {
         add_context_to_agg(ctx);
-        if (s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX) {
-            thingscloud_flush();
-        }
+        should_flush = s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX;
     }
+    adapter_unlock();
+    if (should_flush) thingscloud_flush();
     return ESP_OK;
 }
 
@@ -585,6 +699,7 @@ void thingscloud_flush(void)
 {
     runtime_config_t rt;
     runtime_config_get(&rt);
+    if (!adapter_lock()) return;
     check_mode_change(rt.mqtt.report_mode);
     if (rt.mqtt.report_mode == MQ_REPORT_GATEWAY) {
         if (s_gw_agg != NULL && s_gw_count > 0) {
@@ -593,11 +708,66 @@ void thingscloud_flush(void)
                 s_gw_count = 0;
         }
     } else {
-        if (s_agg == NULL || s_agg_count == 0) return;
+        if (s_agg == NULL || s_agg_count == 0) {
+            adapter_unlock();
+            return;
+        }
         /* Keep the buffer if throttled so the data is retried later. */
         if (publish_subdevice_aggregated(s_agg, s_agg_count) == ESP_OK)
             s_agg_count = 0;
     }
+    adapter_unlock();
+}
+
+esp_err_t thingscloud_replay_context(const tcm_context_t *ctx)
+{
+    if (!thingscloud_is_enabled() || ctx == NULL || !mqtt_is_connected()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ctx->quality_state != QUALITY_GOOD || ctx->point_id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cloud_property_update_t prop = {0};
+    if (!fill_property_value(ctx, &prop)) return ESP_ERR_INVALID_ARG;
+
+    runtime_config_t rt;
+    runtime_config_get(&rt);
+    if (rt.mqtt.report_mode == MQ_REPORT_GATEWAY) {
+        if (ctx->gateway_property_key[0] != '\0') {
+            if (!thingscloud_gateway_key_valid(ctx->gateway_property_key)) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            strlcpy(prop.property_key, ctx->gateway_property_key,
+                    sizeof(prop.property_key));
+        } else {
+            esp_err_t err = build_gateway_property_key(
+                (uint8_t)(ctx->channel_id + 1), ctx->slave_id, ctx->point_id,
+                prop.property_key, sizeof(prop.property_key));
+            if (err != ESP_OK) return err;
+        }
+        return thingscloud_publish_gateway_attributes(&prop, 1);
+    }
+
+    if (thingscloud_format_device_address((uint8_t)ctx->channel_id, ctx->slave_id,
+                                          prop.device_address,
+                                          sizeof(prop.device_address)) < 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    strlcpy(prop.property_key, ctx->point_id, sizeof(prop.property_key));
+    return thingscloud_publish_subdevice_attributes(&prop, 1);
+}
+
+void thingscloud_get_runtime_status(thingscloud_runtime_status_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (!adapter_lock()) return;
+    out->pending_points = (uint32_t)(s_agg_count + s_gw_count);
+    out->throttled_count = s_throttled_count;
+    out->dropped_count = s_dropped_count;
+    out->last_publish_ms = s_last_publish_ms;
+    adapter_unlock();
 }
 
 void thingscloud_on_mqtt_connected(void)
@@ -605,7 +775,10 @@ void thingscloud_on_mqtt_connected(void)
     if (!thingscloud_is_enabled()) return;
     runtime_config_t rt;
     runtime_config_get(&rt);
-    check_mode_change(rt.mqtt.report_mode);
+    if (adapter_lock()) {
+        check_mode_change(rt.mqtt.report_mode);
+        adapter_unlock();
+    }
     if (rt.mqtt.report_mode == MQ_REPORT_SUBDEVICE) {
         /* Re-report every ONLINE sub-device, then resume gateway/attributes. */
         thingscloud_subdev_republish_all_online();

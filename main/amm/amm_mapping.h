@@ -26,12 +26,18 @@ extern "C" {
 #define AMM_NVS_KEY_COUNT       "entry_cnt"
 #define AMM_NVS_KEY_ENTRY_PREFIX "entry_"
 #define AMM_NVS_KEY_SCHEMA      "schema_ver"
+#define AMM_NVS_KEY_POLL_MS     "poll_ms"
 #define AMM_NVS_KEY_ROLLBACK_COUNT "rb_count"
 #define AMM_NVS_KEY_ROLLBACK    "rollback"
-#define AMM_NVS_SCHEMA_VERSION  6
+#define AMM_NVS_SCHEMA_VERSION  7
 #define AMM_MAX_READ_REGISTERS  64
 
 /* ======================== Mapping Entry ======================== */
+
+typedef enum {
+    MQTT_TOPIC_AUTO = 0,
+    MQTT_TOPIC_CUSTOM = 1,
+} mqtt_topic_mode_t;
 
 /**
  * @brief A single Modbus-to-MQTT mapping entry.
@@ -79,6 +85,9 @@ typedef struct {
        reporter auto-generates "p{port}_s{slave}_{point_id}". Appended last so
        the schema-v5 layout remains a strict prefix for cheap NVS migration. */
     char     gateway_property_key[64];
+    /* AUTO resolves against the latest runtime MQTT prefix. CUSTOM preserves
+       mqtt_topic as a user-owned full topic across broker configuration changes. */
+    mqtt_topic_mode_t mqtt_topic_mode;
 } amm_mapping_entry_t;
 
 /* ======================== Validation Result ======================== */
@@ -119,6 +128,13 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry);
 
 /** Update an entry in place and create a new model version. */
 esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry);
+
+/** Set the gateway-wide default poll interval and apply it to every active
+ * mapping in one persisted AMM transaction. */
+esp_err_t amm_set_poll_interval_all(uint32_t poll_interval_ms);
+
+/** Return the persisted gateway-wide default poll interval. */
+uint32_t amm_get_default_poll_interval(void);
 
 /** Copy active entries into a caller-owned snapshot. */
 int amm_get_entries(amm_mapping_entry_t *out, int max_entries);
@@ -225,6 +241,11 @@ const char *amm_get_mqtt_topic(uint8_t slave_id, uint16_t reg_addr);
 esp_err_t amm_copy_mqtt_topic(source_protocol_t protocol, uint8_t channel_id,
                               uint8_t slave_id, uint16_t reg_addr,
                               char *out, size_t out_size);
+
+/** Resolve the effective custom-MQTT topic for an entry using current runtime
+ * configuration. AUTO updates immediately when the MQTT prefix changes. */
+esp_err_t amm_resolve_mqtt_topic(const amm_mapping_entry_t *entry,
+                                 char *out, size_t out_size);
 
 /**
  * @brief Load the mapping table from NVS persistent storage.

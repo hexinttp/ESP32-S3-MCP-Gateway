@@ -99,6 +99,10 @@ esp_err_t uif_clear_replayed(void);
  */
 esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue);
 
+/** Release an in-flight replay token after connection loss. The durable
+ * record remains in Flash/TF and will be retried after reconnect. */
+void uif_replay_connection_lost(void);
+
 /**
  * @brief Get cache utilization as a percentage (0-100).
  */
