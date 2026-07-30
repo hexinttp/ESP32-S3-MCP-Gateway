@@ -236,6 +236,9 @@ static const char *TAG = "CONFIG";
 static const uint32_t CONFIG_MAGIC = 0x47435731U;
 static runtime_config_t s_config;
 static SemaphoreHandle_t s_mutex;
+static uint32_t s_generation;
+
+static bool stored_config_valid(const stored_config_t *stored, size_t size);
 
 static uint32_t crc32_bytes(const uint8_t *data, size_t size)
 {
@@ -338,38 +341,59 @@ esp_err_t runtime_config_validate(const runtime_config_t *config,
 static esp_err_t save_locked(void)
 {
     stored_config_t *stored = calloc(1, sizeof(*stored));
-    if (stored == NULL) return ESP_ERR_NO_MEM;
+    stored_config_t *verify = calloc(1, sizeof(*verify));
+    if (stored == NULL || verify == NULL) {
+        free(stored);
+        free(verify);
+        return ESP_ERR_NO_MEM;
+    }
     stored->magic = CONFIG_MAGIC;
-    stored->generation = 1;
+    stored->generation = s_generation == UINT32_MAX ? 1 : s_generation + 1;
     stored->config = s_config;
     stored->crc32 = crc32_bytes((const uint8_t *)&stored->config, sizeof(stored->config));
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         free(stored);
+        free(verify);
         return err;
     }
     uint8_t active = 0;
     (void)nvs_get_u8(nvs, CONFIG_NVS_KEY_ACTIVE, &active);
     const char *target = active == 0 ? CONFIG_NVS_KEY_B : CONFIG_NVS_KEY_A;
-    stored_config_t *old = calloc(1, sizeof(*old));
-    const char *active_key = active == 0 ? CONFIG_NVS_KEY_A : CONFIG_NVS_KEY_B;
-    size_t old_size = old != NULL ? sizeof(*old) : 0;
-    if (old != NULL &&
-        nvs_get_blob(nvs, active_key, old, &old_size) == ESP_OK &&
-        old_size == sizeof(*old)) {
-        stored->generation = old->generation + 1;
-    }
-    free(old);
     err = nvs_set_blob(nvs, target, stored, sizeof(*stored));
     if (err == ESP_OK) err = nvs_commit(nvs);
+
+    /* A successful commit alone is not enough for an industrial configuration
+       path. Read the inactive slot back and validate its schema, CRC, generation,
+       and complete payload before marking it active. */
+    if (err == ESP_OK) {
+        size_t verify_size = sizeof(*verify);
+        err = nvs_get_blob(nvs, target, verify, &verify_size);
+        if (err == ESP_OK &&
+            (!stored_config_valid(verify, verify_size) ||
+             verify->generation != stored->generation ||
+             memcmp(&verify->config, &stored->config,
+                    sizeof(stored->config)) != 0)) {
+            err = ESP_ERR_INVALID_CRC;
+        }
+    }
     if (err == ESP_OK) {
         active = active == 0 ? 1 : 0;
         err = nvs_set_u8(nvs, CONFIG_NVS_KEY_ACTIVE, active);
     }
     if (err == ESP_OK) err = nvs_commit(nvs);
+    if (err == ESP_OK) {
+        s_generation = stored->generation;
+        ESP_LOGI(TAG, "Runtime configuration persisted and verified (generation=%lu)",
+                 (unsigned long)s_generation);
+    } else {
+        ESP_LOGE(TAG, "Runtime configuration persistence verification failed: %s",
+                 esp_err_to_name(err));
+    }
     nvs_close(nvs);
     free(stored);
+    free(verify);
     return err;
 }
 
@@ -391,6 +415,7 @@ esp_err_t runtime_config_init(void)
     if (s_mutex == NULL) s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) return ESP_ERR_NO_MEM;
 
+    s_generation = 0;
     load_defaults(&s_config);
     stored_config_t *slots = calloc(2, sizeof(*slots));
     if (slots == NULL) return ESP_ERR_NO_MEM;
@@ -407,6 +432,7 @@ esp_err_t runtime_config_init(void)
                 (!valid_a || slots[1].generation > slots[0].generation)
                 ? &slots[1] : &slots[0];
             s_config = selected->config;
+            s_generation = selected->generation;
             nvs_close(nvs);
             ESP_LOGI(TAG, "Transactional runtime configuration loaded (generation=%lu)",
                      (unsigned long)selected->generation);
@@ -422,6 +448,7 @@ esp_err_t runtime_config_init(void)
                     v2->config.schema_version == 2 &&
                     v2->crc32 == crc32_bytes((const uint8_t *)&v2->config,
                                              sizeof(v2->config))) {
+                    s_generation = v2->generation;
                     migrate_v2_to_v3(&v2->config, &s_config);
                     free(slots);
                     ESP_LOGI(TAG, "Migrated runtime configuration schema v2 to v3 (platform=CUSTOM)");
@@ -438,6 +465,7 @@ esp_err_t runtime_config_init(void)
                     v3->config.schema_version == 3 &&
                     v3->crc32 == crc32_bytes((const uint8_t *)&v3->config,
                                              sizeof(v3->config))) {
+                    s_generation = v3->generation;
                     migrate_v3_to_current(&v3->config, &s_config);
                     free(slots);
                     ESP_LOGI(TAG, "Migrated runtime configuration schema v3 (added report_mode)");
@@ -509,6 +537,14 @@ ui_locale_t runtime_config_get_locale(void)
     ui_locale_t locale = s_config.locale;
     xSemaphoreGive(s_mutex);
     return locale;
+}
+
+uint32_t runtime_config_get_generation(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t generation = s_generation;
+    xSemaphoreGive(s_mutex);
+    return generation;
 }
 
 esp_err_t runtime_config_set(const runtime_config_t *config)

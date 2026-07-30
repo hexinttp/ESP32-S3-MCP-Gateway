@@ -112,6 +112,28 @@ mqtt_conn_state_t mqtt_get_connection_state(void);
  */
 bool mqtt_is_connected(void);
 
+/** Milliseconds since boot when the current MQTT session connected.
+ * Returns 0 while disconnected. */
+int64_t mqtt_get_connected_since_ms(void);
+
+typedef struct {
+    mqtt_conn_state_t state;
+    uint32_t connect_count;
+    uint32_t disconnect_count;
+    uint32_t error_count;
+    int64_t last_session_duration_ms;
+    uint32_t task_stack_high_watermark_bytes;
+    bool suspended;
+    char last_reason[160];
+} mqtt_diagnostics_t;
+
+/** Snapshot connection lifecycle diagnostics for the Web status API. */
+void mqtt_get_diagnostics(mqtt_diagnostics_t *out);
+
+/** Stop the client outside the ESP-MQTT callback task and suppress reconnect
+ * until configuration is explicitly saved/restarted. */
+void mqtt_suspend_async(const char *reason);
+
 /**
  * @brief Reconnect the configured MQTT client and report its broker result.
  *

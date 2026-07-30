@@ -42,6 +42,7 @@ static const char *TAG = "SCHED";
  * provides the hard ceiling; this just lowers the baseline cadence. */
 #define THINGSCLOUD_FLUSH_INTERVAL_MS       10000
 #define THINGSCLOUD_GW_STATUS_INTERVAL_MS   60000
+#define THINGSCLOUD_CONNECTION_STABLE_MS    10000
 
 /* ======================== Internal State ======================== */
 
@@ -404,20 +405,28 @@ static void publish_task(void *arg)
             /* Periodic ThingsCloud maintenance even when no telemetry arrives. */
             runtime_config_t rt_periodic;
             runtime_config_get(&rt_periodic);
+            int64_t connected_since_ms = mqtt_get_connected_since_ms();
+            bool cloud_session_stable =
+                connected_since_ms > 0 &&
+                now_ms - connected_since_ms >= THINGSCLOUD_CONNECTION_STABLE_MS;
             if (rt_periodic.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD &&
-                mqtt_is_connected()) {
+                mqtt_is_connected() && cloud_session_stable) {
                 if (now_ms - s_last_tc_flush > THINGSCLOUD_FLUSH_INTERVAL_MS) {
                     thingscloud_flush();
                     s_last_tc_flush = now_ms;
                 }
-                if (now_ms - s_last_gw_status > THINGSCLOUD_GW_STATUS_INTERVAL_MS) {
+                bool replay_pending = uif_get_cached_count() > 0 ||
+                                      uif_replay_is_waiting_response();
+                if (!replay_pending &&
+                    now_ms - s_last_gw_status > THINGSCLOUD_GW_STATUS_INTERVAL_MS) {
                     thingscloud_publish_gateway_status();
                     s_last_gw_status = now_ms;
                 }
                 /* Gateway mode: periodic full slave-status heartbeat so the cloud
                    always has a fresh online/summary snapshot even when nothing
                    changed recently. */
-                if (rt_periodic.mqtt.report_mode == MQ_REPORT_GATEWAY &&
+                if (!replay_pending &&
+                    rt_periodic.mqtt.report_mode == MQ_REPORT_GATEWAY &&
                     now_ms - s_last_slave_status > THINGSCLOUD_GW_STATUS_INTERVAL_MS) {
                     thingscloud_publish_gateway_slave_status();
                     s_last_slave_status = now_ms;
@@ -564,6 +573,13 @@ static void replay_task(void *arg)
 
         network_state_t net_state = get_network_state_locked();
         if (net_state != NET_ONLINE) {
+            continue;
+        }
+
+        int64_t connected_since_ms = mqtt_get_connected_since_ms();
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (connected_since_ms <= 0 ||
+            now_ms - connected_since_ms < THINGSCLOUD_CONNECTION_STABLE_MS) {
             continue;
         }
 

@@ -13,12 +13,14 @@ extern "C" {
  * https://www.thingscloud.xyz/docs/ */
 #define TC_TOPIC_GATEWAY_ATTR        "gateway/attributes"
 #define TC_TOPIC_GATEWAY_ATTR_SERIES "gateway/attributes/series"
+#define TC_TOPIC_GATEWAY_ATTR_RESPONSE "gateway/attributes/response"
 #define TC_TOPIC_GATEWAY_ATTR_PUSH   "gateway/attributes/push"
 #define TC_TOPIC_GATEWAY_CMD_SEND    "gateway/command/send"
 #define TC_TOPIC_GATEWAY_CMD_REPLY   "gateway/command/reply"
 #define TC_TOPIC_GATEWAY_CONNECT     "gateway/connect"
 #define TC_TOPIC_GATEWAY_DISCONNECT  "gateway/disconnect"
 #define TC_TOPIC_ATTR                "attributes"
+#define TC_TOPIC_ATTR_RESPONSE       "attributes/response"
 #define TC_TOPIC_ATTR_PUSH           "attributes/push"
 
 #define TC_FIRMWARE_VERSION          "1.0.0"

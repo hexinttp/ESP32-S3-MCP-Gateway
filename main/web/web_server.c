@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <time.h>
+#include <sys/time.h>
+#include <ctype.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -49,6 +51,20 @@
 static const char *TAG = "WEB";
 
 static httpd_handle_t s_server = NULL;
+
+static bool copy_trimmed_field(char *dst, size_t dst_size, const char *src)
+{
+    if (dst == NULL || dst_size == 0 || src == NULL) return false;
+    const unsigned char *start = (const unsigned char *)src;
+    while (*start != '\0' && isspace(*start)) ++start;
+    const unsigned char *end = start + strlen((const char *)start);
+    while (end > start && isspace(end[-1])) --end;
+    size_t length = (size_t)(end - start);
+    if (length >= dst_size) return false;
+    memcpy(dst, start, length);
+    dst[length] = '\0';
+    return true;
+}
 
 static void sha256_hex(const char *text, char output[65])
 {
@@ -321,6 +337,24 @@ static esp_err_t system_status_get_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "mqtt_connected", mqtt_is_connected());
+    mqtt_diagnostics_t mqtt_diag;
+    mqtt_get_diagnostics(&mqtt_diag);
+    cJSON_AddNumberToObject(root, "mqtt_state", mqtt_diag.state);
+    cJSON_AddNumberToObject(root, "mqtt_connect_count",
+                            mqtt_diag.connect_count);
+    cJSON_AddNumberToObject(root, "mqtt_disconnect_count",
+                            mqtt_diag.disconnect_count);
+    cJSON_AddNumberToObject(root, "mqtt_error_count",
+                            mqtt_diag.error_count);
+    cJSON_AddNumberToObject(root, "mqtt_last_session_duration_ms",
+                            (double)mqtt_diag.last_session_duration_ms);
+    cJSON_AddNumberToObject(
+        root, "mqtt_task_stack_high_watermark_bytes",
+        mqtt_diag.task_stack_high_watermark_bytes);
+    cJSON_AddBoolToObject(root, "mqtt_suspended",
+                          mqtt_diag.suspended);
+    cJSON_AddStringToObject(root, "mqtt_last_reason",
+                            mqtt_diag.last_reason);
     cJSON_AddBoolToObject(root, "modbus_active", true);
     cJSON_AddNumberToObject(root, "total_polls", m.total_polls);
     cJSON_AddNumberToObject(root, "successful_polls", m.successful_polls);
@@ -347,6 +381,8 @@ static esp_err_t system_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "state_capacity", tcm_state_pool_get_capacity());
     cJSON_AddNumberToObject(root, "uptime_seconds",
                             (int64_t)(esp_timer_get_time() / 1000000LL));
+    cJSON_AddNumberToObject(root, "uptime_ms",
+                            (double)(esp_timer_get_time() / 1000LL));
     cJSON_AddNumberToObject(root, "sequence_counter", tcm_get_sequence_counter());
     gateway_health_t health;
     health_service_get(&health);
@@ -443,7 +479,18 @@ static volatile bool s_mqtt_restart_pending = false;
 static void mqtt_restart_task(void *arg)
 {
     (void)arg;
-    mqtt_restart();
+    esp_err_t err = mqtt_restart();
+    if (err == ESP_OK) {
+        web_server_add_log(
+            "info",
+            "[MQTT] Client restart completed; waiting for broker response");
+    } else {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "[MQTT] Client restart failed: %s",
+                 esp_err_to_name(err));
+        web_server_add_log("error", message);
+    }
     s_mqtt_restart_pending = false;
     vTaskDelete(NULL);
 }
@@ -484,6 +531,8 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "lwt_retain", config.mqtt.lwt_retain);
     cJSON_AddStringToObject(root, "report_mode",
         (config.mqtt.report_mode == MQ_REPORT_GATEWAY) ? "gateway" : "subdevice");
+    cJSON_AddNumberToObject(root, "nvs_generation",
+                            (double)runtime_config_get_generation());
     cJSON_AddNumberToObject(root, "config_generation",
                             (double)thingscloud_get_config_generation());
     thingscloud_runtime_status_t tc_status;
@@ -496,6 +545,10 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
                             (double)tc_status.dropped_count);
     cJSON_AddNumberToObject(root, "cloud_last_publish_ms",
                             (double)tc_status.last_publish_ms);
+    cJSON_AddNumberToObject(root, "cloud_last_response_code",
+                            tc_status.last_response_code);
+    cJSON_AddBoolToObject(root, "cloud_upload_suspended",
+                          tc_status.upload_suspended);
     cJSON_AddNumberToObject(root, "cloud_cached_records",
                             (double)uif_get_cached_count());
     cJSON_AddNumberToObject(root, "cloud_online_devices",
@@ -522,6 +575,15 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
 
     runtime_config_t config;
     runtime_config_get(&config);
+    char previous_uri[sizeof(config.mqtt.uri)];
+    char previous_username[sizeof(config.mqtt.username)];
+    char previous_password[sizeof(config.mqtt.password)];
+    strlcpy(previous_uri, config.mqtt.uri, sizeof(previous_uri));
+    strlcpy(previous_username, config.mqtt.username,
+            sizeof(previous_username));
+    strlcpy(previous_password, config.mqtt.password,
+            sizeof(previous_password));
+    mqtt_platform_type_t previous_platform = config.mqtt.platform_type;
     mqtt_report_mode_t previous_report_mode = config.mqtt.report_mode;
 #define COPY_MQTT_STRING(key, field) do { cJSON *item = cJSON_GetObjectItem(root, key); \
     if (cJSON_IsString(item) && strcmp(item->valuestring, "********") != 0) { \
@@ -571,17 +633,37 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
     cv = cJSON_GetObjectItem(root, "clear_password");
     if (cJSON_IsBool(cv)) clear_pass = cJSON_IsTrue(cv);
 
+    bool username_update_requested = false;
+    bool password_update_requested = false;
     cJSON *ui = cJSON_GetObjectItem(root, "username");
     if (cJSON_IsString(ui)) {
         if (clear_user) config.mqtt.username[0] = '\0';
-        else if (ui->valuestring[0] != '\0' && strcmp(ui->valuestring, "********") != 0)
-            strlcpy(config.mqtt.username, ui->valuestring, sizeof(config.mqtt.username));
+        else if (ui->valuestring[0] != '\0' && strcmp(ui->valuestring, "********") != 0) {
+            if (!copy_trimmed_field(config.mqtt.username,
+                                    sizeof(config.mqtt.username),
+                                    ui->valuestring)) {
+                cJSON_Delete(root);
+                return httpd_resp_send_err(
+                    req, HTTPD_400_BAD_REQUEST,
+                    "AccessToken is too long");
+            }
+            username_update_requested = true;
+        }
     }
     cJSON *pi = cJSON_GetObjectItem(root, "password");
     if (cJSON_IsString(pi)) {
         if (clear_pass) config.mqtt.password[0] = '\0';
-        else if (pi->valuestring[0] != '\0' && strcmp(pi->valuestring, "********") != 0)
-            strlcpy(config.mqtt.password, pi->valuestring, sizeof(config.mqtt.password));
+        else if (pi->valuestring[0] != '\0' && strcmp(pi->valuestring, "********") != 0) {
+            if (!copy_trimmed_field(config.mqtt.password,
+                                    sizeof(config.mqtt.password),
+                                    pi->valuestring)) {
+                cJSON_Delete(root);
+                return httpd_resp_send_err(
+                    req, HTTPD_400_BAD_REQUEST,
+                    "ProjectKey is too long");
+            }
+            password_update_requested = true;
+        }
     }
 
     cJSON *value = cJSON_GetObjectItem(root, "enabled");
@@ -604,6 +686,39 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
 
     /* ThingsCloud mandates QoS 0, no retain, and disables the custom LWT. */
     if (config.mqtt.platform_type == MQTT_PLATFORM_THINGSCLOUD) {
+        /* Normalize credentials even when the UI kept the masked existing
+         * values. This repairs credentials previously pasted with CR/LF or
+         * surrounding spaces without requiring an NVS reset. */
+        char normalized_username[sizeof(config.mqtt.username)];
+        char normalized_password[sizeof(config.mqtt.password)];
+        if (!copy_trimmed_field(normalized_username,
+                                sizeof(normalized_username),
+                                config.mqtt.username) ||
+            !copy_trimmed_field(normalized_password,
+                                sizeof(normalized_password),
+                                config.mqtt.password)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(
+                req, HTTPD_400_BAD_REQUEST,
+                "ThingsCloud credentials are invalid");
+        }
+        strlcpy(config.mqtt.username, normalized_username,
+                sizeof(config.mqtt.username));
+        strlcpy(config.mqtt.password, normalized_password,
+                sizeof(config.mqtt.password));
+        if (config.mqtt.username[0] == '\0' ||
+            config.mqtt.password[0] == '\0') {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(
+                req, HTTPD_400_BAD_REQUEST,
+                "ThingsCloud requires AccessToken and ProjectKey");
+        }
+        /* ClientId is not user-configurable for ThingsCloud. mqtt_init()
+         * derives a stable, <=32-byte ID from the gateway MAC. */
+        config.mqtt.client_id[0] = '\0';
+        if (config.mqtt.keepalive_sec < 60) {
+            config.mqtt.keepalive_sec = 60;
+        }
         config.mqtt.qos = 0;
         config.mqtt.retain = false;
         config.mqtt.lwt_enabled = false;
@@ -619,6 +734,17 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
     if (err != ESP_OK) {
         cJSON_Delete(root);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+    }
+    bool cloud_identity_changed =
+        previous_platform != config.mqtt.platform_type ||
+        strcmp(previous_uri, config.mqtt.uri) != 0 ||
+        strcmp(previous_username, config.mqtt.username) != 0 ||
+        strcmp(previous_password, config.mqtt.password) != 0;
+    if (cloud_identity_changed) {
+        /* A quota/rate guard belongs to one cloud identity. Preserve it for
+         * ordinary saves, but clear it when the user actually selects a
+         * different endpoint or certificate. */
+        thingscloud_clear_publish_guard();
     }
 
     /* Re-establish the broker connection with the new settings, but in a
@@ -637,8 +763,34 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
         }
     }
 
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddStringToObject(response, "status", "ok");
+    cJSON_AddBoolToObject(response, "persisted", true);
+    cJSON_AddBoolToObject(response, "restart_required", false);
+    cJSON_AddNumberToObject(response, "nvs_generation",
+                            (double)runtime_config_get_generation());
+    cJSON_AddBoolToObject(response, "username_updated",
+                          username_update_requested || clear_user);
+    cJSON_AddBoolToObject(response, "password_updated",
+                          password_update_requested || clear_pass);
+    char username_masked[32];
+    char password_masked[32];
+    thingscloud_mask_credential(config.mqtt.username, username_masked,
+                                sizeof(username_masked));
+    thingscloud_mask_credential(config.mqtt.password, password_masked,
+                                sizeof(password_masked));
+    cJSON_AddStringToObject(response, "username_masked", username_masked);
+    cJSON_AddStringToObject(response, "password_masked", password_masked);
+
+    char *json = cJSON_PrintUnformatted(response);
+    esp_err_t response_err = json != NULL
+        ? send_json(req, json)
+        : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                              "Unable to encode save confirmation");
+    free(json);
+    cJSON_Delete(response);
     cJSON_Delete(root);
-    return send_json(req, "{\"status\":\"ok\",\"restart_required\":false}");
+    return response_err;
 }
 
 /* ================================================================
@@ -747,11 +899,27 @@ static esp_err_t mqtt_disconnect_post_handler(httpd_req_t *req)
 {
     if (require_authorization(req) != ESP_OK) return ESP_OK;
 
-    esp_err_t err = mqtt_disconnect();
+    runtime_config_t config;
+    runtime_config_get(&config);
+    esp_err_t persist_err = ESP_OK;
+    if (config.mqtt.enabled) {
+        config.mqtt.enabled = false;
+        persist_err = runtime_config_set(&config);
+    }
+    esp_err_t err = persist_err == ESP_OK
+        ? mqtt_disconnect()
+        : persist_err;
+    if (persist_err == ESP_OK && err == ESP_ERR_INVALID_STATE) {
+        /* Idempotent stop: already stopped is still the requested state. */
+        err = ESP_OK;
+    }
     cJSON *resp = cJSON_CreateObject();
     if (err == ESP_OK) {
         cJSON_AddBoolToObject(resp, "success", true);
-        cJSON_AddStringToObject(resp, "message", "MQTT connection disconnected");
+        cJSON_AddBoolToObject(resp, "persisted", true);
+        cJSON_AddStringToObject(
+            resp, "message",
+            "MQTT stopped; automatic reconnect is disabled until settings are saved");
     } else {
         cJSON_AddBoolToObject(resp, "success", false);
         cJSON_AddStringToObject(resp, "error",
@@ -1063,7 +1231,7 @@ static esp_err_t mappings_post_handler(httpd_req_t *req)
     entry.source_protocol = SRC_MODBUS_RTU;
     entry.function_code = 3;
     entry.scale_factor = 1.0f;
-    entry.poll_interval_ms = POLL_INTERVAL_MS;
+    entry.poll_interval_ms = amm_get_default_poll_interval();
     entry.priority = 5;
     entry.retry_count = 2;
     entry.retry_backoff_ms = 50;
@@ -1214,7 +1382,7 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
     entry->data_type = DT_UINT16;
     entry->byte_order = BYTE_ORDER_ABCD;
     entry->scale_factor = 1.0f;
-    entry->poll_interval_ms = POLL_INTERVAL_MS;
+    entry->poll_interval_ms = amm_get_default_poll_interval();
     entry->priority = 5;
     entry->retry_count = 2;
     entry->retry_backoff_ms = 50;
@@ -1483,14 +1651,19 @@ static SemaphoreHandle_t s_log_mutex = NULL;
 
 void web_server_add_log(const char *level_str, const char *text)
 {
+    int64_t timestamp_ms = 0;
+    if (time_service_is_synchronized()) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        timestamp_ms = (int64_t)now.tv_sec * 1000LL + now.tv_usec / 1000;
+    }
     if (!s_log_mutex) return;
     if (xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
 
     web_log_entry_t *e = &s_log_buf[s_log_head];
     e->level = (level_str && *level_str) ? *level_str : 'i';
     snprintf(e->text, WEB_LOG_MAX_TEXT_LEN, "%s", text ? text : "");
-    time_t now = time(NULL);
-    e->timestamp_ms = now >= 1577836800 ? (int64_t)now * 1000 : 0;
+    e->timestamp_ms = timestamp_ms;
     e->uptime_ms = esp_timer_get_time() / 1000LL;
     s_log_head = (s_log_head + 1) % WEB_LOG_MAX_ENTRIES;
     if (s_log_count < WEB_LOG_MAX_ENTRIES) s_log_count++;
@@ -1504,12 +1677,20 @@ void web_server_add_log(const char *level_str, const char *text)
 static esp_err_t system_logs_get_handler(httpd_req_t *req)
 {
     cJSON *arr = cJSON_CreateArray();
+    time_service_status_t time_status = {0};
+    time_service_get_status(&time_status);
+    int64_t uptime_now_ms = esp_timer_get_time() / 1000LL;
 
     if (s_log_mutex && xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         int start = (s_log_count < WEB_LOG_MAX_ENTRIES) ? 0 : s_log_head;
         for (int i = 0; i < s_log_count; i++) {
             int idx = (start + i) % WEB_LOG_MAX_ENTRIES;
             web_log_entry_t *e = &s_log_buf[idx];
+            if (e->timestamp_ms == 0 && time_status.synchronized &&
+                e->uptime_ms <= uptime_now_ms) {
+                e->timestamp_ms = time_status.current_time_ms -
+                                  uptime_now_ms + e->uptime_ms;
+            }
 
             cJSON *obj = cJSON_CreateObject();
             const char *lvl = "info";
@@ -1543,9 +1724,13 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
     char output[2048];
     size_t output_used = 0;
     output[output_used++] = '[';
-    time_t wall_now = time(NULL);
-    int64_t wall_now_ms = wall_now >= 1577836800 ? (int64_t)wall_now * 1000 : 0;
-    int64_t boot_now_ms = esp_timer_get_time() / 1000LL;
+    time_service_status_t time_status = {0};
+    time_service_get_status(&time_status);
+    int64_t uptime_now_ms = esp_timer_get_time() / 1000LL;
+    if (time_status.synchronized) {
+        modbus_comm_log_anchor_wall_time(time_status.current_time_ms,
+                                         uptime_now_ms);
+    }
     int count = modbus_comm_log_count();
     for (int i = 0; i < count; ++i) {
         modbus_comm_log_entry_t entry;
@@ -1590,8 +1775,8 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
             "\"status_code\":%ld,\"status\":\"%s\",\"truncated\":%s,"
             "\"frame_hex\":\"%s\",\"register_values\":[%s]}",
             i == 0 ? "" : ",", (unsigned long)entry.sequence,
-            wall_now_ms > 0 ? wall_now_ms - boot_now_ms + entry.timestamp_ms : 0,
             entry.timestamp_ms,
+            entry.uptime_ms,
             entry.direction == MODBUS_COMM_TX ? "TX" : "RX",
             entry.slave_id, entry.function_code, entry.register_address,
             entry.register_count, (long)entry.status,

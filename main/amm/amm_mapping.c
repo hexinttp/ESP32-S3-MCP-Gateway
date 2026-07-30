@@ -389,6 +389,10 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
                      "slave=%u reg=%u", entry->slave_id, entry->register_address);
             memcpy(&s_mapping_table[i], entry, sizeof(amm_mapping_entry_t));
             s_mapping_table[i].active = true;
+            if (s_mapping_table[i].poll_interval_ms == 0) {
+                s_mapping_table[i].poll_interval_ms =
+                    s_default_poll_interval_ms;
+            }
             amm_normalize_read_window(&s_mapping_table[i]);
             s_mapping_table[i].mapping_version = ++s_model_version;
             esp_err_t ret = amm_save_entry_to_nvs_unlocked(i);
@@ -424,7 +428,8 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
     amm_normalize_read_window(&s_mapping_table[target]);
     s_mapping_table[target].mapping_version = ++s_model_version;
     if (s_mapping_table[target].poll_interval_ms == 0) {
-        s_mapping_table[target].poll_interval_ms = POLL_INTERVAL_MS;
+        s_mapping_table[target].poll_interval_ms =
+            s_default_poll_interval_ms;
     }
 
     esp_err_t ret = amm_save_entry_to_nvs_unlocked(target);
@@ -579,7 +584,8 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry)
     amm_normalize_read_window(&s_mapping_table[index]);
     s_mapping_table[index].mapping_version = ++s_model_version;
     if (s_mapping_table[index].poll_interval_ms == 0) {
-        s_mapping_table[index].poll_interval_ms = POLL_INTERVAL_MS;
+        s_mapping_table[index].poll_interval_ms =
+            s_default_poll_interval_ms;
     }
     esp_err_t err = amm_save_entry_to_nvs_unlocked(index);
     amm_unlock();
@@ -727,7 +733,9 @@ esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
 
         entry.active = true;
         entry.mapping_version = ++s_model_version;
-        if (entry.poll_interval_ms == 0) entry.poll_interval_ms = POLL_INTERVAL_MS;
+        if (entry.poll_interval_ms == 0) {
+            entry.poll_interval_ms = s_default_poll_interval_ms;
+        }
         if (entry.scale_factor == 0.0f) entry.scale_factor = 1.0f;
         amm_normalize_read_window(&entry);
 
@@ -1453,7 +1461,8 @@ esp_err_t amm_load_from_nvs(void)
     s_model_version = 1;
     for (int i = 0; i < s_mapping_count; ++i) {
         if (s_mapping_table[i].poll_interval_ms == 0) {
-            s_mapping_table[i].poll_interval_ms = POLL_INTERVAL_MS;
+            s_mapping_table[i].poll_interval_ms =
+                s_default_poll_interval_ms;
         }
         if (s_mapping_table[i].scale_factor == 0.0f) {
             s_mapping_table[i].scale_factor = 1.0f;

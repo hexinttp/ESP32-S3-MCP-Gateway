@@ -90,6 +90,10 @@ typedef enum {
 #define TASK_STACK_SIZE_MODBUS   12288
 #define TASK_STACK_SIZE_TCM      16384
 #define TASK_STACK_SIZE_MQTT     24576
+/* Hardware-measured peak use is about 7 KB across connect, subscribe,
+ * ThingsCloud response parsing and disconnect. 10 KB leaves ~3 KB margin
+ * while still fitting a fragmented runtime internal-SRAM heap. */
+#define MQTT_CLIENT_TASK_STACK_SIZE 10240
 #define TASK_STACK_SIZE_SCHED    8192
 #define TASK_STACK_SIZE_EVAL     8192
 

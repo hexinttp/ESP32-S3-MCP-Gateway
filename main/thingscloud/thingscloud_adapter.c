@@ -33,6 +33,9 @@ static SemaphoreHandle_t s_adapter_mutex = NULL;
 static uint32_t s_throttled_count = 0;
 static uint32_t s_dropped_count = 0;
 static int64_t s_last_publish_ms = 0;
+static volatile int s_last_response_code = 0;
+static volatile bool s_upload_suspended = false;
+static volatile int64_t s_rate_block_until_ms = 0;
 
 static bool adapter_lock(void)
 {
@@ -59,8 +62,8 @@ static void adapter_unlock(void)
  *   - TC_RATE_REFILL_MS     : ms to regenerate one token (=> steady rate)
  * Control messages (gateway/connect, gateway/disconnect) are NOT limited
  * because they are low-frequency and must not be dropped. */
-#define TC_RATE_BUCKET_TOKENS   8
-#define TC_RATE_REFILL_MS       3000    /* 1 token / 3s => ~20 msg/min steady */
+#define TC_RATE_BUCKET_TOKENS   1
+#define TC_RATE_REFILL_MS       30000   /* Free-tier-safe: one aggregate / 30s */
 
 static int      s_rate_tokens  = TC_RATE_BUCKET_TOKENS;
 static int64_t  s_rate_last_ms = 0;
@@ -85,6 +88,7 @@ static void tc_rate_refill(int64_t now_ms)
 static bool tc_rate_allow(void)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_upload_suspended || now_ms < s_rate_block_until_ms) return false;
     tc_rate_refill(now_ms);
     if (s_rate_tokens > 0) {
         s_rate_tokens--;
@@ -697,6 +701,11 @@ esp_err_t thingscloud_publish_context(const tcm_context_t *ctx)
 
 void thingscloud_flush(void)
 {
+    /* During durable replay, only the oldest cached record may be in flight.
+       Holding live aggregates prevents an unrelated response from being
+       mistaken for that record's application-level acknowledgement. */
+    if (uif_replay_is_waiting_response() || uif_get_cached_count() > 0) return;
+
     runtime_config_t rt;
     runtime_config_get(&rt);
     if (!adapter_lock()) return;
@@ -767,6 +776,40 @@ void thingscloud_get_runtime_status(thingscloud_runtime_status_t *out)
     out->throttled_count = s_throttled_count;
     out->dropped_count = s_dropped_count;
     out->last_publish_ms = s_last_publish_ms;
+    out->last_response_code = s_last_response_code;
+    out->upload_suspended = s_upload_suspended;
+    adapter_unlock();
+}
+
+void thingscloud_record_publish_response(bool accepted, int error_code)
+{
+    if (!adapter_lock()) return;
+    s_last_response_code = accepted ? 0 : error_code;
+    if (error_code == 403) {
+        s_rate_tokens = 0;
+        s_rate_block_until_ms = esp_timer_get_time() / 1000 + 60000;
+    } else if (error_code == 413) {
+        s_upload_suspended = true;
+    }
+    adapter_unlock();
+}
+
+bool thingscloud_upload_is_suspended(void)
+{
+    if (!adapter_lock()) return true;
+    bool suspended = s_upload_suspended;
+    adapter_unlock();
+    return suspended;
+}
+
+void thingscloud_clear_publish_guard(void)
+{
+    if (!adapter_lock()) return;
+    s_last_response_code = 0;
+    s_upload_suspended = false;
+    s_rate_block_until_ms = 0;
+    s_rate_tokens = TC_RATE_BUCKET_TOKENS;
+    s_rate_last_ms = esp_timer_get_time() / 1000;
     adapter_unlock();
 }
 
@@ -777,17 +820,15 @@ void thingscloud_on_mqtt_connected(void)
     runtime_config_get(&rt);
     if (adapter_lock()) {
         check_mode_change(rt.mqtt.report_mode);
+        /* Never burst stale tokens after a long offline interval. One token
+           becomes available after the MQTT stability window; all subsequent
+           telemetry follows the configured 30-second pacing. */
+        s_rate_tokens = TC_RATE_BUCKET_TOKENS;
+        s_rate_last_ms = esp_timer_get_time() / 1000;
         adapter_unlock();
     }
-    if (rt.mqtt.report_mode == MQ_REPORT_SUBDEVICE) {
-        /* Re-report every ONLINE sub-device, then resume gateway/attributes. */
-        thingscloud_subdev_republish_all_online();
-        thingscloud_flush();
-    } else {
-        /* Gateway mode: push all slave states + RS485 summary first, then the
-           latest buffered business data. No gateway/connect is published. */
-        thingscloud_publish_gateway_slave_status();
-        thingscloud_flush();
-    }
-    thingscloud_publish_gateway_status();
+    /* Connection callbacks run in the ESP-MQTT task. Keep this path free of
+       JSON construction and publish bursts; scheduler maintenance resumes only
+       after the session has remained stable. */
+    ESP_LOGI(TAG, "ThingsCloud session connected; telemetry held for stability window");
 }

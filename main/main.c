@@ -153,7 +153,6 @@ void app_main(void)
     }
     if (config.tf_enabled) tf_storage_mount();
     ESP_ERROR_CHECK(network_manager_init());
-    ESP_ERROR_CHECK(time_service_init());
     ESP_ERROR_CHECK(ota_service_init());
 
     /* Reserve/start the MQTT client only after an uplink has an IP address,
@@ -168,8 +167,12 @@ void app_main(void)
         ESP_LOGI(TAG, "Network ready after %d ms; starting MQTT", mqtt_network_wait_ms);
     } else {
         ESP_LOGW(TAG, "Network not ready after %d ms; MQTT will use automatic reconnect",
-                 mqtt_network_wait_ms);
+                  mqtt_network_wait_ms);
     }
+    /* Start SNTP only after the default interface has an address. Starting it
+       during Ethernet/WiFi bring-up can leave the first DNS request unresolved
+       and all log timestamps without a trustworthy wall-clock anchor. */
+    ESP_ERROR_CHECK(time_service_init());
     mqtt_init();
 
     tcm_init();

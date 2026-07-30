@@ -1,9 +1,11 @@
 #include "modbus/modbus_comm_log.h"
 
 #include <string.h>
+#include <sys/time.h>
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "services/time_service.h"
 
 static modbus_comm_log_entry_t s_entries[MODBUS_COMM_LOG_CAPACITY];
 static SemaphoreHandle_t s_mutex;
@@ -25,6 +27,14 @@ void modbus_comm_log_add(modbus_comm_direction_t direction,
                          const uint8_t *frame,
                          size_t frame_length)
 {
+    int64_t uptime_ms = esp_timer_get_time() / 1000LL;
+    int64_t timestamp_ms = 0;
+    if (time_service_is_synchronized()) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        timestamp_ms = (int64_t)now.tv_sec * 1000LL + now.tv_usec / 1000;
+    }
+
     modbus_comm_log_init();
     if (s_mutex == NULL ||
         xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -34,7 +44,8 @@ void modbus_comm_log_add(modbus_comm_direction_t direction,
     modbus_comm_log_entry_t *entry = &s_entries[s_next];
     memset(entry, 0, sizeof(*entry));
     entry->sequence = ++s_sequence;
-    entry->timestamp_ms = esp_timer_get_time() / 1000;
+    entry->timestamp_ms = timestamp_ms;
+    entry->uptime_ms = uptime_ms;
     entry->direction = direction;
     entry->slave_id = slave_id;
     entry->function_code = function_code;
@@ -97,6 +108,26 @@ bool modbus_comm_log_get(int index, modbus_comm_log_entry_t *out)
     }
     xSemaphoreGive(s_mutex);
     return found;
+}
+
+void modbus_comm_log_anchor_wall_time(int64_t wall_now_ms,
+                                      int64_t uptime_now_ms)
+{
+    if (wall_now_ms <= 0 || uptime_now_ms < 0 || s_mutex == NULL ||
+        xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    for (uint16_t i = 0; i < s_count; ++i) {
+        uint16_t oldest = (uint16_t)((s_next + MODBUS_COMM_LOG_CAPACITY -
+                                      s_count) % MODBUS_COMM_LOG_CAPACITY);
+        modbus_comm_log_entry_t *entry =
+            &s_entries[(oldest + i) % MODBUS_COMM_LOG_CAPACITY];
+        if (entry->timestamp_ms == 0 && entry->uptime_ms <= uptime_now_ms) {
+            entry->timestamp_ms =
+                wall_now_ms - uptime_now_ms + entry->uptime_ms;
+        }
+    }
+    xSemaphoreGive(s_mutex);
 }
 
 void modbus_comm_log_clear(void)

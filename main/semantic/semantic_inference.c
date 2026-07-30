@@ -104,7 +104,8 @@ void semantic_inference_build_raw_mapping(
     entry->byte_order = BYTE_ORDER_ABCD;
     entry->scale_factor = 1.0f;
     entry->offset = 0.0f;
-    entry->poll_interval_ms = 1000;
+    /* Zero means "inherit the gateway-wide AMM polling interval". */
+    entry->poll_interval_ms = 0;
     entry->priority = 3;
     entry->active = true;
     entry->discovered = true;

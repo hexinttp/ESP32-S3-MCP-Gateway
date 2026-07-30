@@ -3,6 +3,8 @@
 #include "mqtt_comm/mqtt_handler.h"
 #include "amm/amm_mapping.h"
 #include "services/control_service.h"
+#include "uif/uif_persistence.h"
+#include "web/web_server.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -203,4 +205,74 @@ void thingscloud_on_gateway_attributes_push(const char *topic, const char *data,
     /* Gateway self attribute downlink: no writable gateway attributes in this
        firmware; log at info level and ignore. */
     ESP_LOGI(TAG, "Gateway attributes/push received (%d bytes); ignored", data_len);
+}
+
+static void handle_attributes_response(bool gateway_topic, const char *data,
+                                       int data_len)
+{
+    if (data == NULL || data_len <= 0) return;
+
+    cJSON *root = cJSON_ParseWithLength(data, (size_t)data_len);
+    bool accepted = false;
+    int error_code = 0;
+    const char *message = "";
+    if (root != NULL) {
+        cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+        cJSON *errcode = cJSON_GetObjectItemCaseSensitive(root, "errcode");
+        cJSON *message_item = cJSON_GetObjectItemCaseSensitive(root, "message");
+        accepted = (cJSON_IsNumber(result) && result->valueint == 1) ||
+                   cJSON_IsTrue(result);
+        if (cJSON_IsNumber(errcode)) error_code = errcode->valueint;
+        if (cJSON_IsString(message_item)) message = message_item->valuestring;
+    }
+
+    char log_text[192];
+    if (root == NULL) {
+        snprintf(log_text, sizeof(log_text),
+                 "[MQTT RX] ThingsCloud %s response has invalid JSON (%d bytes)",
+                 gateway_topic ? "sub-device" : "gateway", data_len);
+        ESP_LOGW(TAG, "%s", log_text);
+        web_server_add_log("error", log_text);
+    } else if (accepted) {
+        snprintf(log_text, sizeof(log_text),
+                 "[MQTT RX] ThingsCloud %s attributes accepted",
+                 gateway_topic ? "sub-device" : "gateway");
+        ESP_LOGI(TAG, "%s", log_text);
+        web_server_add_log("ok", log_text);
+    } else {
+        snprintf(log_text, sizeof(log_text),
+                 "[MQTT RX] ThingsCloud %s attributes rejected: code=%d %.96s",
+                 gateway_topic ? "sub-device" : "gateway",
+                 error_code, message);
+        ESP_LOGW(TAG, "%s", log_text);
+        web_server_add_log("error", log_text);
+    }
+
+    if (root != NULL) {
+        thingscloud_record_publish_response(accepted, error_code);
+        uif_replay_cloud_response(gateway_topic, accepted, error_code);
+        cJSON_Delete(root);
+    }
+    if (error_code == 413) {
+        /* Keep the MQTT control plane alive. The broker may close this
+         * transport after rejecting the message, but ESP-MQTT will reconnect
+         * and the adapter guard prevents another telemetry publish. */
+        web_server_add_log(
+            "warn",
+            "[MQTT] Telemetry suspended after cloud 413; control connection will recover");
+    }
+}
+
+void thingscloud_on_attributes_response(const char *topic, const char *data,
+                                        int data_len)
+{
+    (void)topic;
+    handle_attributes_response(false, data, data_len);
+}
+
+void thingscloud_on_gateway_attributes_response(const char *topic,
+                                                const char *data, int data_len)
+{
+    (void)topic;
+    handle_attributes_response(true, data, data_len);
 }

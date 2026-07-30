@@ -103,6 +103,13 @@ esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue);
  * record remains in Flash/TF and will be retried after reconnect. */
 void uif_replay_connection_lost(void);
 
+/** Complete the single in-flight ThingsCloud replay after the platform's
+ * application-level attributes response. A rejected record remains durable. */
+void uif_replay_cloud_response(bool gateway_topic, bool accepted, int error_code);
+
+/** True while a ThingsCloud replay is waiting for an application response. */
+bool uif_replay_is_waiting_response(void);
+
 /**
  * @brief Get cache utilization as a percentage (0-100).
  */

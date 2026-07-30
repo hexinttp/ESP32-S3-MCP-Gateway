@@ -112,6 +112,7 @@ esp_err_t runtime_config_validate(const runtime_config_t *config,
                                   char *reason, size_t reason_size);
 void runtime_config_get(runtime_config_t *out);
 ui_locale_t runtime_config_get_locale(void);
+uint32_t runtime_config_get_generation(void);
 esp_err_t runtime_config_set(const runtime_config_t *config);
 esp_err_t runtime_config_reset(void);
 

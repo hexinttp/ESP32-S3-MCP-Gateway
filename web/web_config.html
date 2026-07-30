@@ -734,6 +734,7 @@ tbody tr:last-child td { border-bottom: none; }
           <span class="badge badge-success" id="mqttConnBadge"><span class="dot dot-green"></span> <span data-i18n="status.connected">Connected</span></span>
         </div>
         <div class="card-body">
+          <div id="mqttConnectionReason" class="hint" style="margin-bottom:12px;"></div>
           <div class="form-group">
             <label data-i18n="mqtt.platform">Cloud Platform</label>
             <select id="mqttPlatform" onchange="applyMqttPlatformUI()">
@@ -761,10 +762,6 @@ tbody tr:last-child td { border-bottom: none; }
             <div class="form-group">
               <label data-i18n="mqtt.broker_uri">Broker URI</label>
               <input type="text" id="mqttUri" placeholder="mqtt://broker.example.com:1883" value="mqtt://192.168.1.100:1883">
-            </div>
-            <div class="form-group">
-              <label data-i18n="mqtt.client_id">Client ID</label>
-              <input type="text" id="mqttClientId" value="esp32s3_gateway_01">
             </div>
             <div class="form-group">
               <label id="mqttUserLabel">
@@ -834,12 +831,13 @@ tbody tr:last-child td { border-bottom: none; }
               <div class="form-group"><label data-i18n="mqtt.status.throttled">Rate-limited</label><div id="tcThrottledCount">0</div></div>
               <div class="form-group"><label data-i18n="mqtt.status.deferred">Deferred to Cache</label><div id="tcDroppedCount">0</div></div>
               <div class="form-group"><label data-i18n="mqtt.status.last_publish">Last Publish</label><div id="tcLastPublish">-</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.cloud_response">Cloud Response</label><div id="tcCloudResponse">-</div></div>
+              <div class="form-group"><label data-i18n="mqtt.status.upload_state">Upload State</label><div id="tcUploadState">-</div></div>
             </div>
           </div>
 
           <div style="margin-top:16px; display:flex; gap:8px;">
             <button class="btn btn-primary" onclick="saveMqttConfig()" data-i18n="btn.save">Save Configuration</button>
-            <button class="btn btn-outline" onclick="testMqttConnection()" data-i18n="mqtt.test">Test Connection</button>
             <button class="btn btn-danger" id="mqttDisconnectBtn" onclick="disconnectMqtt()" data-i18n="mqtt.disconnect">Disconnect</button>
           </div>
         </div>
@@ -1626,16 +1624,20 @@ const I18N = {
     "mqtt.status.throttled": "限流次数",
     "mqtt.status.deferred": "转存缓存次数",
     "mqtt.status.last_publish": "最近成功上报",
+    "mqtt.status.cloud_response": "云端响应码",
+    "mqtt.status.upload_state": "上报状态",
+    "mqtt.status.upload_active": "正常",
+    "mqtt.status.upload_suspended": "已暂停（云端配额耗尽）",
+    "mqtt.connection_reason": "连接诊断",
+    "mqtt.saved_verified": "配置已写入并通过 NVS 回读校验（版本 {generation}）",
     "mqtt.broker_uri": "Broker URI",
     "mqtt.uri": "Broker URI",
-    "mqtt.client_id": "\u5ba2\u6237\u7aef ID",
     "mqtt.username": "\u7528\u6237\u540d\uff08\u53ef\u9009\uff09",
     "mqtt.password": "\u5bc6\u7801\uff08\u53ef\u9009\uff09",
     "mqtt.keepalive": "Keep-Alive\uff08\u79d2\uff09",
     "mqtt.qos": "\u9ed8\u8ba4 QoS \u7ea7\u522b",
     "mqtt.topic_prefix": "\u6570\u636e\u4e3b\u9898\u524d\u7f00",
     "mqtt.topic_hint": "\u53d1\u5e03\u4e3b\u9898\uff1a{prefix}/{client_id}/{device}/{point}",
-    "mqtt.test": "\u6d4b\u8bd5\u8fde\u63a5",
     "mqtt.disconnect": "\u65ad\u5f00\u8fde\u63a5",
     "mqtt.command_prefix": "\u547d\u4ee4\u4e3b\u9898\u524d\u7f00",
     "mqtt.clean_session": "\u6e05\u7406\u4f1a\u8bdd",
@@ -1832,6 +1834,7 @@ const I18N = {
     "logs.sequence": "\u5e8f\u53f7",
     "logs.time": "\u65e5\u671f\u65f6\u95f4",
     "logs.raw_registers": "\u539f\u59cb\u5bc4\u5b58\u5668",
+    "logs.time_unsynced": "\u65f6\u95f4\u672a\u540c\u6b65",
     "logs.frame": "\u539f\u59cb\u5e27",
     "logs.empty": "\u6682\u65e0\u5339\u914d\u7684\u901a\u4fe1\u8bb0\u5f55",
     "logs.cleared": "RS485 \u901a\u4fe1\u65e5\u5fd7\u5df2\u6e05\u7a7a",
@@ -1942,16 +1945,20 @@ const I18N = {
     'mqtt.status.throttled': 'Rate-limited',
     'mqtt.status.deferred': 'Deferred to Cache',
     'mqtt.status.last_publish': 'Last Publish',
+    'mqtt.status.cloud_response': 'Cloud Response',
+    'mqtt.status.upload_state': 'Upload State',
+    'mqtt.status.upload_active': 'Active',
+    'mqtt.status.upload_suspended': 'Suspended (cloud quota exhausted)',
+    'mqtt.connection_reason': 'Connection diagnosis',
+    'mqtt.saved_verified': 'Configuration persisted and verified in NVS (generation {generation})',
     'mqtt.broker_uri': 'Broker URI',
     'mqtt.uri': 'Broker URI',
-    'mqtt.client_id': 'Client ID',
     'mqtt.username': 'Username (optional)',
     'mqtt.password': 'Password (optional)',
     'mqtt.keepalive': 'Keep-Alive (seconds)',
     'mqtt.qos': 'Default QoS Level',
     'mqtt.topic_prefix': 'Data Topic Prefix',
     'mqtt.topic_hint': 'Published topics: {prefix}/{client_id}/{device}/{point}',
-    'mqtt.test': 'Test Connection',
     'mqtt.disconnect': 'Disconnect',
     'mqtt.command_prefix': 'Command Topic Prefix',
     'mqtt.clean_session': 'Clean Session',
@@ -2148,6 +2155,7 @@ const I18N = {
     'logs.sequence': 'Sequence',
     'logs.time': 'Date/Time',
     'logs.raw_registers': 'Raw Registers',
+    'logs.time_unsynced': 'time not synchronized',
     'logs.frame': 'Raw Frame',
     'logs.empty': 'No matching communication records',
     'logs.cleared': 'RS485 communication log cleared',
@@ -2254,6 +2262,7 @@ let systemState = {
   free_heap: 0,
   flash_size: 0,
   uptime_seconds: 0,
+  uptime_ms: 0,
   sequence_counter: 0,
 };
 
@@ -2354,6 +2363,30 @@ function formatNumericValue(value) {
   return number.toFixed(3).replace(/\.?0+$/, '');
 }
 
+function localizeMqttReason(reason) {
+  const raw = String(reason || '').trim();
+  if (!raw || currentLang !== 'zh') return raw || '-';
+  if (raw.includes('CONNACK 5') || raw.includes('authentication')) {
+    return '云平台拒绝鉴权（CONNACK 5）：请核对同一项目下的 AccessToken 与 ProjectKey';
+  }
+  if (raw.includes('insufficient contiguous internal SRAM')) {
+    return '内部 SRAM 连续空间不足，MQTT 任务无法启动';
+  }
+  if (raw.includes('resident MQTT task is waiting')) {
+    return '已停止自动重连，MQTT 常驻任务正在等待新配置';
+  }
+  if (raw.includes('configuration applied')) {
+    return '配置已应用，正在向云平台重新连接';
+  }
+  if (raw.includes('waiting for broker')) {
+    return 'MQTT 客户端已启动，正在等待云平台响应';
+  }
+  if (raw.includes('connected to broker')) {
+    return '已连接云平台';
+  }
+  return raw;
+}
+
 /* ============================================================
  * Dashboard
  * ============================================================ */
@@ -2375,10 +2408,16 @@ function updateDashboard() {
     mqttBadge.className = 'badge ' + (connected ? 'badge-success' : 'badge-danger');
     mqttBadge.innerHTML = `<span class="dot ${dot}"></span> ${label}`;
   }
-  // Only allow "Disconnect" when actually connected.
+  const mqttReason = document.getElementById('mqttConnectionReason');
+  if (mqttReason) {
+    mqttReason.textContent =
+      `${t('mqtt.connection_reason')}: ${localizeMqttReason(s.mqtt_last_reason)}`;
+  }
+  // A disconnected client may still be retrying and occupying the cloud
+  // identity. Keep Stop available until the connection is explicitly suspended.
   const mqttDisconnectBtn = document.getElementById('mqttDisconnectBtn');
   if (mqttDisconnectBtn) {
-    mqttDisconnectBtn.disabled = !s.mqtt_connected;
+    mqttDisconnectBtn.disabled = s.mqtt_suspended === true;
   }
   document.getElementById('statModbusPolls').textContent = s.total_polls;
   document.getElementById('statPublished').textContent = s.mqtt_published;
@@ -2865,10 +2904,10 @@ async function saveMqttConfig() {
     return;
   }
   const data = {
+    enabled: true,
     platform_type: isTC ? 'thingscloud' : 'custom',
     report_mode: reportMode,
     uri: document.getElementById('mqttUri').value,
-    client_id: document.getElementById('mqttClientId').value,
     username: document.getElementById('mqttUser').value,
     password: document.getElementById('mqttPass').value,
     keepalive: parseInt(document.getElementById('mqttKeepalive').value),
@@ -2883,17 +2922,27 @@ async function saveMqttConfig() {
     lwt_qos: parseInt(document.getElementById('mqttLwtQos').value),
     lwt_retain: document.getElementById('mqttLwtRetain').checked,
   };
-  const saved = await apiPut('/api/mqtt/config', data);
-  if (!saved) {
-    showToast(t('toast.error'), 'error');
+  const saved = await apiJson('PUT', '/api/mqtt/config', data, 12000);
+  if (!saved || saved.error || saved.persisted !== true) {
+    const message = saved?.error || t('toast.error');
+    showToast(message, 'error');
+    addLog('error', `[MQTT] Configuration persistence failed: ${message}`);
     return;
   }
+  const userInput = document.getElementById('mqttUser');
+  const passInput = document.getElementById('mqttPass');
+  userInput.value = '';
+  passInput.value = '';
+  userInput.placeholder = saved.username_masked || 'MQTT Username';
+  passInput.placeholder = saved.password_masked ? '********' : 'MQTT Password';
   window.__mqttPlatform = data.platform_type;
   window.__mqttEffectiveMode = data.report_mode;
   mappings = await apiGet('/api/mappings', 20000) || mappings;
   renderMappingTable();
-  showToast(t('toast.saved'), 'success');
-  addLog('info', `[MQTT] Configuration saved: platform=${data.platform_type} URI=${data.uri}`);
+  const generation = saved.nvs_generation ?? '-';
+  const verifiedMessage = t('mqtt.saved_verified').replace('{generation}', generation);
+  showToast(verifiedMessage, 'success');
+  addLog('info', `[MQTT] Configuration persisted: generation=${generation} platform=${data.platform_type} URI=${data.uri}`);
   addLog('info', t('mqtt.report_mode.restart_hint'));
   const effEl = document.getElementById('reportModeEffective');
   if (effEl) effEl.textContent = `${t('mqtt.report_mode.effective')}: ${t('mqtt.report_mode.' + data.report_mode + '.short')}`;
@@ -2941,7 +2990,7 @@ async function persistModbusConfig(notifyUser = true) {
   const result = await apiJson('PUT', '/api/modbus/config', data);
   if (result && !result.error) {
     if (notifyUser) showToast(t('toast.saved'), 'success');
-    addLog('info', `[MODBUS] Configuration saved: baud=${data.baudrate} parity=${data.parity} TCP=${data.tcp_endpoints.length}`);
+    addLog('info', `[MODBUS] Configuration saved: baud=${data.baudrate} parity=${data.parity} poll=${data.poll_interval}ms TCP=${data.tcp_endpoints.length}`);
     return true;
   }
   const message = result?.error || t('toast.error');
@@ -2952,33 +3001,6 @@ async function persistModbusConfig(notifyUser = true) {
 
 async function saveModbusConfig() {
   await persistModbusConfig(true);
-}
-
-async function testMqttConnection() {
-  const uri = document.getElementById('mqttUri').value.trim();
-  if (!uri) {
-    showToast(currentLang === 'zh' ? '请先填写 Broker URI' : 'Enter a broker URI first', 'error');
-    addLog('error', '[MQTT] Connection test: missing broker URI');
-    return;
-  }
-  const btn = event && event.target ? event.target : null;
-  if (btn) { btn.disabled = true; }
-  addLog('info', `[MQTT] Connection test: probing ${uri} ...`);
-  const result = await apiJson('POST', '/api/mqtt/test', {
-    uri: uri,
-    username: document.getElementById('mqttUser').value,
-    password: document.getElementById('mqttPass').value,
-    timeout_ms: 8000
-  }, 15000);
-  if (btn) { btn.disabled = false; }
-  if (result && result.success) {
-    showToast(currentLang === 'zh' ? '连接成功：Broker 已响应' : 'Connected: broker responded', 'success');
-    addLog('ok', '[MQTT] Connection test: OK (broker responded)');
-  } else {
-    const message = (result && (result.error || result.message)) || (currentLang === 'zh' ? '未知错误' : 'unknown error');
-    showToast((currentLang === 'zh' ? '连接失败：' : 'Connection failed: ') + message, 'error');
-    addLog('error', `[MQTT] Connection test: FAIL (${message})`);
-  }
 }
 
 async function disconnectMqtt() {
@@ -3116,19 +3138,38 @@ function filteredModbusLogs() {
   });
 }
 
-function formatDateTime(timestampMs, eventUptimeMs) {
-  let value = Number(timestampMs);
-  if (!Number.isFinite(value) || value < 1577836800000) {
-    const eventUptime = Number(eventUptimeMs);
-    const currentUptime = Number(systemState.uptime_seconds) * 1000;
-    value = Number.isFinite(eventUptime) && currentUptime >= eventUptime
-      ? Date.now() - currentUptime + eventUptime
-      : Date.now();
-  }
+let estimatedBootEpochMs = null;
+let estimatedBootCount = null;
+
+function formatEpochDateTime(value, estimated = false) {
   const date = new Date(value);
   const pad = number => String(number).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ` +
+  return `${estimated ? '~' : ''}${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ` +
     `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatDateTime(timestampMs, eventUptimeMs) {
+  const value = Number(timestampMs);
+  if (Number.isFinite(value) && value >= 1577836800000) {
+    return formatEpochDateTime(value);
+  }
+
+  const uptimeMs = Number(eventUptimeMs);
+  if (Number.isFinite(uptimeMs) && uptimeMs >= 0 &&
+      Number.isFinite(estimatedBootEpochMs)) {
+    return formatEpochDateTime(estimatedBootEpochMs + uptimeMs, true);
+  }
+
+  if (!Number.isFinite(value) || value < 1577836800000) {
+    if (!Number.isFinite(uptimeMs) || uptimeMs < 0) return '-';
+    const totalSeconds = Math.floor(uptimeMs / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const pad = number => String(number).padStart(2, '0');
+    return `T+${pad(hours)}:${pad(minutes)}:${pad(seconds)} (${t('logs.time_unsynced')})`;
+  }
+  return '-';
 }
 
 function renderModbusLogs() {
@@ -3243,6 +3284,19 @@ async function refreshAll() {
     const status = await apiGet('/api/system/status');
     if (status) {
       Object.assign(systemState, status);
+      uptimeStart = Date.now();
+      const bootCount = Number(status.boot_count);
+      const uptimeMs = Number(status.uptime_ms);
+      if (!status.time_synchronized && Number.isFinite(uptimeMs)) {
+        if (estimatedBootEpochMs === null ||
+            estimatedBootCount !== bootCount) {
+          estimatedBootEpochMs = Date.now() - uptimeMs;
+          estimatedBootCount = bootCount;
+        }
+      } else if (status.time_synchronized) {
+        estimatedBootEpochMs = null;
+        estimatedBootCount = bootCount;
+      }
     }
 
     if (activePage === 'page-mapping') {
@@ -3408,7 +3462,6 @@ async function loadRuntimeForms() {
   const mqtt = await apiGet('/api/mqtt/config');
   if (mqtt) {
     document.getElementById('mqttUri').value = mqtt.uri || '';
-    document.getElementById('mqttClientId').value = mqtt.client_id || '';
     document.getElementById('mqttPlatform').value = mqtt.platform_type === 'thingscloud' ? 'thingscloud' : 'custom';
     window.__mqttPlatform = mqtt.platform_type === 'thingscloud'
       ? 'thingscloud' : 'custom';
@@ -3447,6 +3500,13 @@ async function loadRuntimeForms() {
     document.getElementById('tcLastPublish').textContent = lastPublish > 0
       ? `${Math.floor(lastPublish / 1000)} s`
       : '-';
+    const responseCode = Number(mqtt.cloud_last_response_code || 0);
+    document.getElementById('tcCloudResponse').textContent =
+      responseCode > 0 ? String(responseCode) : '-';
+    document.getElementById('tcUploadState').textContent =
+      mqtt.cloud_upload_suspended
+        ? t('mqtt.status.upload_suspended')
+        : t('mqtt.status.upload_active');
     applyMqttPlatformUI();
     applyReportModeUI();
   }
@@ -3455,6 +3515,10 @@ async function loadRuntimeForms() {
     document.getElementById('mbBaudrate').value = modbus.baudrate || 9600;
     document.getElementById('mbParity').value = ({0:'none',2:'even',3:'odd'})[modbus.parity] || 'none';
     document.getElementById('mbTimeout').value = modbus.timeout || 1000;
+    document.getElementById('mbPollInterval').value =
+      Number.isFinite(Number(modbus.poll_interval))
+        ? Number(modbus.poll_interval)
+        : 1000;
     tcpEndpoints = Array.isArray(modbus.tcp_endpoints) ? modbus.tcp_endpoints : [];
     const server = modbus.tcp_server || {};
     document.getElementById('tcpServerEnabled').checked = server.enabled === true;

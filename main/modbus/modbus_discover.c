@@ -1198,7 +1198,7 @@ static int apply_embedded_semantic_profile(bool *matched_devices)
             entry->scale_factor = profile_number(reg, "scale", 1.0f);
             entry->offset = profile_number(reg, "offset", 0.0f);
             entry->poll_interval_ms =
-                cJSON_IsNumber(poll) ? (uint32_t)poll->valuedouble : 1000;
+                cJSON_IsNumber(poll) ? (uint32_t)poll->valuedouble : 0;
             entry->priority =
                 cJSON_IsNumber(priority) ? (uint8_t)priority->valuedouble : 5;
             entry->read_start_address = entry->register_address;

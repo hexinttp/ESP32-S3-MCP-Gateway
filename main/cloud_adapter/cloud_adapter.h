@@ -119,9 +119,14 @@ typedef struct {
     uint32_t throttled_count;
     uint32_t dropped_count;
     int64_t last_publish_ms;
+    int last_response_code;
+    bool upload_suspended;
 } thingscloud_runtime_status_t;
 
 void thingscloud_get_runtime_status(thingscloud_runtime_status_t *out);
+void thingscloud_record_publish_response(bool accepted, int error_code);
+void thingscloud_clear_publish_guard(void);
+bool thingscloud_upload_is_suspended(void);
 
 /* Called by the MQTT layer on (re)connect to re-report online sub-devices. */
 void thingscloud_on_mqtt_connected(void);
@@ -133,6 +138,9 @@ bool thingscloud_is_enabled(void);
 void thingscloud_on_attributes_push(const char *topic, const char *data, int data_len);
 void thingscloud_on_command_send(const char *topic, const char *data, int data_len);
 void thingscloud_on_gateway_attributes_push(const char *topic, const char *data, int data_len);
+void thingscloud_on_attributes_response(const char *topic, const char *data, int data_len);
+void thingscloud_on_gateway_attributes_response(const char *topic, const char *data,
+                                                int data_len);
 
 /* Mask a sensitive credential for logging: shows first4****last4. */
 void thingscloud_mask_credential(const char *src, char *out, size_t out_size);

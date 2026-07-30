@@ -20,7 +20,8 @@ typedef enum {
 
 typedef struct {
     uint32_t sequence;
-    int64_t timestamp_ms;
+    int64_t timestamp_ms;   /* Fixed Unix epoch time, or 0 before time sync. */
+    int64_t uptime_ms;      /* Fixed monotonic event time since boot. */
     modbus_comm_direction_t direction;
     uint8_t slave_id;
     uint8_t function_code;
@@ -44,6 +45,8 @@ void modbus_comm_log_add(modbus_comm_direction_t direction,
 int modbus_comm_log_snapshot(modbus_comm_log_entry_t *out, int max_entries);
 int modbus_comm_log_count(void);
 bool modbus_comm_log_get(int index, modbus_comm_log_entry_t *out);
+void modbus_comm_log_anchor_wall_time(int64_t wall_now_ms,
+                                      int64_t uptime_now_ms);
 void modbus_comm_log_clear(void);
 
 #ifdef __cplusplus

@@ -7,11 +7,20 @@
 #include "storage/offline_store.h"
 #include "config/runtime_config.h"
 #include "cloud_adapter/cloud_adapter.h"
+#include "esp_timer.h"
 
 static const char *TAG = "UIF";
 static bool s_initialized;
 static volatile bool s_replay_outstanding;
 static volatile uint32_t s_replay_sequence;
+static volatile bool s_replay_gateway_topic;
+static volatile int64_t s_replay_sent_ms;
+static volatile int64_t s_replay_retry_after_ms;
+
+#define UIF_CLOUD_RESPONSE_TIMEOUT_MS 20000
+#define UIF_CLOUD_REJECT_RETRY_MS     60000
+#define UIF_CLOUD_INVALID_RETRY_MS    300000
+#define UIF_CLOUD_PACING_RETRY_MS     30000
 
 static void replay_acknowledged(uint32_t sequence_id)
 {
@@ -19,7 +28,11 @@ static void replay_acknowledged(uint32_t sequence_id)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Replay acknowledged and removed: seq=%lu", (unsigned long)sequence_id);
     }
-    if (s_replay_sequence == sequence_id) s_replay_outstanding = false;
+    if (s_replay_sequence == sequence_id) {
+        s_replay_outstanding = false;
+        s_replay_sequence = 0;
+        s_replay_sent_ms = 0;
+    }
 }
 
 esp_err_t uif_init(void)
@@ -80,7 +93,17 @@ esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue)
 {
     (void)mqtt_out_queue;
     if (!s_initialized || !mqtt_is_connected()) return ESP_ERR_INVALID_STATE;
-    if (s_replay_outstanding) return ESP_OK;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_replay_outstanding) {
+        if (now_ms - s_replay_sent_ms < UIF_CLOUD_RESPONSE_TIMEOUT_MS) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Cloud replay response timed out; retaining seq=%lu",
+                 (unsigned long)s_replay_sequence);
+        s_replay_outstanding = false;
+        s_replay_retry_after_ms = now_ms + UIF_CLOUD_REJECT_RETRY_MS;
+    }
+    if (now_ms < s_replay_retry_after_ms) return ESP_ERR_TIMEOUT;
 
     runtime_config_t runtime;
     runtime_config_get(&runtime);
@@ -96,14 +119,20 @@ esp_err_t uif_replay_all(QueueHandle_t mqtt_out_queue)
                      (unsigned long)record.sequence_id);
             return ESP_ERR_INVALID_RESPONSE;
         }
+        s_replay_sequence = record.sequence_id;
+        s_replay_gateway_topic =
+            runtime.mqtt.report_mode == MQ_REPORT_GATEWAY;
+        s_replay_sent_ms = now_ms;
+        s_replay_outstanding = true;
         err = thingscloud_replay_context(&ctx);
-        if (err != ESP_OK) return err;
-        err = offline_store_remove(record.sequence_id);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "ThingsCloud replay accepted and removed: seq=%lu",
-                     (unsigned long)record.sequence_id);
+        if (err != ESP_OK) {
+            s_replay_outstanding = false;
+            s_replay_retry_after_ms = now_ms + UIF_CLOUD_PACING_RETRY_MS;
+            return err;
         }
-        return err;
+        ESP_LOGI(TAG, "ThingsCloud replay sent; awaiting platform response: seq=%lu",
+                 (unsigned long)record.sequence_id);
+        return ESP_OK;
     }
 
     int scheduled = 0;
@@ -132,5 +161,42 @@ void uif_replay_connection_lost(void)
 {
     s_replay_outstanding = false;
     s_replay_sequence = 0;
+    s_replay_sent_ms = 0;
 }
-void uif_destroy(void) { s_initialized = false; s_replay_outstanding = false; }
+
+bool uif_replay_is_waiting_response(void)
+{
+    return s_replay_outstanding;
+}
+
+void uif_replay_cloud_response(bool gateway_topic, bool accepted, int error_code)
+{
+    if (!s_replay_outstanding || gateway_topic != s_replay_gateway_topic) return;
+
+    uint32_t sequence_id = s_replay_sequence;
+    if (accepted) {
+        replay_acknowledged(sequence_id);
+        s_replay_retry_after_ms = 0;
+        return;
+    }
+
+    s_replay_outstanding = false;
+    s_replay_sequence = 0;
+    s_replay_sent_ms = 0;
+    int64_t delay_ms = (error_code == 402 || error_code == 406 ||
+                        error_code == 413)
+        ? UIF_CLOUD_INVALID_RETRY_MS
+        : UIF_CLOUD_REJECT_RETRY_MS;
+    s_replay_retry_after_ms = esp_timer_get_time() / 1000 + delay_ms;
+    ESP_LOGW(TAG, "Cloud rejected replay seq=%lu errcode=%d; retained for retry",
+             (unsigned long)sequence_id, error_code);
+}
+
+void uif_destroy(void)
+{
+    s_initialized = false;
+    s_replay_outstanding = false;
+    s_replay_sequence = 0;
+    s_replay_sent_ms = 0;
+    s_replay_retry_after_ms = 0;
+}

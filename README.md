@@ -1,6 +1,6 @@
 # ESP32-S3 TCM/AMM/UIF Industrial Gateway
 
-## 2026-07-29 Development Status
+## 2026-07-30 Development Status
 
 This revision consolidates the gateway, ThingsCloud, MCP management, AMM cloud
 routing, rule-engine, health-monitoring, and UIF recovery work completed during
@@ -20,6 +20,9 @@ hardware integration on the ESP32-S3 board.
   used as overflow storage when present.
 - Chinese/English Web UI, MCP management, rule engine, MQTT logs and health
   counters.
+- Fixed system and RS485 communication log event times. Each record keeps both
+  monotonic uptime and Unix epoch time; records created before SNTP sync are
+  anchored once and never recalculated on page refresh.
 - Firmware builds with ESP-IDF 5.3.1 and flashes successfully through COM9.
 
 ### MQTT integration status
@@ -34,12 +37,13 @@ hardware integration on the ESP32-S3 board.
 - MQTT.fx and the gateway must not use the same ThingsCloud device credentials
   simultaneously because the platform permits only one connection per device
   identity.
-- Runtime MQTT reconfiguration still requires a production connection-manager
-  refactor. The present 20 KB MQTT task stack can be allocated during cold boot,
-  but internal SRAM fragmentation can prevent client recreation after a live
-  configuration change. The planned implementation uses one long-lived client
-  owner, a non-blocking command queue, explicit maintenance mode, and
-  error-class-specific exponential backoff.
+- Runtime configuration is saved transactionally to NVS and applied through one
+  long-lived MQTT owner task. Reconnect, stop and reconfigure requests are
+  serialized, so the Web API never creates a competing MQTT client session.
+- Disconnect classification, bounded exponential reconnect backoff and
+  connection counters are exposed to the Web UI and system status API.
+- UIF records accumulated while disconnected are replayed in sequence after the
+  cloud session recovers, using the current cloud platform and reporting mode.
 
 ### Resource and reliability policy
 
@@ -49,6 +53,9 @@ hardware integration on the ESP32-S3 board.
   queue; TF remains optional overflow/history storage.
 - Watchdog, reset reason, minimum heap, largest internal block, cache usage and
   online/offline device counts are exposed through `/api/system/status`.
+- SNTP starts after the network is ready and supports two configured servers.
+  Until synchronization succeeds, the Web UI prefixes browser-anchored dates
+  with `~`; after synchronization, logs use the fixed device epoch timestamp.
 - Local `test_logs/` artifacts are intentionally excluded from Git.
 
 本项目是面向 ESP32-S3 的 MODBUS-MQTT 工业协议网关固件，采用 ESP-IDF 5.3.1 和 FreeRTOS 开发。网关将 MODBUS RTU/TCP 数据转换为固定 TCM 上下文，通过 MQTT 发布，并提供动态 AMM 映射、UIF 离线恢复、Web 配置、LCD 状态菜单、TF 历史记录、离线自动化决策和 MCP 工具接口。当前版本新增 ThingsCloud 云平台适配层，支持以"网关 + 子设备"模型将 TCM 数据聚合上报到 ThingsCloud。
@@ -56,6 +63,8 @@ hardware integration on the ESP32-S3 board.
 当前版本已经在带 16 MB Flash、8 MB PSRAM 的 ESP32-S3 实物开发板上完成烧录，并使用真实 RS485 温湿度传感器、PC 端 RTU 仿真器和 Modbus TCP 仿真器完成设备发现与寄存器读取测试。
 
 本次工业化功能扩展已再次在实板验证：固件可稳定启动并保持运行，WiFi 获取地址 `192.168.100.22`，Web 首页局域网首次响应约 117 ms，配置 API 返回 HTTP 200，北向 MODBUS TCP Server 的 502 端口可连接并返回标准异常响应。未配置有效 MQTT Broker 时 MQTT 保持停用；未插 TF 卡时系统继续使用 SPI Flash 缓存，这两种状态都不会阻塞网关启动。
+
+2026-07-30 联调版本进一步完成了 MQTT 单实例连接管理、配置事务化写入 NVS、运行时安全重连、断网缓存顺序补传、Modbus 轮询周期即时应用，以及系统日志与 RS485 通信日志的固定事件时间。日志在设备尚未完成 SNTP 同步时同时保留单调运行时间，Web 页面只建立一次固定时间锚点并以 `~` 标识估算日期；同步成功后改用 ESP32 记录的真实日期时间，历史记录不会因页面刷新而变化。
 
 ## 工业化优先级完成情况
 
