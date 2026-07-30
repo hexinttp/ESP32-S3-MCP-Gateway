@@ -1,11 +1,16 @@
 #include "modbus/modbus_comm_log.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include "board/tf_storage.h"
+#include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "services/time_service.h"
+#include "storage/log_store.h"
 
 static modbus_comm_log_entry_t s_entries[MODBUS_COMM_LOG_CAPACITY];
 static SemaphoreHandle_t s_mutex;
@@ -61,7 +66,97 @@ void modbus_comm_log_add(modbus_comm_direction_t direction,
 
     s_next = (uint16_t)((s_next + 1) % MODBUS_COMM_LOG_CAPACITY);
     if (s_count < MODBUS_COMM_LOG_CAPACITY) ++s_count;
+
+    /* Format the on-disk/export line while the slot is still ours; it may be
+     * reused by a following add() once we drop the lock. */
+    char line[256];
+    modbus_comm_log_format_line(entry, line, sizeof(line));
     xSemaphoreGive(s_mutex);
+
+    /* Mirror the entry to the SD card (if mounted) for later export. */
+    if (tf_storage_is_mounted() && line[0] != '\0') {
+        log_store_append_modbus(line, uptime_ms);
+    }
+}
+
+/* Format an entry the same way it is stored on the SD card, so the live RAM
+ * tail can be concatenated onto the SD history during a full export without
+ * any parsing. */
+void modbus_comm_log_format_line(const modbus_comm_log_entry_t *e, char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) { if (buf) buf[0] = '\0'; return; }
+    if (e == NULL) { buf[0] = '\0'; return; }
+
+    char ts[40];
+    if (e->timestamp_ms > 0) {
+        time_t sec = (time_t)(e->timestamp_ms / 1000);
+        int ms = (int)(e->timestamp_ms % 1000);
+        struct tm tm_info;
+        if (localtime_r(&sec, &tm_info) != NULL) {
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
+            int n = (int)strlen(ts);
+            snprintf(ts + n, sizeof(ts) - (size_t)n, ".%03d", ms);
+        } else {
+            snprintf(ts, sizeof(ts), "U%lld", (long long)e->uptime_ms);
+        }
+    } else {
+        snprintf(ts, sizeof(ts), "U%lld", (long long)e->uptime_ms);
+    }
+
+    const char *dir = (e->direction == MODBUS_COMM_TX) ? "TX" : "RX";
+    const char *st  = (e->status == ESP_OK) ? "OK" : esp_err_to_name(e->status);
+    char hex[MODBUS_COMM_FRAME_MAX * 3 + 1];
+    size_t h = 0;
+    for (uint8_t i = 0; i < e->frame_length && h < sizeof(hex) - 1; ++i) {
+        h += (size_t)snprintf(hex + h, sizeof(hex) - h, "%02X", e->frame[i]);
+    }
+    snprintf(buf, len,
+             "%s [%s] slave=%u fn=0x%02X addr=%u cnt=%u len=%u status=%s frame=%s%s\n",
+             ts, dir, e->slave_id, e->function_code, e->register_address,
+             e->register_count, e->frame_length, st, hex,
+             e->truncated ? "(trunc)" : "");
+}
+
+/*
+ * Invoke @p cb for every RAM-buffer entry whose uptime is greater than
+ * @p min_uptime_ms (i.e. not yet persisted to the SD card), in chronological
+ * order. Used by the combined export so the live tail is appended after the
+ * SD history without duplicating what is already on the card.
+ */
+void modbus_comm_log_iterate_tail(int64_t min_uptime_ms,
+                                  void (*cb)(const char *line, void *arg),
+                                  void *arg)
+{
+    modbus_comm_log_init();
+    if (s_mutex == NULL || cb == NULL) return;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+
+    uint16_t oldest = (uint16_t)((s_next + MODBUS_COMM_LOG_CAPACITY - s_count)
+                                 % MODBUS_COMM_LOG_CAPACITY);
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < s_count; ++i) {
+        if (s_entries[(oldest + i) % MODBUS_COMM_LOG_CAPACITY].uptime_ms
+                > min_uptime_ms) {
+            ++n;
+        }
+    }
+    modbus_comm_log_entry_t *copy = (n > 0) ? calloc(n, sizeof(*copy)) : NULL;
+    uint16_t k = 0;
+    if (copy != NULL) {
+        for (uint16_t i = 0; i < s_count; ++i) {
+            modbus_comm_log_entry_t *e =
+                &s_entries[(oldest + i) % MODBUS_COMM_LOG_CAPACITY];
+            if (e->uptime_ms > min_uptime_ms) copy[k++] = *e;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+
+    for (uint16_t i = 0; i < k; ++i) {
+        char line[256];
+        modbus_comm_log_format_line(&copy[i], line, sizeof(line));
+        cb(line, arg);
+    }
+    free(copy);
 }
 
 int modbus_comm_log_snapshot(modbus_comm_log_entry_t *out, int max_entries)

@@ -8,6 +8,7 @@
          "network/network_manager.c"
          "storage/offline_store.c"
          "storage/history_store.c"
+         "storage/log_store.c"
          "tcm/tcm_context.c"
          "tcm/tcm_state_pool.c"
          "semantic/semantic_inference.c"
@@ -31,6 +32,7 @@
          "automation/automation_engine.c"
          "automation/automation_web.c"
          "mcp/mcp_http.c"
+         "mcp/mcp_token_store.c"
          "web/web_server.c"
     INCLUDE_DIRS "." "web" "cloud_adapter" "thingscloud"
     REQUIRES driver esp_wifi esp_event esp_netif esp_eth lwip nvs_flash mqtt esp-modbus esp_timer

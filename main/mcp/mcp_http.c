@@ -3,26 +3,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "amm/amm_mapping.h"
 #include "automation/automation_engine.h"
 #include "cJSON.h"
 #include "config/runtime_config.h"
 #include "esp_timer.h"
+#include "freertos/portmacro.h"
 #include "mbedtls/sha256.h"
+#include "mcp/mcp_token_store.h"
 #include "modbus/modbus_discover.h"
 #include "services/control_service.h"
 #include "tcm/tcm_context.h"
 #include "tcm/tcm_state_pool.h"
 #include "uif/uif_persistence.h"
 
-#define MCP_AUTH_MAX_FAILURES 5
-#define MCP_AUTH_LOCKOUT_MS 30000
+/* Per-source rate limiting. The original MCP implementation used a single
+ * global failure counter with a global lockout: any client that failed N
+ * times would lock out *every* MCP client (a trivial denial-of-service). We
+ * now track failures per originating IP, so an attacker can only throttle
+ * themselves. */
+#define MCP_RL_BUCKETS 16
+#define MCP_RL_MAX_FAILURES 8
+#define MCP_RL_LOCKOUT_MS 30000
 
-static uint8_t s_auth_failures;
+typedef struct {
+    uint32_t peer;             /* IPv4 host-order, 0 = empty */
+    uint8_t failures;
+    int64_t lock_until_ms;
+} mcp_rl_t;
+
+static mcp_rl_t s_rl[MCP_RL_BUCKETS];
+static portMUX_TYPE s_rl_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static uint32_t s_authorized_requests;
 static uint32_t s_auth_failure_total;
 static int64_t s_last_authorized_ms;
-static int64_t s_auth_locked_until_ms;
 
 static void sha256_hex(const char *text, char output[65])
 {
@@ -34,32 +53,100 @@ static void sha256_hex(const char *text, char output[65])
     output[64] = '\0';
 }
 
-static bool constant_time_equal(const char *left, const char *right, size_t size)
+static uint32_t peer_ip_key(httpd_req_t *req)
 {
-    unsigned char difference = 0;
-    for (size_t i = 0; i < size; ++i) {
-        difference |= (unsigned char)left[i] ^ (unsigned char)right[i];
-    }
-    return difference == 0;
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return 0;
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0) return 0;
+    if (addr.sin_family != AF_INET) return 0;
+    return ntohl(addr.sin_addr.s_addr);
 }
 
-static esp_err_t require_mcp_authorization(httpd_req_t *req)
+/* Returns ESP_OK if the peer is allowed to attempt authentication, or
+ * ESP_ERR_TIMEOUT if it is currently locked out (with lock_remaining filled). */
+static esp_err_t mcp_rl_check(uint32_t peer, int64_t now_ms, int64_t *lock_remaining)
+{
+    *lock_remaining = 0;
+    portENTER_CRITICAL(&s_rl_mux);
+    int idx = -1, empty = -1;
+    for (int i = 0; i < MCP_RL_BUCKETS; ++i) {
+        if (s_rl[i].peer == peer) { idx = i; break; }
+        if (s_rl[i].peer == 0 && empty < 0) empty = i;
+    }
+    if (idx < 0) idx = (empty >= 0) ? empty : (int)(peer % MCP_RL_BUCKETS);
+    if (s_rl[idx].peer != peer) {
+        s_rl[idx].peer = peer;
+        s_rl[idx].failures = 0;
+        s_rl[idx].lock_until_ms = 0;
+    }
+    esp_err_t r = ESP_OK;
+    if (s_rl[idx].lock_until_ms > now_ms) {
+        r = ESP_ERR_TIMEOUT;
+        *lock_remaining = s_rl[idx].lock_until_ms - now_ms;
+    }
+    portEXIT_CRITICAL(&s_rl_mux);
+    return r;
+}
+
+static void mcp_rl_fail(uint32_t peer, int64_t now_ms)
+{
+    portENTER_CRITICAL(&s_rl_mux);
+    int idx = -1, empty = -1;
+    for (int i = 0; i < MCP_RL_BUCKETS; ++i) {
+        if (s_rl[i].peer == peer) { idx = i; break; }
+        if (s_rl[i].peer == 0 && empty < 0) empty = i;
+    }
+    if (idx < 0) idx = (empty >= 0) ? empty : (int)(peer % MCP_RL_BUCKETS);
+    if (s_rl[idx].peer != peer) {
+        s_rl[idx].peer = peer;
+        s_rl[idx].failures = 0;
+        s_rl[idx].lock_until_ms = 0;
+    }
+    if (++s_rl[idx].failures >= MCP_RL_MAX_FAILURES) {
+        s_rl[idx].lock_until_ms = now_ms + MCP_RL_LOCKOUT_MS;
+    }
+    portEXIT_CRITICAL(&s_rl_mux);
+}
+
+static void mcp_rl_ok(uint32_t peer)
+{
+    portENTER_CRITICAL(&s_rl_mux);
+    for (int i = 0; i < MCP_RL_BUCKETS; ++i) {
+        if (s_rl[i].peer == peer) {
+            s_rl[i].failures = 0;
+            s_rl[i].lock_until_ms = 0;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_rl_mux);
+}
+
+/* Authenticate the bearer token against the dedicated MCP token store. On
+ * success fills `out_token` (used by the caller for scope checks) and returns
+ * ESP_OK. Rate limiting is per-peer so a single misbehaving client cannot lock
+ * out the others. */
+static esp_err_t require_mcp_authorization(httpd_req_t *req, mcp_token_t *out_token)
 {
     runtime_config_t config;
     runtime_config_get(&config);
-    if (!config.security.auth_enabled ||
-        strlen(config.security.password_sha256) != 64) {
+    if (!config.security.auth_enabled) {
         httpd_resp_set_status(req, "403 Forbidden");
         httpd_resp_sendstr(req, "MCP access is disabled until authentication is configured");
         return ESP_ERR_NOT_ALLOWED;
     }
 
+    uint32_t peer = peer_ip_key(req);
     int64_t now_ms = esp_timer_get_time() / 1000;
-    if (now_ms < s_auth_locked_until_ms) {
+    int64_t lock_remaining = 0;
+    if (mcp_rl_check(peer, now_ms, &lock_remaining) != ESP_OK) {
         httpd_resp_set_status(req, "429 Too Many Requests");
-        httpd_resp_set_hdr(req, "Retry-After", "30");
-        httpd_resp_sendstr(req, "MCP authentication is temporarily locked");
-        return ESP_ERR_TIMEOUT;
+        char retry[24];
+        snprintf(retry, sizeof(retry), "%lld", (long long)(lock_remaining / 1000 + 1));
+        httpd_resp_set_hdr(req, "Retry-After", retry);
+        httpd_resp_sendstr(req, "Too many authentication failures from this address");
+        return ESP_ERR_NOT_ALLOWED;
     }
 
     char authorization[192] = {0};
@@ -67,26 +154,24 @@ static esp_err_t require_mcp_authorization(httpd_req_t *req)
         httpd_req_get_hdr_value_str(req, "Authorization", authorization,
                                     sizeof(authorization)) == ESP_OK &&
         strncmp(authorization, "Bearer ", 7) == 0;
-    char digest[65] = {0};
+    mcp_token_t token;
     if (accepted) {
+        char digest[65] = {0};
         sha256_hex(authorization + 7, digest);
-        accepted = constant_time_equal(digest, config.security.password_sha256, 64);
+        accepted = (mcp_token_authenticate(digest, &token) == ESP_OK);
     }
     if (!accepted) {
         ++s_auth_failure_total;
-        if (++s_auth_failures >= MCP_AUTH_MAX_FAILURES) {
-            s_auth_failures = 0;
-            s_auth_locked_until_ms = now_ms + MCP_AUTH_LOCKOUT_MS;
-        }
+        mcp_rl_fail(peer, now_ms);
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
         httpd_resp_sendstr(req, "Unauthorized");
         return ESP_ERR_NOT_ALLOWED;
     }
-    s_auth_failures = 0;
-    s_auth_locked_until_ms = 0;
+    mcp_rl_ok(peer);
     ++s_authorized_requests;
     s_last_authorized_ms = now_ms;
+    if (out_token != NULL) *out_token = token;
     return ESP_OK;
 }
 
@@ -161,24 +246,33 @@ static cJSON *tools_list_result(void)
              "{\"slave_start\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247},\"slave_end\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247}}", NULL);
     add_tool(tools, "get_gateway_config", "Read non-secret gateway runtime configuration", "{}", NULL);
     add_tool(tools, "get_cache_status", "Read UIF offline cache and replay status", "{}", NULL);
-    add_tool(tools, "configure_rule_from_natural_language",
-             "Translate the user's natural-language request into this structured rule. "
-             "Call first with confirmed=false, show the returned preview to the user, "
-             "and call again with confirmed=true only after explicit user confirmation.",
-             "{\"rule_name\":{\"type\":\"string\"},"
-             "\"source_device\":{\"type\":\"string\"},\"source_point\":{\"type\":\"string\"},"
-             "\"operator\":{\"type\":\"string\",\"enum\":[\"gt\",\"gte\",\"lt\",\"lte\",\"eq\",\"neq\"]},"
-             "\"threshold\":{\"type\":\"number\"},\"hysteresis\":{\"type\":\"number\",\"minimum\":0},"
-             "\"hold_ms\":{\"type\":\"integer\",\"minimum\":0},"
-             "\"cooldown_ms\":{\"type\":\"integer\",\"minimum\":200},"
-             "\"action\":{\"type\":\"string\",\"enum\":[\"mqtt_alert\",\"write_point\"]},"
-             "\"target_device\":{\"type\":\"string\"},\"target_point\":{\"type\":\"string\"},"
-             "\"target_value\":{\"type\":\"number\"},\"alert_topic\":{\"type\":\"string\"},"
-             "\"alert_message\":{\"type\":\"string\"},\"interlock_device\":{\"type\":\"string\"},"
-             "\"interlock_point\":{\"type\":\"string\"},\"interlock_required_state\":{\"type\":\"boolean\"},"
-             "\"enabled\":{\"type\":\"boolean\"},\"confirmed\":{\"type\":\"boolean\"}}",
-             "[\"rule_name\",\"source_device\",\"source_point\",\"operator\",\"threshold\","
-             "\"action\",\"confirmed\"]");
+    /* Two-phase rule configuration: preview always validates and returns a
+     * structured preview without persisting; commit re-validates and persists.
+     * This removes the implicit "confirmed=true" single-shot write path. */
+    const char *rule_props =
+        "{\"rule_name\":{\"type\":\"string\"},"
+        "\"source_device\":{\"type\":\"string\"},\"source_point\":{\"type\":\"string\"},"
+        "\"operator\":{\"type\":\"string\",\"enum\":[\"gt\",\"gte\",\"lt\",\"lte\",\"eq\",\"neq\"]},"
+        "\"threshold\":{\"type\":\"number\"},\"hysteresis\":{\"type\":\"number\",\"minimum\":0},"
+        "\"hold_ms\":{\"type\":\"integer\",\"minimum\":0},"
+        "\"cooldown_ms\":{\"type\":\"integer\",\"minimum\":200},"
+        "\"action\":{\"type\":\"string\",\"enum\":[\"mqtt_alert\",\"write_point\"]},"
+        "\"target_device\":{\"type\":\"string\"},\"target_point\":{\"type\":\"string\"},"
+        "\"target_value\":{\"type\":\"number\"},\"alert_topic\":{\"type\":\"string\"},"
+        "\"alert_message\":{\"type\":\"string\"},\"interlock_device\":{\"type\":\"string\"},"
+        "\"interlock_point\":{\"type\":\"string\"},\"interlock_required_state\":{\"type\":\"boolean\"},"
+        "\"enabled\":{\"type\":\"boolean\"}}";
+    const char *rule_required =
+        "[\"rule_name\",\"source_device\",\"source_point\",\"operator\",\"threshold\",\"action\"]";
+    add_tool(tools, "rule_preview",
+             "Validate a natural-language rule and return a structured preview "
+             "without persisting it. Always call this first and show the result "
+             "to the user before rule_commit.",
+             rule_props, rule_required);
+    add_tool(tools, "rule_commit",
+             "Persist a previously previewed rule. Re-validates all numeric "
+             "boundaries before writing.",
+             rule_props, rule_required);
     return result;
 }
 
@@ -279,7 +373,11 @@ static cJSON *rule_response(const automation_rule_t *rule, bool valid,
     return response;
 }
 
-static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
+/* Validate and optionally persist a rule. When `commit` is false the function
+ * only validates and returns a preview (the rule_preview tool). When true it
+ * re-validates and, if the gateway write switch is enabled, persists it
+ * (the rule_commit tool). Numeric boundaries are enforced in both paths. */
+static cJSON *call_configure_rule(cJSON *arguments, bool commit, bool *is_error)
 {
     automation_rule_t rule = {
         .enabled = true,
@@ -301,13 +399,20 @@ static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
     }
     cJSON *threshold = cJSON_GetObjectItem(arguments, "threshold");
     if (!cJSON_IsNumber(threshold) ||
+        !isfinite(threshold->valuedouble) ||
         !parse_rule_operator(operator_name, &rule.condition_operator)) {
         *is_error = true;
         return rule_response(&rule, false, false, "invalid threshold or operator", 0);
     }
     rule.threshold = (float)threshold->valuedouble;
     cJSON *item = cJSON_GetObjectItem(arguments, "hysteresis");
-    if (cJSON_IsNumber(item)) rule.hysteresis = (float)item->valuedouble;
+    if (cJSON_IsNumber(item)) {
+        if (!isfinite(item->valuedouble)) {
+            *is_error = true;
+            return rule_response(&rule, false, false, "hysteresis must be finite", 0);
+        }
+        rule.hysteresis = (float)item->valuedouble;
+    }
     item = cJSON_GetObjectItem(arguments, "hold_ms");
     if (cJSON_IsNumber(item)) rule.hold_ms = (uint32_t)item->valuedouble;
     item = cJSON_GetObjectItem(arguments, "cooldown_ms");
@@ -351,7 +456,7 @@ static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
         }
         item = cJSON_GetObjectItem(arguments, "target_value");
         amm_mapping_entry_t target;
-        if (!cJSON_IsNumber(item) ||
+        if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
             amm_find_mapping_by_point(rule.target_device, rule.target_point,
                                       &target) != ESP_OK) {
             *is_error = true;
@@ -380,10 +485,9 @@ static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
                              "hysteresis must be non-negative and cooldown at least 200 ms", 0);
     }
 
-    item = cJSON_GetObjectItem(arguments, "confirmed");
-    if (!cJSON_IsTrue(item)) {
+    if (!commit) {
         return rule_response(&rule, true, false,
-                             "preview only; obtain explicit user confirmation before applying", 0);
+                             "preview only; call rule_commit to apply", 0);
     }
     runtime_config_t config;
     runtime_config_get(&config);
@@ -397,6 +501,14 @@ static cJSON *call_configure_rule(cJSON *arguments, bool *is_error)
     *is_error = err != ESP_OK;
     return rule_response(&rule, true, err == ESP_OK,
                          err == ESP_OK ? "rule saved" : esp_err_to_name(err), id);
+}
+
+static uint8_t tool_required_scope(const char *name)
+{
+    if (strcmp(name, "write_point") == 0) return MCP_SCOPE_WRITE;
+    if (strcmp(name, "rule_commit") == 0) return MCP_SCOPE_WRITE;
+    if (strcmp(name, "discover_modbus_devices") == 0) return MCP_SCOPE_WRITE;
+    return MCP_SCOPE_READ;
 }
 
 static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
@@ -422,13 +534,19 @@ static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
         cJSON *device = cJSON_GetObjectItem(arguments, "device_id");
         cJSON *point = cJSON_GetObjectItem(arguments, "point_id");
         cJSON *value = cJSON_GetObjectItem(arguments, "value");
+        if (!cJSON_IsString(device) || !cJSON_IsString(point) || !cJSON_IsNumber(value) ||
+            !isfinite(value->valuedouble)) {
+            *is_error = true;
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddBoolToObject(response, "accepted", false);
+            cJSON_AddStringToObject(response, "reason", "invalid device/point/value");
+            return response;
+        }
         control_result_t write_result = {0};
         esp_err_t err = !config.mcp_write_enabled ? ESP_ERR_NOT_ALLOWED :
-            (!cJSON_IsString(device) || !cJSON_IsString(point) || !cJSON_IsNumber(value)
-                ? ESP_ERR_INVALID_ARG
-                : control_service_write_point(device->valuestring, point->valuestring,
-                                              (float)value->valuedouble,
-                                              CONTROL_SOURCE_MCP, &write_result));
+            control_service_write_point(device->valuestring, point->valuestring,
+                                        (float)value->valuedouble,
+                                        CONTROL_SOURCE_MCP, &write_result);
         cJSON *response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "accepted", err == ESP_OK);
         cJSON_AddStringToObject(response, "reason", !config.mcp_write_enabled
@@ -471,18 +589,22 @@ static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
         cJSON_AddNumberToObject(response, "data_loss", uif_get_data_loss_count());
         return response;
     }
-    if (strcmp(name, "configure_rule_from_natural_language") == 0) {
-        return call_configure_rule(arguments, is_error);
-    }
+    if (strcmp(name, "rule_preview") == 0) return call_configure_rule(arguments, false, is_error);
+    if (strcmp(name, "rule_commit") == 0) return call_configure_rule(arguments, true, is_error);
     *is_error = true;
     return cJSON_Parse("{\"error\":\"unknown tool\"}");
 }
 
 static esp_err_t mcp_post_handler(httpd_req_t *req)
 {
-    if (require_mcp_authorization(req) != ESP_OK) return ESP_OK;
+    mcp_token_t active_token;
+    if (require_mcp_authorization(req, &active_token) != ESP_OK) return ESP_OK;
+
     cJSON *request = read_body(req);
-    if (request == NULL) return send_rpc(req, NULL, NULL, -32700, "Parse error");
+    if (request == NULL) {
+        return send_rpc(req, NULL, NULL, -32700, "Parse error");
+    }
+
     cJSON *id = cJSON_GetObjectItem(request, "id");
     cJSON *method = cJSON_GetObjectItem(request, "method");
     if (!cJSON_IsString(method)) {
@@ -490,9 +612,13 @@ static esp_err_t mcp_post_handler(httpd_req_t *req)
         cJSON_Delete(request);
         return response;
     }
+
     cJSON *result = NULL;
     int error = 0;
     const char *error_message = NULL;
+    bool owned_args = false;
+    cJSON *arguments = NULL;
+
     if (strcmp(method->valuestring, "initialize") == 0) {
         result = cJSON_CreateObject();
         cJSON_AddStringToObject(result, "protocolVersion", "2025-03-26");
@@ -505,24 +631,38 @@ static esp_err_t mcp_post_handler(httpd_req_t *req)
         result = tools_list_result();
     } else if (strcmp(method->valuestring, "tools/call") == 0) {
         cJSON *params = cJSON_GetObjectItem(request, "params");
-        cJSON *name = cJSON_GetObjectItem(params, "name");
-        cJSON *arguments = cJSON_GetObjectItem(params, "arguments");
+        cJSON *name = params != NULL ? cJSON_GetObjectItem(params, "name") : NULL;
         if (!cJSON_IsString(name)) {
-            error = -32602; error_message = "Missing tool name";
-        } else {
-            if (!cJSON_IsObject(arguments)) arguments = cJSON_CreateObject();
-            bool is_error = false;
-            cJSON *value = tool_call(name->valuestring, arguments, &is_error);
-            result = tool_text_result(value, is_error);
-            if (cJSON_GetObjectItem(params, "arguments") == NULL) cJSON_Delete(arguments);
+            error = -32602;
+            error_message = "Missing tool name";
+            goto cleanup;
         }
+        /* Scope check is performed *before* any work happens. A token without
+         * the required scope gets a clean error rather than executing. */
+        if (!mcp_token_has_scope(&active_token, tool_required_scope(name->valuestring))) {
+            error = -32602;
+            error_message = "Token scope is insufficient for this tool";
+            goto cleanup;
+        }
+        arguments = cJSON_GetObjectItem(params, "arguments");
+        if (!cJSON_IsObject(arguments)) {
+            arguments = cJSON_CreateObject();
+            owned_args = true;
+        }
+        bool is_error = false;
+        cJSON *value = tool_call(name->valuestring, arguments, &is_error);
+        result = tool_text_result(value, is_error);
     } else if (strcmp(method->valuestring, "notifications/initialized") == 0) {
         cJSON_Delete(request);
         httpd_resp_set_status(req, "202 Accepted");
         return httpd_resp_send(req, NULL, 0);
     } else {
-        error = -32601; error_message = "Method not found";
+        error = -32601;
+        error_message = "Method not found";
     }
+
+cleanup:
+    if (owned_args && arguments != NULL) cJSON_Delete(arguments);
     esp_err_t response = send_rpc(req, id, result, error, error_message);
     cJSON_Delete(request);
     return response;
@@ -531,7 +671,7 @@ static esp_err_t mcp_post_handler(httpd_req_t *req)
 static esp_err_t mcp_options_handler(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, MCP-Protocol-Version");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Protocol-Version");
     return httpd_resp_send(req, NULL, 0);
 }
 
@@ -539,25 +679,19 @@ static esp_err_t mcp_status_get_handler(httpd_req_t *req)
 {
     runtime_config_t config;
     runtime_config_get(&config);
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    int64_t lock_remaining_ms = s_auth_locked_until_ms > now_ms
-        ? s_auth_locked_until_ms - now_ms : 0;
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "access_enabled",
-                          config.security.auth_enabled &&
-                          strlen(config.security.password_sha256) == 64);
+    size_t tokens = mcp_token_count();
+    cJSON_AddBoolToObject(root, "access_enabled", config.security.auth_enabled && tokens > 0);
     cJSON_AddBoolToObject(root, "auth_enabled", config.security.auth_enabled);
-    cJSON_AddBoolToObject(root, "token_configured",
-                          strlen(config.security.password_sha256) == 64);
+    cJSON_AddNumberToObject(root, "token_count", (double)tokens);
+    cJSON_AddBoolToObject(root, "token_configured", tokens > 0);
     cJSON_AddBoolToObject(root, "write_enabled", config.mcp_write_enabled);
     cJSON_AddStringToObject(root, "endpoint", "/mcp");
     cJSON_AddNumberToObject(root, "authorized_requests", s_authorized_requests);
     cJSON_AddNumberToObject(root, "authentication_failures", s_auth_failure_total);
     cJSON_AddNumberToObject(root, "last_authorized_uptime_ms",
                             (double)s_last_authorized_ms);
-    cJSON_AddNumberToObject(root, "lock_remaining_ms",
-                            (double)lock_remaining_ms);
-    cJSON_AddNumberToObject(root, "tool_count", 7);
+    cJSON_AddNumberToObject(root, "tool_count", 8);
     char *text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (text == NULL) {
@@ -573,6 +707,7 @@ static esp_err_t mcp_status_get_handler(httpd_req_t *req)
 
 esp_err_t mcp_http_register(httpd_handle_t server)
 {
+    mcp_token_store_init();
     const httpd_uri_t post = {.uri = "/mcp", .method = HTTP_POST, .handler = mcp_post_handler};
     const httpd_uri_t options = {.uri = "/mcp", .method = HTTP_OPTIONS, .handler = mcp_options_handler};
     const httpd_uri_t status = {

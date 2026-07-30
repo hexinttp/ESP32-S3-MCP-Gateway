@@ -17,6 +17,7 @@
 #include "modbus/modbus_tcp_server.h"
 #include "mqtt_comm/mqtt_handler.h"
 #include "network/network_manager.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "scheduler/scheduler.h"
 #include "storage/offline_store.h"
@@ -33,10 +34,36 @@
 
 static const char *TAG = "MAIN";
 
+/* Printed on every boot so an unexpected restart (panic, watchdog, brownout)
+ * can be identified from the serial log even when the crash itself was missed. */
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:  return "power-on";
+        case ESP_RST_EXT:      return "external pin";
+        case ESP_RST_SW:       return "software restart";
+        case ESP_RST_PANIC:    return "PANIC / exception";
+        case ESP_RST_INT_WDT:  return "interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "task watchdog";
+        case ESP_RST_WDT:      return "other watchdog";
+        case ESP_RST_DEEPSLEEP:return "deep sleep wake";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO:     return "SDIO";
+        default:               return "unknown";
+    }
+}
+
 static void init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err != ESP_OK) {
+        /* The original code only recovered from NO_FREE_PAGES / NEW_VERSION_FOUND.
+         * A corrupted NVS (e.g. left half-written after a crash during a config
+         * or rule write) returns ESP_ERR_NVS_CORRUPT and would otherwise abort
+         * via ESP_ERROR_CHECK, leaving the board in an infinite reboot loop that
+         * looks like "won't boot". Erase and re-initialise to self-heal. */
+        ESP_LOGW(TAG, "nvs_flash_init failed (%s); erasing NVS and retrying",
+                 esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -140,7 +167,8 @@ static void lcd_menu_task(void *argument)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 TCM/AMM/UIF gateway starting");
+    ESP_LOGI(TAG, "ESP32-S3 TCM/AMM/UIF gateway starting (reset reason: %s)",
+             reset_reason_name(esp_reset_reason()));
     init_nvs();
     ESP_ERROR_CHECK(runtime_config_init());
     ESP_ERROR_CHECK(health_service_init());
@@ -210,7 +238,12 @@ void app_main(void)
              (unsigned long)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned long)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
-    ESP_ERROR_CHECK(automation_start());
+    if (automation_start() != ESP_OK) {
+        /* Do not abort the whole boot if the automation task cannot be created
+         * (e.g. transient low memory). Failing here previously caused an
+         * ESP_ERROR_CHECK abort and an infinite reboot loop. */
+        ESP_LOGW(TAG, "automation_start failed; continuing without automation rules");
+    }
     if (config.lcd_enabled && board_get_status()->lcd_ready) {
         xTaskCreate(lcd_menu_task, "lcd_menu", 4096, NULL, 2, NULL);
     }

@@ -100,7 +100,7 @@ hardware integration on the ESP32-S3 board.
 - UIF 离线恢复：13 MB SPI Flash FAT 队列优先，TF 卡溢出，PUBACK 后删除。
 - TF 历史：按序列分片保存 JSONL；空间不足时删除最早历史文件。
 - 自动化规则：Web 配置阈值、回差、保持、冷却、点位联锁、写点或 MQTT 告警动作；规则保存在 NVS，并保留最近 64 条执行审计。
-- Web 配置：中文/English 一键切换；默认不启用认证，可选 Bearer Token；配置 AP 与已有网络接口均可访问；设备结果和通信日志使用低内存流式传输。
+- Web 配置：中文/English 一键切换；开放配置界面，无需登录；配置 AP 与已有网络接口均可访问；设备结果和通信日志使用低内存流式传输。
 - LCD 状态菜单：网络、MQTT、TCM/AMM/UIF、TF 和配置 AP 状态轮播。
 - W5500 以太网优先，链路断开后自动切换 Wi-Fi STA，同时保留配置 AP，并记录出口与切换次数。
 - NTP 时间同步、时间质量标记、运行健康指标、HTTPS OTA、镜像哈希校验和失败回滚。
@@ -110,6 +110,8 @@ hardware integration on the ESP32-S3 board.
 - ThingsCloud 可靠性：支持 100 台子设备和全部 1000 个 AMM 点位的严格通道下行匹配；离线 TCM 记录在重连后重新经过当前云平台上报模式；聚合数据按实际 JSON 字节拆包，限流或缓冲拥塞时转入 UIF 持久化缓存；Web 页面以中英文显示在线设备、待发送点位、离线缓存、限流次数和最近上报状态。
 - AMM 动态云路由：自定义 MQTT 点位支持 `AUTO`/`CUSTOM` Topic 策略；`AUTO` 在发布时根据最新 Topic 前缀、网关、设备和点位动态计算，修改 MQTT 配置后无需批量改写映射；`CUSTOM` 保留用户指定的完整 Topic。ThingsCloud 子设备模式使用 `point_id`，网关模式使用自定义或自动生成的 `gateway_property_key`，Web 映射表会随平台和模式切换显示当前有效路由。
 - 发布管线稳定性：`publish_task` 采用 PSRAM 64 KB 静态栈（`xTaskCreateStatic`），规避内部 DRAM 紧张导致的任务创建失败和深层 esp-mqtt 调用链栈溢出；离线缓存写入解耦到独立 `cache_writer_task` 异步执行，SPI Flash 慢写不再阻塞实时发布路径；MQTT 断线重连退避 10 s。
+- SD 卡日志持久化：系统日志与 Modbus 通信日志经独立写线程异步落盘到 TF 卡（`/logs/system.log` 1 MiB、`/logs/modbus_comm.log` 4 MiB 自动轮转），TF 空间不足（< 2 MiB）时自动删除最旧日志文件；新增导出接口 `GET /api/system/logs/export`、`GET /api/modbus/logs/export`，可在浏览器或 `curl` 一次性下载含历史分片的完整日志。
+- 可靠性增强：NVS 初始化失败（含 `ESP_ERR_NVS_CORRUPT`）自动擦除重初始化自愈，避免 NVS 写坏导致无限重启变砖；自动化任务栈按 8192/6144/5120/4096 梯度回退、规则执行的大结构体（`runtime_config_t`、`tcm_context_t`、topic/payload 缓冲）改为堆分配，规则触发不再栈溢出；`control_service` 写入源鉴权与 `runtime_config_t` 堆分配，避免放大各调用方栈帧；启动打印 `esp_reset_reason()` 便于排障，`automation_start` 失败不再中止整个启动流程。
 
 设备发现表优先分配到 PSRAM：检测到外部 PSRAM 时单次最多保留 100 台设备、每台 32 个原始寄存器字；PSRAM 不可用时自动降级为 8 台设备。扫描任务栈也优先放入 PSRAM，并在不可用时回退内部 RAM，避免大量活动映射造成内部 RAM 碎片后无法启动扫描。AMM 和 TCM 最新状态池最多保留 1000 个活动点位；无 PSRAM 时 AMM 自动降级为 64 点。自动化规则最多 16 条。设备发现容量和 AMM 活动映射容量相互独立。
 
@@ -346,24 +348,44 @@ TCM JSON 使用可机读的 UCUM 风格单位 `degC`；中文 Web 显示层将�
 - `discover_modbus_devices`
 - `get_gateway_config`
 - `get_cache_status`
-- `configure_rule_from_natural_language`
+- `rule_preview`
+- `rule_commit`
 
-`configure_rule_from_natural_language` is a two-stage safety workflow. The MCP
-client converts the user's natural-language instruction into the tool's
-structured rule schema and first calls it with `confirmed=false`. The gateway
-validates the AMM source point, optional interlock, writable target, value
-range, hysteresis, and cooldown, then returns a normalized preview without
-changing configuration. Only after the user explicitly confirms that preview
-may the client repeat the call with `confirmed=true`. Applying the rule also
-requires `mcp_write_enabled`.
+Rule configuration is a two-phase safety workflow. The MCP client converts the
+user's natural-language instruction into the `rule_*` structured schema and
+calls `rule_preview` first. The gateway validates the AMM source point, optional
+interlock, writable target, value range, hysteresis (>= 0) and cooldown
+(>= 200 ms), then returns a normalized preview **without** changing
+configuration. Only after the user explicitly confirms that preview may the
+client call `rule_commit`, which re-validates every boundary and, when
+`mcp_write_enabled` is on, persists the rule.
 
-MCP access is denied by default. Before any MCP client can connect, configure
-and enable the gateway Bearer Token under System Security. Every request to
-`POST /mcp` must send `Authorization: Bearer <token>`. Tokens are stored only
-as SHA-256 digests. Five consecutive authentication failures trigger a
-30-second lockout, and the MCP endpoint does not advertise unrestricted CORS.
-Keep `mcp_write_enabled` disabled for read-only clients; enable it only for
-trusted operators that must apply rules or write industrial points.
+MCP access is denied by default. Before any MCP client can connect, provision a
+gateway Bearer Token (see `/api/mcp/tokens`). Every request to `POST /mcp` must
+send `Authorization: Bearer <token>`. Tokens are stored only as SHA-256 digests
+in a dedicated NVS namespace, fully separate from the open Web configuration UI (which has no login). Rate
+limiting is per source IP: a client that fails authentication is locked out for
+30 seconds *for that address only*, so one attacker cannot deny service to the
+others. Keep `mcp_write_enabled` disabled for read-only clients; enable it only
+for trusted operators that must apply rules or write industrial points.
+
+### MCP 令牌管理（`/api/mcp/tokens`）
+
+MCP 令牌不再依赖 Web 登录口令，而是由独立的 `mcp_token_store` 管理，持久化在专用
+NVS 命名空间 `mcp_tokens`，仅保存 SHA-256 摘要。令牌作用域（scope）分 `read` /
+`write` / `admin` 三档，可任意组合，创建时至少包含一个作用域。所有令牌管理接口均
+为局域网开放（与 Web 配置界面一致，无登录鉴权）。
+
+- `GET /api/mcp/tokens`：列出已配置令牌（id、scope、enabled、创建/轮换时间），**不返回任何摘要或明文**。
+- `POST /api/mcp/tokens`：新建令牌或轮换密钥。
+  - 新建：`{"id":"<id>","secret":"<secret>","scope":["read","write"]}`
+  - 轮换：`{"action":"rotate","id":"<id>","secret":"<new-secret>"}`
+- `DELETE /api/mcp/tokens?id=<id>`：删除令牌；删除最后一个启用的 admin 令牌会被拒绝以防锁死。
+
+首次启动且 `security.auth_enabled=true` 时，若已配置 Web 口令摘要，会自动引导一个
+admin 作用域令牌（`id=admin`），便于零迁移；专用令牌创建后可手动删除该引导令牌。令牌
+认证对 `Authorization: Bearer <token>` 的摘要做恒定时间比较，仅按源 IP 做失败限速
+（30 s），不会因单一地址攻击而阻塞其他客户端。
 
 入口：`POST http://<gateway-ip>/mcp`
 
@@ -398,12 +420,15 @@ trusted operators that must apply rules or write industrial points.
 | `GET /api/discover/devices` | 流式返回设备、探测入口和原始寄存器 |
 | `POST /api/discover/apply` | 将发现结果应用到 AMM |
 | `GET/DELETE /api/modbus/logs` | 查询或清空 RTU TX/RX 原始通信日志 |
+| `GET /api/modbus/logs/export` | 导出 Modbus 通信日志（含 TF 卡历史分片） |
 | `GET/POST/DELETE /api/automation/rules` | 离线自动化规则 |
 | `GET /api/automation/audit` | 自动化执行与联锁审计 |
 | `GET/PUT /api/time/config` | NTP、时区和同步周期 |
-| `GET/PUT /api/security/config` | 可选 Web 鉴权和 OTA 安全策略 |
+| `GET/PUT /api/security/config` | MCP 鉴权开关与 OTA 安全策略（Web 配置界面开放、无登录） |
+| `GET/POST/DELETE /api/mcp/tokens` | MCP 令牌管理（列出/新建轮换/删除，详见上文令牌管理小节） |
 | `GET /api/ota/status`、`POST /api/ota/start` | HTTPS OTA 状态与启动 |
 | `GET /api/system/status` | 运行状态与研究指标 |
+| `GET /api/system/logs/export` | 导出系统运行日志（含 TF 卡历史分片） |
 
 ## 目录结构
 

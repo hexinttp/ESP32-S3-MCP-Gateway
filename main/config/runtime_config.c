@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "gateway_config.h"
+#include "mbedtls/sha256.h"
 
 #define CONFIG_NVS_NAMESPACE "gateway"
 #define CONFIG_NVS_KEY_LEGACY "runtime"
@@ -329,9 +330,10 @@ esp_err_t runtime_config_validate(const runtime_config_t *config,
              config->modbus_rtu.timeout_ms > 30000) error = "invalid RTU timeout";
     else if (config->modbus_tcp_server.enabled &&
              config->modbus_tcp_server.port == 0) error = "invalid Modbus TCP server port";
-    else if (config->security.auth_enabled &&
-             (config->security.username[0] == '\0' ||
-              strlen(config->security.password_sha256) != 64)) error = "web authentication credentials are incomplete";
+    /* NOTE: A Web admin password / username is no longer required. The Web
+     * configuration UI is open and never prompts for a password. MCP access is
+     * authenticated separately via the dedicated MCP token store (mcp_http.c),
+     * whose gate is `security.auth_enabled` and is validated there, not here. */
     if (reason != NULL && reason_size > 0) {
         strlcpy(reason, error != NULL ? error : "ok", reason_size);
     }

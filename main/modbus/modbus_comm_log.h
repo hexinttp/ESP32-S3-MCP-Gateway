@@ -49,6 +49,20 @@ void modbus_comm_log_anchor_wall_time(int64_t wall_now_ms,
                                       int64_t uptime_now_ms);
 void modbus_comm_log_clear(void);
 
+/** Render a single entry in the same line format used on the SD card. */
+void modbus_comm_log_format_line(const modbus_comm_log_entry_t *e,
+                                 char *buf, size_t len);
+
+/**
+ * @brief Invoke @p cb for every RAM-buffer entry whose uptime exceeds
+ *        @p min_uptime_ms (i.e. not yet flushed to the SD card), oldest first.
+ *        Used by the combined export to append the live tail after the SD
+ *        history without duplicating persisted lines.
+ */
+void modbus_comm_log_iterate_tail(int64_t min_uptime_ms,
+                                  void (*cb)(const char *line, void *arg),
+                                  void *arg);
+
 #ifdef __cplusplus
 }
 #endif

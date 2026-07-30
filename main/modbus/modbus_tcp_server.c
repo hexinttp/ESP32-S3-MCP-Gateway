@@ -101,7 +101,7 @@ static uint8_t write_single(uint8_t unit, uint8_t function_code,
     double engineering = raw_numeric * mapping.scale_factor + mapping.offset;
     control_result_t result;
     return control_service_write_point(mapping.device_id, mapping.point_id,
-                                       engineering, CONTROL_SOURCE_WEB,
+                                       engineering, CONTROL_SOURCE_REST_API,
                                        &result) == ESP_OK ? 0 : 4;
 }
 
@@ -145,7 +145,7 @@ static uint8_t write_multiple_registers(uint8_t unit, uint16_t address,
         double engineering = raw * mapping.scale_factor + mapping.offset;
         control_result_t result;
         if (control_service_write_point(mapping.device_id, mapping.point_id,
-                                        engineering, CONTROL_SOURCE_WEB,
+                                        engineering, CONTROL_SOURCE_REST_API,
                                         &result) != ESP_OK) {
             return 4;
         }

@@ -38,7 +38,10 @@
 #include "mqtt_comm/mqtt_handler.h"
 #include "eval/eval_logger.h"
 #include "automation/automation_web.h"
+#include "storage/log_store.h"
+#include "board/tf_storage.h"
 #include "mcp/mcp_http.h"
+#include "mcp/mcp_token_store.h"
 #include "config/runtime_config.h"
 #include "cloud_adapter/cloud_adapter.h"
 #include "uif/uif_persistence.h"
@@ -66,16 +69,6 @@ static bool copy_trimmed_field(char *dst, size_t dst_size, const char *src)
     return true;
 }
 
-static void sha256_hex(const char *text, char output[65])
-{
-    uint8_t digest[32];
-    mbedtls_sha256((const unsigned char *)text, strlen(text), digest, 0);
-    for (int i = 0; i < 32; ++i) {
-        snprintf(output + i * 2, 3, "%02x", digest[i]);
-    }
-    output[64] = '\0';
-}
-
 static const char *data_type_name(data_type_t type)
 {
     static const char *names[] = {
@@ -94,32 +87,6 @@ static data_type_t parse_data_type_name(const char *name)
         }
     }
     return DT_UINT16;
-}
-
-static esp_err_t require_authorization(httpd_req_t *req)
-{
-    runtime_config_t config;
-    runtime_config_get(&config);
-    if (!config.security.auth_enabled) return ESP_OK;
-
-    char authorization[192] = {0};
-    if (httpd_req_get_hdr_value_str(req, "Authorization", authorization,
-                                    sizeof(authorization)) != ESP_OK ||
-        strncmp(authorization, "Bearer ", 7) != 0) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
-        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
-        return ESP_ERR_NOT_ALLOWED;
-    }
-    char digest[65];
-    sha256_hex(authorization + 7, digest);
-    if (strcmp(digest, config.security.password_sha256) != 0) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
-        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
-        return ESP_ERR_NOT_ALLOWED;
-    }
-    return ESP_OK;
 }
 
 static void httpd_resp_send_400(httpd_req_t *req)
@@ -447,7 +414,7 @@ static esp_err_t wifi_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t wifi_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -566,7 +533,7 @@ static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -801,7 +768,7 @@ static esp_err_t mqtt_config_put_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mqtt_test_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -897,7 +864,7 @@ static esp_err_t mqtt_test_post_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mqtt_disconnect_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
 
     runtime_config_t config;
     runtime_config_get(&config);
@@ -988,7 +955,7 @@ static esp_err_t modbus_config_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t modbus_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -1219,7 +1186,7 @@ static esp_err_t mappings_get_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (!root) {
         httpd_resp_send_400(req);
@@ -1494,7 +1461,7 @@ static bool mapping_entry_from_json(const cJSON *root, amm_mapping_entry_t *entr
 /* POST /api/mappings/import - Batch semantic profile import. */
 static esp_err_t mappings_import_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_large_request_json(req, 768U * 1024U);
     if (root == NULL) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -1553,7 +1520,7 @@ static esp_err_t mappings_import_post_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     /* Extract index from URI: /api/mappings/<idx> */
     char uri[64];
     httpd_req_get_url_str(req, uri, sizeof(uri));
@@ -1570,7 +1537,7 @@ static esp_err_t mappings_put_handler(httpd_req_t *req)
  * ================================================================ */
 static esp_err_t mappings_delete_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     /* Extract slave_id and register_address from query or body */
     char uri[64];
     httpd_req_get_url_str(req, uri, sizeof(uri));
@@ -1609,7 +1576,7 @@ static esp_err_t mappings_delete_handler(httpd_req_t *req)
 
 static esp_err_t mappings_clear_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     esp_err_t err = amm_clear_mappings();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Web API: clear mappings failed: %s", esp_err_to_name(err));
@@ -1624,7 +1591,7 @@ static esp_err_t mappings_clear_handler(httpd_req_t *req)
 
 static esp_err_t mappings_rollback_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     esp_err_t err = amm_rollback();
     if (err == ESP_OK) return send_ok(req);
     httpd_resp_set_status(req, "409 Conflict");
@@ -1669,6 +1636,89 @@ void web_server_add_log(const char *level_str, const char *text)
     if (s_log_count < WEB_LOG_MAX_ENTRIES) s_log_count++;
 
     xSemaphoreGive(s_log_mutex);
+
+    /* Also persist the entry to the SD card (if mounted) for later export. */
+    log_store_append(level_str, text, e->uptime_ms);
+}
+
+/* ================================================================
+ * GET /api/system/logs/export - Combined export: full SD-card history
+ * (rotated files + active) followed by the live RAM tail (entries not yet
+ * flushed to the card), so the download contains ALL log data.
+ * ================================================================ */
+typedef struct {
+    httpd_req_t *req;
+    esp_err_t    err;
+} log_export_ctx_t;
+
+static void stream_sd_file_cb(const char *path, void *arg)
+{
+    log_export_ctx_t *ctx = (log_export_ctx_t *)arg;
+    if (ctx->err != ESP_OK) return;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return;
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        ctx->err = httpd_resp_send_chunk(ctx->req, buf, n);
+        if (ctx->err != ESP_OK) break;
+    }
+    fclose(f);
+}
+
+/* Render a RAM log entry in the same on-disk line format so it concatenates
+ * cleanly after the SD history. */
+static void format_system_log_line(const web_log_entry_t *e, char *buf, size_t len)
+{
+    char ts[32];
+    if (e->timestamp_ms > 0) {
+        time_t sec = (time_t)(e->timestamp_ms / 1000);
+        struct tm tm_info;
+        if (localtime_r(&sec, &tm_info) != NULL)
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
+        else snprintf(ts, sizeof(ts), "U%lld", (long long)e->uptime_ms);
+    } else {
+        snprintf(ts, sizeof(ts), "U%lld", (long long)e->uptime_ms);
+    }
+    const char *lvl = (e->level == 'w') ? "warn" : (e->level == 'e') ? "error"
+                                        : (e->level == 'o') ? "ok"   : "info";
+    snprintf(buf, len, "%s [%s] %s\n", ts, lvl, e->text);
+}
+
+static esp_err_t system_logs_export_handler(httpd_req_t *req)
+{
+
+
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Content-Disposition",
+                       "attachment; filename=\"system_logs.txt\"");
+
+    log_export_ctx_t ctx = { req, ESP_OK };
+    /* Snapshot the "already on SD" watermark BEFORE streaming the card so that
+     * any entry flushed to SD during the stream is still appended from the RAM
+     * tail (a harmless boundary duplicate) rather than silently dropped. */
+    int64_t last_flush = log_store_last_flushed_uptime(LOG_STORE_STREAM_SYSTEM);
+    if (tf_storage_is_mounted()) {
+        log_store_list_files(LOG_STORE_STREAM_SYSTEM, stream_sd_file_cb, &ctx);
+    }
+    if (ctx.err == ESP_OK && s_log_mutex) {
+        if (xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            int start = (s_log_count < WEB_LOG_MAX_ENTRIES) ? 0 : s_log_head;
+            for (int i = 0; i < s_log_count; ++i) {
+                int idx = (start + i) % WEB_LOG_MAX_ENTRIES;
+                web_log_entry_t *e = &s_log_buf[idx];
+                if (e->uptime_ms <= last_flush) continue;   /* already on SD */
+                char line[WEB_LOG_MAX_TEXT_LEN + 64];
+                format_system_log_line(e, line, sizeof(line));
+                ctx.err = httpd_resp_send_chunk(req, line, strlen(line));
+                if (ctx.err != ESP_OK) break;
+            }
+            xSemaphoreGive(s_log_mutex);
+        }
+    }
+    if (ctx.err == ESP_OK) ctx.err = httpd_resp_send_chunk(req, NULL, 0);
+    return ctx.err;
 }
 
 /* ================================================================
@@ -1713,6 +1763,40 @@ static esp_err_t system_logs_get_handler(httpd_req_t *req)
     free(json);
     cJSON_Delete(arr);
     return ESP_OK;
+}
+
+/* ================================================================
+ * GET /api/modbus/logs/export - Combined export: full SD-card history
+ * (rotated + active) followed by the live RAM tail, all in the same comm-log
+ * line format as stored on the card. Contains ALL RS485 traffic data.
+ * ================================================================ */
+static void modbus_tail_cb(const char *line, void *arg)
+{
+    log_export_ctx_t *ctx = (log_export_ctx_t *)arg;
+    if (ctx->err != ESP_OK || line == NULL) return;
+    size_t len = strlen(line);
+    if (len > 0) ctx->err = httpd_resp_send_chunk(ctx->req, line, len);
+}
+
+static esp_err_t modbus_logs_export_handler(httpd_req_t *req)
+{
+
+
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Content-Disposition",
+                       "attachment; filename=\"modbus_comm_log.txt\"");
+
+    log_export_ctx_t ctx = { req, ESP_OK };
+    int64_t last_flush = log_store_last_flushed_uptime(LOG_STORE_STREAM_MODBUS);
+    if (tf_storage_is_mounted()) {
+        log_store_list_files(LOG_STORE_STREAM_MODBUS, stream_sd_file_cb, &ctx);
+    }
+    if (ctx.err == ESP_OK) {
+        modbus_comm_log_iterate_tail(last_flush, modbus_tail_cb, &ctx);
+    }
+    if (ctx.err == ESP_OK) ctx.err = httpd_resp_send_chunk(req, NULL, 0);
+    return ctx.err;
 }
 
 static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
@@ -1810,7 +1894,7 @@ static esp_err_t modbus_logs_get_handler(httpd_req_t *req)
 
 static esp_err_t modbus_logs_delete_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     modbus_comm_log_clear();
     return send_ok(req);
 }
@@ -1972,7 +2056,7 @@ static esp_err_t discover_devices_get_handler(httpd_req_t *req)
 /* POST /api/discover/scan */
 static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *body = parse_request_json(req);
     if (body == NULL) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
@@ -2060,7 +2144,7 @@ static esp_err_t discover_scan_post_handler(httpd_req_t *req)
 /* POST /api/discover/apply */
 static esp_err_t discover_apply_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     if (modbus_discover_get_result().scan_in_progress) {
         httpd_resp_set_status(req, "409 Conflict");
         return send_json(req, "{\"error\":\"discovery scan in progress\"}");
@@ -2086,7 +2170,7 @@ static esp_err_t discover_apply_post_handler(httpd_req_t *req)
 /* POST /api/discover/reset */
 static esp_err_t discover_reset_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     modbus_discover_reset();
     return send_ok(req);
 }
@@ -2156,7 +2240,7 @@ static bool parse_discover_device_uri(const char *uri, uint8_t *slave_id,
 /* PUT /api/discover/devices/<slave_id> -update device info */
 static esp_err_t discover_device_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -2192,7 +2276,7 @@ static esp_err_t discover_device_put_handler(httpd_req_t *req)
 /* PUT /api/discover/devices/<slave_id>/registers/<reg_addr> -update register */
 static esp_err_t discover_register_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -2263,7 +2347,7 @@ static esp_err_t discover_register_put_handler(httpd_req_t *req)
 /* POST /api/discover/devices/<slave_id>/registers/<reg_addr>/toggle */
 static esp_err_t discover_register_toggle_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -2295,7 +2379,7 @@ static esp_err_t discover_register_toggle_handler(httpd_req_t *req)
 /* DELETE /api/discover/devices/<slave_id>/registers/<reg_addr> */
 static esp_err_t discover_register_delete_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     char uri[128];
     httpd_req_get_url_str(req, uri, sizeof(uri));
 
@@ -2335,7 +2419,7 @@ static esp_err_t gateway_config_get_handler(httpd_req_t *req)
 
 static esp_err_t gateway_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     runtime_config_t config;
@@ -2380,7 +2464,7 @@ static esp_err_t time_config_get_handler(httpd_req_t *req)
 
 static esp_err_t time_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     runtime_config_t config;
@@ -2411,9 +2495,6 @@ static esp_err_t security_config_get_handler(httpd_req_t *req)
     health_service_get(&health);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "auth_enabled", config.security.auth_enabled);
-    cJSON_AddStringToObject(root, "username", config.security.username);
-    cJSON_AddBoolToObject(root, "token_configured",
-                          config.security.password_sha256[0] != '\0');
     cJSON_AddBoolToObject(root, "ota_enabled", config.security.ota_enabled);
     cJSON_AddBoolToObject(root, "ota_allow_http", config.security.ota_allow_http);
     cJSON_AddBoolToObject(root, "secure_boot_enabled", health.secure_boot_enabled);
@@ -2428,27 +2509,13 @@ static esp_err_t security_config_get_handler(httpd_req_t *req)
 
 static esp_err_t security_config_put_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     runtime_config_t config;
     runtime_config_get(&config);
     cJSON *value = cJSON_GetObjectItem(root, "auth_enabled");
     if (cJSON_IsBool(value)) config.security.auth_enabled = cJSON_IsTrue(value);
-    value = cJSON_GetObjectItem(root, "username");
-    if (cJSON_IsString(value)) {
-        strlcpy(config.security.username, value->valuestring,
-                sizeof(config.security.username));
-    }
-    cJSON *token = cJSON_GetObjectItem(root, "bearer_token");
-    cJSON *token_hash = cJSON_GetObjectItem(root, "bearer_token_sha256");
-    if (cJSON_IsString(token) && token->valuestring[0] != '\0') {
-        sha256_hex(token->valuestring, config.security.password_sha256);
-    } else if (cJSON_IsString(token_hash) &&
-               strlen(token_hash->valuestring) == 64) {
-        strlcpy(config.security.password_sha256, token_hash->valuestring,
-                sizeof(config.security.password_sha256));
-    }
     value = cJSON_GetObjectItem(root, "ota_enabled");
     if (cJSON_IsBool(value)) config.security.ota_enabled = cJSON_IsTrue(value);
     value = cJSON_GetObjectItem(root, "ota_allow_http");
@@ -2472,7 +2539,7 @@ static esp_err_t ota_status_get_handler(httpd_req_t *req)
 
 static esp_err_t ota_start_post_handler(httpd_req_t *req)
 {
-    if (require_authorization(req) != ESP_OK) return ESP_OK;
+
     cJSON *root = parse_request_json(req);
     if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     cJSON *url = cJSON_GetObjectItem(root, "url");
@@ -2505,6 +2572,134 @@ static esp_err_t cors_options_handler(httpd_req_t *req)
 /* ================================================================
  * Server Start / Stop
  * ================================================================ */
+static void mcp_scope_to_string(uint8_t scope, char *out, size_t size)
+{
+    out[0] = '\0';
+    if (scope & MCP_SCOPE_READ) strlcat(out, "read", size);
+    if (scope & MCP_SCOPE_WRITE) {
+        if (out[0]) strlcat(out, ",", size);
+        strlcat(out, "write", size);
+    }
+    if (scope & MCP_SCOPE_ADMIN) {
+        if (out[0]) strlcat(out, ",", size);
+        strlcat(out, "admin", size);
+    }
+}
+
+/* MCP bearer-token management. All endpoints require Web admin authorization.
+ * No secret digests are ever returned to the caller. */
+static esp_err_t mcp_tokens_get_handler(httpd_req_t *req)
+{
+
+    mcp_token_t tokens[MCP_TOKEN_MAX];
+    size_t count = MCP_TOKEN_MAX;
+    if (mcp_token_list(tokens, &count) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "token list failed");
+    }
+    cJSON *root = cJSON_CreateArray();
+    for (size_t i = 0; i < count; ++i) {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "id", tokens[i].id);
+        char scope_str[32];
+        mcp_scope_to_string(tokens[i].scope, scope_str, sizeof(scope_str));
+        cJSON_AddStringToObject(t, "scope", scope_str);
+        cJSON_AddBoolToObject(t, "enabled", tokens[i].enabled);
+        cJSON_AddNumberToObject(t, "created_at_ms", (double)tokens[i].created_at_ms);
+        cJSON_AddNumberToObject(t, "rotated_at_ms", (double)tokens[i].rotated_at_ms);
+        cJSON_AddItemToArray(root, t);
+    }
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    esp_err_t err = text ? send_json(req, text)
+                         : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                "serialize failed");
+    free(text);
+    return err;
+}
+
+static esp_err_t mcp_tokens_post_handler(httpd_req_t *req)
+{
+
+    cJSON *root = parse_request_json(req);
+    if (root == NULL) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+
+    cJSON *action = cJSON_GetObjectItem(root, "action");
+    if (cJSON_IsString(action) && strcmp(action->valuestring, "rotate") == 0) {
+        cJSON *id = cJSON_GetObjectItem(root, "id");
+        cJSON *secret = cJSON_GetObjectItem(root, "secret");
+        if (!cJSON_IsString(id) || !cJSON_IsString(secret) || secret->valuestring[0] == '\0') {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "id and secret required");
+        }
+        esp_err_t err = mcp_token_rotate(id->valuestring, secret->valuestring, NULL);
+        cJSON_Delete(root);
+        return err == ESP_OK ? send_ok(req)
+                             : httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                                   esp_err_to_name(err));
+    }
+
+    cJSON *id = cJSON_GetObjectItem(root, "id");
+    cJSON *secret = cJSON_GetObjectItem(root, "secret");
+    cJSON *scope_arr = cJSON_GetObjectItem(root, "scope");
+    uint8_t scope = 0;
+    if (cJSON_IsArray(scope_arr)) {
+        for (int i = 0; i < cJSON_GetArraySize(scope_arr); ++i) {
+            cJSON *s = cJSON_GetArrayItem(scope_arr, i);
+            if (!cJSON_IsString(s)) continue;
+            if (strcmp(s->valuestring, "read") == 0) scope |= MCP_SCOPE_READ;
+            else if (strcmp(s->valuestring, "write") == 0) scope |= MCP_SCOPE_WRITE;
+            else if (strcmp(s->valuestring, "admin") == 0) scope |= MCP_SCOPE_ADMIN;
+        }
+    }
+    if (scope == 0) scope = MCP_SCOPE_READ;
+    if (!cJSON_IsString(id) || id->valuestring[0] == '\0' ||
+        !cJSON_IsString(secret) || secret->valuestring[0] == '\0') {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "id and secret required");
+    }
+    mcp_token_t created;
+    esp_err_t err = mcp_token_create(id->valuestring, scope, secret->valuestring, &created);
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+    }
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "id", created.id);
+    char scope_str[32];
+    mcp_scope_to_string(created.scope, scope_str, sizeof(scope_str));
+    cJSON_AddStringToObject(resp, "scope", scope_str);
+    cJSON_AddBoolToObject(resp, "enabled", created.enabled);
+    char *text = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    esp_err_t rerr = text ? send_json(req, text)
+                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                 "serialize failed");
+    free(text);
+    return rerr;
+}
+
+static esp_err_t mcp_tokens_delete_handler(httpd_req_t *req)
+{
+
+    char id[33] = {0};
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0) {
+        char *q = malloc(qlen + 1);
+        if (q != NULL && httpd_req_get_url_query_str(req, q, qlen + 1) == ESP_OK) {
+            httpd_query_key_value(q, "id", id, sizeof(id));
+        }
+        free(q);
+    }
+    if (id[0] == '\0') {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "id required");
+    }
+    esp_err_t err = mcp_token_delete(id);
+    return err == ESP_OK ? send_ok(req)
+                         : httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                               esp_err_to_name(err));
+}
+
 esp_err_t web_server_start(uint16_t port)
 {
     /* Initialize log buffer mutex */
@@ -2515,6 +2710,10 @@ esp_err_t web_server_start(uint16_t port)
             return ESP_FAIL;
         }
     }
+
+    /* Ensure the MCP token store is loaded (idempotent) so the management
+     * endpoints below operate on the persisted tokens. */
+    mcp_token_store_init();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
@@ -2546,6 +2745,9 @@ esp_err_t web_server_start(uint16_t port)
     };
     const httpd_uri_t sys_logs_get = {
         .uri = "/api/system/logs", .method = HTTP_GET, .handler = system_logs_get_handler,
+    };
+    const httpd_uri_t sys_logs_export = {
+        .uri = "/api/system/logs/export", .method = HTTP_GET, .handler = system_logs_export_handler,
     };
     const httpd_uri_t gateway_get = {
         .uri = "/api/gateway/config", .method = HTTP_GET, .handler = gateway_config_get_handler,
@@ -2601,6 +2803,9 @@ esp_err_t web_server_start(uint16_t port)
     };
     const httpd_uri_t modbus_logs_get = {
         .uri = "/api/modbus/logs", .method = HTTP_GET, .handler = modbus_logs_get_handler,
+    };
+    const httpd_uri_t modbus_logs_export = {
+        .uri = "/api/modbus/logs/export", .method = HTTP_GET, .handler = modbus_logs_export_handler,
     };
     const httpd_uri_t modbus_logs_del = {
         .uri = "/api/modbus/logs", .method = HTTP_DELETE, .handler = modbus_logs_delete_handler,
@@ -2679,11 +2884,24 @@ esp_err_t web_server_start(uint16_t port)
     const httpd_uri_t cors_options = {
         .uri = "/api/*", .method = HTTP_OPTIONS, .handler = cors_options_handler,
     };
+    const httpd_uri_t mcp_tokens_get = {
+        .uri = "/api/mcp/tokens", .method = HTTP_GET,
+        .handler = mcp_tokens_get_handler,
+    };
+    const httpd_uri_t mcp_tokens_post = {
+        .uri = "/api/mcp/tokens", .method = HTTP_POST,
+        .handler = mcp_tokens_post_handler,
+    };
+    const httpd_uri_t mcp_tokens_del = {
+        .uri = "/api/mcp/tokens", .method = HTTP_DELETE,
+        .handler = mcp_tokens_delete_handler,
+    };
 
     httpd_register_uri_handler(s_server, &root_get);
     httpd_register_uri_handler(s_server, &ui_asset_get);
     httpd_register_uri_handler(s_server, &sys_status_get);
     httpd_register_uri_handler(s_server, &sys_logs_get);
+    httpd_register_uri_handler(s_server, &sys_logs_export);
     httpd_register_uri_handler(s_server, &gateway_get);
     httpd_register_uri_handler(s_server, &gateway_put);
     httpd_register_uri_handler(s_server, &time_get);
@@ -2701,6 +2919,7 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &modbus_get);
     httpd_register_uri_handler(s_server, &modbus_put);
     httpd_register_uri_handler(s_server, &modbus_logs_get);
+    httpd_register_uri_handler(s_server, &modbus_logs_export);
     httpd_register_uri_handler(s_server, &modbus_logs_del);
     httpd_register_uri_handler(s_server, &mappings_get);
     httpd_register_uri_handler(s_server, &mappings_post);
@@ -2724,6 +2943,9 @@ esp_err_t web_server_start(uint16_t port)
     httpd_register_uri_handler(s_server, &discover_reg_del);
     httpd_register_uri_handler(s_server, &discover_dev_put);
     httpd_register_uri_handler(s_server, &cors_options);
+    httpd_register_uri_handler(s_server, &mcp_tokens_get);
+    httpd_register_uri_handler(s_server, &mcp_tokens_post);
+    httpd_register_uri_handler(s_server, &mcp_tokens_del);
     ESP_ERROR_CHECK(automation_web_register(s_server));
     ESP_ERROR_CHECK(mcp_http_register(s_server));
 

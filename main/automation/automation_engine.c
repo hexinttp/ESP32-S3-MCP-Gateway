@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "config/runtime_config.h"
 #include "freertos/FreeRTOS.h"
@@ -191,16 +192,26 @@ static void audit_event(const automation_rule_t *rule, const tcm_context_t *stat
     xSemaphoreGive(s_mutex);
 }
 
-static bool interlock_allows(const automation_rule_t *rule)
+/* Scratch space for interlock checks and rule execution.
+ * These structures are far too large for the automation task stack
+ * (runtime_config_t alone is ~2 KiB, tcm_context_t a few hundred bytes), so
+ * they live on the heap. Putting them on the stack previously overflowed the
+ * automation task and rebooted the device whenever a rule fired. */
+typedef struct {
+    runtime_config_t config;
+    char topic[128];
+    char payload[512];
+} rule_exec_scratch_t;
+
+static bool interlock_allows(const automation_rule_t *rule, tcm_context_t *scratch)
 {
     if (rule->interlock_device[0] == '\0' || rule->interlock_point[0] == '\0') {
         return true;
     }
-    tcm_context_t state;
     return tcm_state_pool_get(rule->interlock_device, rule->interlock_point,
-                              &state) == ESP_OK &&
-           (state.value != 0.0) == rule->interlock_required_state &&
-           state.quality_state == QUALITY_GOOD;
+                              scratch) == ESP_OK &&
+           (scratch->value != 0.0) == rule->interlock_required_state &&
+           scratch->quality_state == QUALITY_GOOD;
 }
 
 static esp_err_t execute_rule(const automation_rule_t *rule, const tcm_context_t *state)
@@ -211,39 +222,56 @@ static esp_err_t execute_rule(const automation_rule_t *rule, const tcm_context_t
                                            rule->target_value,
                                            CONTROL_SOURCE_AUTOMATION, &result);
     }
-    runtime_config_t config;
-    runtime_config_get(&config);
-    char topic[128];
-    if (rule->alert_topic[0] != '\0') strlcpy(topic, rule->alert_topic, sizeof(topic));
-    else snprintf(topic, sizeof(topic), "%salerts", config.mqtt.data_prefix);
-    char payload[512];
-    snprintf(payload, sizeof(payload),
+
+    rule_exec_scratch_t *scratch = calloc(1, sizeof(*scratch));
+    if (scratch == NULL) {
+        ESP_LOGE(TAG, "rule %lu: out of memory for alert payload",
+                 (unsigned long)rule->id);
+        return ESP_ERR_NO_MEM;
+    }
+    runtime_config_get(&scratch->config);
+    if (rule->alert_topic[0] != '\0') {
+        strlcpy(scratch->topic, rule->alert_topic, sizeof(scratch->topic));
+    } else {
+        snprintf(scratch->topic, sizeof(scratch->topic), "%salerts",
+                 scratch->config.mqtt.data_prefix);
+    }
+    snprintf(scratch->payload, sizeof(scratch->payload),
              "{\"rule_id\":%lu,\"rule\":\"%s\",\"device_id\":\"%s\","
              "\"point_id\":\"%s\",\"value\":%.6g,\"message\":\"%s\"}",
              (unsigned long)rule->id, rule->name, state->device_id, state->point_id,
              state->value, rule->alert_message);
-    return mqtt_publish(topic, payload, config.mqtt.qos);
+    esp_err_t err = mqtt_publish(scratch->topic, scratch->payload,
+                                 scratch->config.mqtt.qos);
+    free(scratch);
+    return err;
 }
 
 static void automation_task(void *argument)
 {
     (void)argument;
     automation_rule_t *rules = calloc(AUTOMATION_MAX_RULES, sizeof(*rules));
-    if (rules == NULL) {
+    /* Keep the (large) TCM contexts off the task stack - see rule_exec_scratch_t. */
+    tcm_context_t *state_buf = calloc(2, sizeof(*state_buf));
+    if (rules == NULL || state_buf == NULL) {
         ESP_LOGE(TAG, "Unable to allocate rule snapshot");
+        free(rules);
+        free(state_buf);
         s_task = NULL;
         vTaskDelete(NULL);
         return;
     }
+    tcm_context_t *state = &state_buf[0];
+    tcm_context_t *interlock_state = &state_buf[1];
+
     while (true) {
         int count = automation_get_rules(rules, AUTOMATION_MAX_RULES);
         int64_t now = esp_timer_get_time() / 1000;
         for (int i = 0; i < count; ++i) {
             if (!rules[i].enabled) continue;
-            tcm_context_t state;
-            if (tcm_state_pool_get(rules[i].source_device, rules[i].source_point, &state) != ESP_OK) continue;
+            if (tcm_state_pool_get(rules[i].source_device, rules[i].source_point, state) != ESP_OK) continue;
             ++s_stats.evaluations;
-            bool matched = condition_matches(&rules[i], (float)state.value,
+            bool matched = condition_matches(&rules[i], (float)state->value,
                                              s_condition_active[i]);
             s_condition_active[i] = matched;
             if (!matched) {
@@ -253,18 +281,18 @@ static void automation_task(void *argument)
             if (s_condition_since[i] == 0) s_condition_since[i] = now;
             if (now - s_condition_since[i] < rules[i].hold_ms ||
                 now - s_last_trigger[i] < rules[i].cooldown_ms) continue;
-            if (!interlock_allows(&rules[i])) {
+            if (!interlock_allows(&rules[i], interlock_state)) {
                 ++s_stats.failures;
-                audit_event(&rules[i], &state, false, "interlock blocked action");
+                audit_event(&rules[i], state, false, "interlock blocked action");
                 s_last_trigger[i] = now;
                 continue;
             }
-            if (execute_rule(&rules[i], &state) == ESP_OK) {
+            if (execute_rule(&rules[i], state) == ESP_OK) {
                 ++s_stats.triggers;
-                audit_event(&rules[i], &state, true, "action completed");
+                audit_event(&rules[i], state, true, "action completed");
             } else {
                 ++s_stats.failures;
-                audit_event(&rules[i], &state, false, "action failed");
+                audit_event(&rules[i], state, false, "action failed");
             }
             s_last_trigger[i] = now;
         }
@@ -275,8 +303,24 @@ static void automation_task(void *argument)
 esp_err_t automation_start(void)
 {
     if (s_task != NULL) return ESP_OK;
-    return xTaskCreate(automation_task, "automation", 4096, NULL, 4, &s_task) == pdPASS
-        ? ESP_OK : ESP_ERR_NO_MEM;
+    /* Rule execution (execute_rule) invokes MQTT publishing and Modbus writes,
+     * which use the LWIP/network stack and need a generous stack. All large
+     * buffers along that path are heap-allocated, but the network stack itself
+     * still needs room. Try the largest size the internal DRAM can provide
+     * instead of jumping straight to a minimum that later overflows. */
+    static const uint32_t stack_options[] = { 8192, 6144, 5120, 4096 };
+    for (size_t i = 0; i < sizeof(stack_options) / sizeof(stack_options[0]); ++i) {
+        if (xTaskCreate(automation_task, "automation", stack_options[i], NULL, 4,
+                        &s_task) == pdPASS) {
+            if (i > 0) {
+                ESP_LOGW(TAG, "automation task created with reduced stack %u bytes",
+                         (unsigned)stack_options[i]);
+            }
+            return ESP_OK;
+        }
+    }
+    s_task = NULL;
+    return ESP_ERR_NO_MEM;
 }
 
 automation_stats_t automation_get_stats(void)

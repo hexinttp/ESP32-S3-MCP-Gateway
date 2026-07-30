@@ -660,14 +660,13 @@ tbody tr:last-child td { border-bottom: none; }
             <div class="form-group"><label data-i18n="system.ntp2">Secondary NTP Server</label><input id="timeServer2" type="text" value="time.cloudflare.com"></div>
             <div class="form-group"><label data-i18n="system.timezone">Timezone</label><input id="timeTimezone" type="text" value="CST-8"></div>
             <div class="form-group"><label data-i18n="system.sync_interval">Time Sync Interval (ms)</label><input id="timeSyncInterval" type="number" min="60000" value="3600000"></div>
-            <div class="form-group"><label data-i18n="system.auth_user">Web User</label><input id="securityUser" type="text" value="admin"></div>
-            <div class="form-group"><label data-i18n="system.auth_token">Bearer Token</label><input id="securityToken" type="password" autocomplete="new-password"></div>
+
             <div class="form-group"><label data-i18n="system.ota_url">HTTPS OTA URL</label><input id="otaUrl" type="url" placeholder="https://server/firmware.bin"></div>
             <div class="form-group"><label data-i18n="system.ota_sha">Firmware SHA-256</label><input id="otaSha" type="text" maxlength="64"></div>
           </div>
           <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:12px;">
             <label><input id="timeEnabled" type="checkbox" checked> <span data-i18n="system.time_enable">Enable NTP</span></label>
-            <label><input id="securityAuthEnabled" type="checkbox"> <span data-i18n="system.auth_enable">Enable Web Authentication</span></label>
+
             <label><input id="securityOtaEnabled" type="checkbox" checked> <span data-i18n="system.ota_enable">Enable Signed OTA</span></label>
             <span id="securityHardwareStatus" class="muted"></span>
           </div>
@@ -1275,7 +1274,7 @@ tbody tr:last-child td { border-bottom: none; }
       </div>
 
       <div class="card">
-        <div class="card-header"><span data-i18n="mcp.tools">Available MCP Tools</span><span class="badge badge-info">7</span></div>
+        <div class="card-header"><span data-i18n="mcp.tools">Available MCP Tools</span><span class="badge badge-info">8</span></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th data-i18n="mcp.tool">Tool</th><th data-i18n="mcp.permission">Permission</th><th data-i18n="mcp.purpose">Purpose</th></tr></thead>
@@ -1286,7 +1285,8 @@ tbody tr:last-child td { border-bottom: none; }
               <tr><td><code>get_cache_status</code></td><td data-i18n="mcp.read_only">Read only</td><td data-i18n="mcp.cache_desc">Read UIF offline-cache status</td></tr>
               <tr><td><code>discover_modbus_devices</code></td><td data-i18n="mcp.operation">Operation</td><td data-i18n="mcp.discovery_desc">Start controlled Modbus discovery</td></tr>
               <tr><td><code>write_point</code></td><td data-i18n="mcp.write_required">Write permission</td><td data-i18n="mcp.write_desc">Write through AMM safety constraints</td></tr>
-              <tr><td><code>configure_rule_from_natural_language</code></td><td data-i18n="mcp.confirm_required">Write + confirmation</td><td data-i18n="mcp.rule_desc">Preview and apply a rule generated from natural language</td></tr>
+              <tr><td><code>rule_preview</code></td><td data-i18n="mcp.preview_perm">Preview (read scope)</td><td data-i18n="mcp.rule_preview_desc">Validate a rule and return a structured preview without persisting</td></tr>
+              <tr><td><code>rule_commit</code></td><td data-i18n="mcp.commit_perm">Write scope + confirmation</td><td data-i18n="mcp.rule_commit_desc">Persist a previously previewed rule after re-validating</td></tr>
             </tbody>
           </table>
         </div>
@@ -1300,7 +1300,7 @@ tbody tr:last-child td { border-bottom: none; }
           <span data-i18n="logs.modbus_title">RS485 Communication Log</span>
           <div style="display:flex; gap:8px;">
             <button class="btn btn-outline btn-sm" onclick="clearModbusLogs()" data-i18n="logs.clear">Clear</button>
-            <button class="btn btn-outline btn-sm" onclick="exportModbusLogs()" data-i18n="logs.export_csv">Export CSV</button>
+            <button class="btn btn-outline btn-sm" onclick="exportModbusLogs()" data-i18n="logs.export">Export</button>
           </div>
         </div>
         <div class="card-body">
@@ -1505,6 +1505,8 @@ tbody tr:last-child td { border-bottom: none; }
   </div>
 </div>
 
+
+
 <!-- Toast Container -->
 <div class="toast-container" id="toastContainer"></div>
 
@@ -1555,9 +1557,6 @@ const I18N = {
     "system.timezone": "\u65f6\u533a",
     "system.sync_interval": "\u65f6\u95f4\u540c\u6b65\u5468\u671f (ms)",
     "system.time_enable": "\u542f\u7528 NTP",
-    "system.auth_user": "Web \u7528\u6237\u540d",
-    "system.auth_token": "Bearer Token",
-    "system.auth_enable": "\u542f\u7528 Web \u8ba4\u8bc1",
     "system.ota_enable": "\u542f\u7528\u7b7e\u540d OTA",
     "system.ota_url": "HTTPS OTA \u5730\u5740",
     "system.ota_sha": "\u56fa\u4ef6 SHA-256",
@@ -1805,6 +1804,7 @@ const I18N = {
     "mcp.token_placeholder": "\u7559\u7a7a\u4fdd\u7559\u5f53\u524d Token",
     "mcp.enable_access": "\u542f\u7528\u9700\u8ba4\u8bc1\u7684 MCP \u8bbf\u95ee",
     "mcp.enable_write": "\u5141\u8bb8\u5199\u70b9\u4f4d\u548c\u4fee\u6539\u89c4\u5219",
+
     "mcp.tools": "\u53ef\u7528 MCP \u5de5\u5177",
     "mcp.tool": "\u5de5\u5177",
     "mcp.permission": "\u6743\u9650",
@@ -1819,12 +1819,18 @@ const I18N = {
     "mcp.cache_desc": "\u8bfb\u53d6 UIF \u79bb\u7ebf\u7f13\u5b58\u72b6\u6001",
     "mcp.discovery_desc": "\u542f\u52a8\u53d7\u63a7 Modbus \u8bbe\u5907\u53d1\u73b0",
     "mcp.write_desc": "\u901a\u8fc7 AMM \u5b89\u5168\u7ea6\u675f\u5199\u5165\u70b9\u4f4d",
+    "mcp.rule_preview_desc": "\u6821\u9a8c\u89c4\u5219\u5e76\u8fd4\u56de\u7ed3\u6784\u5316\u9884\u89c8\uff08\u4e0d\u843d\u76d8\uff09",
+    "mcp.rule_commit_desc": "\u91cd\u65b0\u6821\u9a8c\u540e\u6301\u4e45\u5316\u89c4\u5219",
+    "mcp.preview_perm": "\u9884\u89c8\uff08\u9700\u8bfb\u6743\u9650\uff09",
+    "mcp.commit_perm": "\u5199\u6743\u9650 + \u4e8c\u6b21\u786e\u8ba4",
     "mcp.rule_desc": "\u9884\u89c8\u5e76\u5e94\u7528\u7531\u81ea\u7136\u8bed\u8a00\u751f\u6210\u7684\u89c4\u5219",
     "logs.title": "\u7cfb\u7edf\u65e5\u5fd7",
     "logs.modbus_title": "RS485 \u901a\u4fe1\u65e5\u5fd7",
     "logs.clear": "\u6e05\u7a7a",
     "logs.export": "\u5bfc\u51fa",
-    "logs.export_csv": "\u5bfc\u51fa CSV",
+    "logs.sd_no_file": "SD \u5361\u4e0a\u5c1a\u65e0\u65e5\u5fd7\u6587\u4ef6",
+    "logs.sd_not_mounted": "SD \u5361\u672a\u6302\u8f7d\uff0c\u65e0\u6cd5\u5bfc\u51fa",
+    "logs.export_ok": "SD \u5361\u65e5\u5fd7\u5df2\u5bfc\u51fa",
     "logs.all": "\u5168\u90e8",
     "logs.direction": "\u65b9\u5411",
     "logs.function": "\u529f\u80fd\u7801",
@@ -1885,9 +1891,6 @@ const I18N = {
     'system.timezone': 'Timezone',
     'system.sync_interval': 'Time Sync Interval (ms)',
     'system.time_enable': 'Enable NTP',
-    'system.auth_user': 'Web User',
-    'system.auth_token': 'Bearer Token',
-    'system.auth_enable': 'Enable Web Authentication',
     'system.ota_enable': 'Enable Signed OTA',
     'system.ota_url': 'HTTPS OTA URL',
     'system.ota_sha': 'Firmware SHA-256',
@@ -2126,6 +2129,7 @@ const I18N = {
     'mcp.token_placeholder': 'Leave blank to keep the current token',
     'mcp.enable_access': 'Enable authenticated MCP access',
     'mcp.enable_write': 'Allow point writes and rule changes',
+
     'mcp.tools': 'Available MCP Tools',
     'mcp.tool': 'Tool',
     'mcp.permission': 'Permission',
@@ -2140,12 +2144,18 @@ const I18N = {
     'mcp.cache_desc': 'Read UIF offline-cache status',
     'mcp.discovery_desc': 'Start controlled Modbus discovery',
     'mcp.write_desc': 'Write through AMM safety constraints',
+    'mcp.rule_preview_desc': 'Validate a rule and return a structured preview without persisting',
+    'mcp.rule_commit_desc': 'Persist a previously previewed rule after re-validating',
+    'mcp.preview_perm': 'Preview (read scope)',
+    'mcp.commit_perm': 'Write scope + confirmation',
     'mcp.rule_desc': 'Preview and apply a rule generated from natural language',
     'logs.title': 'System Logs',
     'logs.modbus_title': 'RS485 Communication Log',
     'logs.clear': 'Clear',
     'logs.export': 'Export',
-    'logs.export_csv': 'Export CSV',
+    'logs.sd_no_file': 'No log file on SD card yet',
+    'logs.sd_not_mounted': 'SD card not mounted, cannot export',
+    'logs.export_ok': 'Log exported (includes SD card data)',
     'logs.all': 'All',
     'logs.direction': 'Direction',
     'logs.function': 'Function',
@@ -2278,22 +2288,21 @@ let modbusLogEntries = [];
 /* ============================================================
  * API Helper
  * ============================================================ */
+
+/* ============================================================
+ * API helper
+ * The Web configuration UI is open (no login gate). MCP clients
+ * authenticate SEPARATELY via their own Bearer token validated
+ * against the dedicated MCP token store (see mcp_http.c / mcp_token_store.c).
+ * ============================================================ */
 async function fetchWithTimeout(path, options = {}, timeoutMs = API_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  const headers = new Headers(options.headers || {});
-  const token = sessionStorage.getItem('gateway_bearer_token');
-  if (token) headers.set('Authorization', `Bearer ${token}`);
-  try {
-    return await fetch(API_BASE + path, {
-      cache: 'no-store',
-      ...options,
-      headers,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
+  return fetch(API_BASE + path, {
+    cache: 'no-store',
+    ...options,
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeoutId));
 }
 
 async function apiGet(path, timeoutMs = API_TIMEOUT_MS) {
@@ -3027,7 +3036,6 @@ function scanWifi() {
 }
 
 async function saveSystemManagement() {
-  const token = document.getElementById('securityToken').value;
   const timeResult = await apiJson('PUT', '/api/time/config', {
     enabled: document.getElementById('timeEnabled').checked,
     server1: document.getElementById('timeServer1').value.trim(),
@@ -3035,20 +3043,15 @@ async function saveSystemManagement() {
     timezone: document.getElementById('timeTimezone').value.trim(),
     sync_interval_ms: Number(document.getElementById('timeSyncInterval').value)
   });
-  const securityPayload = {
-    auth_enabled: document.getElementById('securityAuthEnabled').checked,
-    username: document.getElementById('securityUser').value.trim(),
+  const securityResult = await apiJson('PUT', '/api/security/config', {
     ota_enabled: document.getElementById('securityOtaEnabled').checked,
     ota_allow_http: false
-  };
-  if (token) securityPayload.bearer_token = token;
-  const securityResult = await apiJson('PUT', '/api/security/config', securityPayload);
-  if (securityResult && !securityResult.error && token) {
-    sessionStorage.setItem('gateway_bearer_token', token);
-  }
+  });
   const error = timeResult?.error || securityResult?.error;
   showToast(error || t('toast.saved'), error ? 'error' : 'success');
 }
+
+
 
 async function startOtaUpdate() {
   const url = document.getElementById('otaUrl').value.trim();
@@ -3114,13 +3117,34 @@ async function fetchServerLogs() {
 
 function clearLogs() { logLines = []; serverLogsFetched = false; renderLogs(); }
 
+/* Download a streamed blob endpoint (the combined export includes the full
+ * SD-card history plus the live RAM tail - i.e. ALL log data in one file). */
+async function downloadLogStream(url, filename) {
+  try {
+    const res = await fetchWithTimeout(url, {}, 60000);
+    if (res.status === 404) {
+      const body = await res.json().catch(() => ({}));
+      if (body && body.error === 'sd_card_not_mounted') {
+        showToast(t('logs.sd_not_mounted'), 'error');
+      } else {
+        showToast(t('logs.sd_no_file'), 'error');
+      }
+      return;
+    }
+    if (!res.ok) { showToast('Export failed: HTTP ' + res.status, 'error'); return; }
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl; a.download = filename; a.click();
+    URL.revokeObjectURL(objUrl);
+    showToast(t('logs.export_ok'), 'success');
+  } catch (e) {
+    showToast('Export failed: ' + e.message, 'error');
+  }
+}
+
 function exportLogs() {
-  const text = logLines.map(l => l.text).join('\n');
-  const blob = new Blob([text], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'gateway_logs.txt'; a.click();
-  URL.revokeObjectURL(url);
+  downloadLogStream('/api/system/logs/export', 'system_logs.txt');
 }
 
 function filteredModbusLogs() {
@@ -3224,28 +3248,10 @@ async function clearModbusLogs() {
   }
 }
 
-function csvCell(value) {
-  return `"${String(value ?? '').replace(/"/g, '""')}"`;
-}
-
 function exportModbusLogs() {
-  const headers = ['sequence', 'datetime', 'direction', 'slave_id',
-    'function_code', 'register_address', 'register_count', 'raw_registers',
-    'frame_hex', 'status'];
-  const rows = filteredModbusLogs().map(entry => [
-    entry.sequence, formatDateTime(entry.timestamp_ms, entry.uptime_ms), entry.direction, entry.slave_id,
-    entry.function_code, entry.register_address, entry.register_count,
-    Array.isArray(entry.register_values) ? entry.register_values.join('|') : '',
-    entry.frame_hex || '', entry.status || ''
-  ]);
-  const csv = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = `modbus_rtu_logs_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  // The combined export contains the full SD-card RS485 history plus the live
+  // RAM tail - all data in a single download (same line format as on the card).
+  downloadLogStream('/api/modbus/logs/export', 'modbus_comm_log.txt');
 }
 
 /* ============================================================
@@ -3538,8 +3544,6 @@ async function loadRuntimeForms() {
   }
   const security = await apiGet('/api/security/config');
   if (security) {
-    document.getElementById('securityAuthEnabled').checked = security.auth_enabled === true;
-    document.getElementById('securityUser').value = security.username || 'admin';
     document.getElementById('securityOtaEnabled').checked = security.ota_enabled !== false;
     document.getElementById('securityHardwareStatus').textContent =
       `Secure Boot: ${security.secure_boot_enabled ? 'ON' : 'OFF'} · Flash Encryption: ${security.flash_encryption_enabled ? 'ON' : 'OFF'}`;
@@ -4232,14 +4236,26 @@ async function saveMcpManagement() {
       : 'Bearer Token must contain at least 16 characters', 'error');
     return;
   }
-  const securityPayload = { auth_enabled: enabled };
-  if (token) securityPayload.bearer_token = token;
-  const securityResult = await apiJson('PUT', '/api/security/config', securityPayload);
+  /* The MCP access token lives ONLY in the dedicated MCP token store and is
+   * independent from the Web admin password. We must NOT write it into the Web
+   * login session or into security.password_sha256, otherwise changing the MCP
+   * token would break Web sign-in / other config pages. */
+  if (token) {
+    const mcpResult = await apiJson('POST', '/api/mcp/tokens', {
+      action: 'rotate', id: 'admin', secret: token
+    });
+    if (!mcpResult || mcpResult.error) {
+      showToast(mcpResult?.error || t('toast.error'), 'error');
+      return;
+    }
+  }
+  /* Enable/disable MCP authentication (auth_enabled) WITHOUT touching the Web
+   * admin password. */
+  const securityResult = await apiJson('PUT', '/api/security/config', { auth_enabled: enabled });
   if (!securityResult || securityResult.error) {
     showToast(securityResult?.error || t('toast.error'), 'error');
     return;
   }
-  if (token) sessionStorage.setItem('gateway_bearer_token', token);
   const gatewayResult = await apiJson('PUT', '/api/gateway/config', {
     mcp_write_enabled: writeEnabled
   });
@@ -4247,7 +4263,6 @@ async function saveMcpManagement() {
     showToast(gatewayResult?.error || t('toast.error'), 'error');
     return;
   }
-  if (!enabled) sessionStorage.removeItem('gateway_bearer_token');
   document.getElementById('mcpBearerToken').value = '';
   showToast(currentLang === 'zh' ? 'MCP \u914d\u7f6e\u5df2\u4fdd\u5b58' : 'MCP configuration saved', 'success');
   await loadMcpManagement();

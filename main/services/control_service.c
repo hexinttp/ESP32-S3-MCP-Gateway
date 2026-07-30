@@ -2,13 +2,41 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "amm/amm_mapping.h"
 #include "eval/eval_logger.h"
 #include "modbus/modbus_access.h"
 #include "esp_log.h"
+#include "config/runtime_config.h"
 
 static const char *TAG = "CONTROL";
+
+const char *control_source_name(control_source_t source)
+{
+    switch (source) {
+    case CONTROL_SOURCE_MQTT: return "MQTT";
+    case CONTROL_SOURCE_REST_API: return "REST_API";
+    case CONTROL_SOURCE_MCP: return "MCP";
+    case CONTROL_SOURCE_AUTOMATION: return "AUTOMATION";
+    case CONTROL_SOURCE_LOCAL_UI: return "LOCAL_UI";
+    default: return "UNKNOWN";
+    }
+}
+
+bool control_source_may_write(control_source_t source)
+{
+    if (source != CONTROL_SOURCE_MCP) return true;
+    /* runtime_config_t is ~2 KiB. Keeping it on the stack inflates the frame of
+     * every caller of control_service_write_point (automation task included)
+     * even when this branch is not taken, which overflowed small task stacks. */
+    runtime_config_t *cfg = malloc(sizeof(*cfg));
+    if (cfg == NULL) return false;
+    runtime_config_get(cfg);
+    bool allowed = cfg->mcp_write_enabled;
+    free(cfg);
+    return allowed;
+}
 
 static uint16_t swap_bytes(uint16_t value)
 {
@@ -84,12 +112,21 @@ esp_err_t control_service_write_point(const char *device_id, const char *point_i
                                       double engineering_value, control_source_t source,
                                       control_result_t *result)
 {
-    (void)source;
-    if (result != NULL) memset(result, 0, sizeof(*result));
+    if (result != NULL) {
+        memset(result, 0, sizeof(*result));
+        result->source = source;
+    }
     if (device_id == NULL || point_id == NULL || !isfinite(engineering_value)) {
         return reject(result, ESP_ERR_INVALID_ARG, "invalid target or value");
     }
     eval_increment_metric("commands_received", 1);
+    /* Source-aware policy. The MCP origin is additionally gated by the global
+       write switch; all other origins are validated by their own upstream
+       layers. A write must never bypass this single entry point. */
+    if (!control_source_may_write(source)) {
+        return reject(result, ESP_ERR_NOT_ALLOWED,
+                      "writes from this source are not permitted");
+    }
     amm_mapping_entry_t mapping;
     if (amm_find_mapping_by_point(device_id, point_id, &mapping) != ESP_OK) {
         return reject(result, ESP_ERR_NOT_FOUND, "semantic point not found");
@@ -122,6 +159,7 @@ esp_err_t control_service_write_point(const char *device_id, const char *point_i
         result->status = ESP_OK;
         strlcpy(result->reason, "write accepted", sizeof(result->reason));
     }
-    ESP_LOGI(TAG, "%s/%s = %.6g", device_id, point_id, engineering_value);
+    ESP_LOGI(TAG, "%s/%s = %.6g source=%s", device_id, point_id,
+             engineering_value, control_source_name(source));
     return ESP_OK;
 }
