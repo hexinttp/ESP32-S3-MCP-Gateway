@@ -17,6 +17,8 @@
 #include "mcp/mcp_token_store.h"
 #include "modbus/modbus_discover.h"
 #include "services/control_service.h"
+#include "storage/log_store.h"
+#include "storage/offline_store.h"
 #include "tcm/tcm_context.h"
 #include "tcm/tcm_state_pool.h"
 #include "uif/uif_persistence.h"
@@ -246,6 +248,7 @@ static cJSON *tools_list_result(void)
              "{\"slave_start\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247},\"slave_end\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":247}}", NULL);
     add_tool(tools, "get_gateway_config", "Read non-secret gateway runtime configuration", "{}", NULL);
     add_tool(tools, "get_cache_status", "Read UIF offline cache and replay status", "{}", NULL);
+    add_tool(tools, "list_rules", "List configured local automation rules and execution statistics", "{}", NULL);
     /* Two-phase rule configuration: preview always validates and returns a
      * structured preview without persisting; commit re-validates and persists.
      * This removes the implicit "confirmed=true" single-shot write path. */
@@ -273,6 +276,11 @@ static cJSON *tools_list_result(void)
              "Persist a previously previewed rule. Re-validates all numeric "
              "boundaries before writing.",
              rule_props, rule_required);
+    add_tool(tools, "rule_delete", "Delete a local automation rule by identifier",
+             "{\"rule_id\":{\"type\":\"integer\",\"minimum\":1}}", "[\"rule_id\"]");
+    add_tool(tools, "export_logs", "Read a bounded tail of persisted gateway logs",
+             "{\"stream\":{\"type\":\"string\",\"enum\":[\"system\",\"modbus\"]},"
+             "\"max_lines\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}}", NULL);
     return result;
 }
 
@@ -373,6 +381,150 @@ static cJSON *rule_response(const automation_rule_t *rule, bool valid,
     return response;
 }
 
+static void add_rule_to_json(cJSON *array, const automation_rule_t *rule)
+{
+    static const char *operators[] = {"gt", "gte", "lt", "lte", "eq", "neq"};
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddNumberToObject(item, "rule_id", rule->id);
+    cJSON_AddBoolToObject(item, "enabled", rule->enabled);
+    cJSON_AddStringToObject(item, "name", rule->name);
+    cJSON_AddStringToObject(item, "source_device", rule->source_device);
+    cJSON_AddStringToObject(item, "source_point", rule->source_point);
+    int op = (int)rule->condition_operator;
+    cJSON_AddStringToObject(item, "operator",
+                            op >= RULE_OP_GT && op <= RULE_OP_NEQ ? operators[op] : "unknown");
+    cJSON_AddNumberToObject(item, "threshold", rule->threshold);
+    cJSON_AddNumberToObject(item, "hysteresis", rule->hysteresis);
+    cJSON_AddNumberToObject(item, "hold_ms", rule->hold_ms);
+    cJSON_AddNumberToObject(item, "cooldown_ms", rule->cooldown_ms);
+    cJSON_AddStringToObject(item, "action",
+                            rule->action == RULE_ACTION_WRITE_POINT
+                                ? "write_point" : "mqtt_alert");
+    cJSON_AddStringToObject(item, "target_device", rule->target_device);
+    cJSON_AddStringToObject(item, "target_point", rule->target_point);
+    cJSON_AddNumberToObject(item, "target_value", rule->target_value);
+    cJSON_AddStringToObject(item, "alert_topic", rule->alert_topic);
+    cJSON_AddItemToArray(array, item);
+}
+
+static cJSON *call_list_rules(void)
+{
+    automation_rule_t *rules = calloc(AUTOMATION_MAX_RULES, sizeof(*rules));
+    if (rules == NULL) return cJSON_Parse("{\"error\":\"out of memory\"}");
+    int count = automation_get_rules(rules, AUTOMATION_MAX_RULES);
+    automation_stats_t stats = automation_get_stats();
+    cJSON *response = cJSON_CreateObject();
+    cJSON *array = cJSON_AddArrayToObject(response, "rules");
+    for (int i = 0; i < count; ++i) add_rule_to_json(array, &rules[i]);
+    cJSON *stats_json = cJSON_AddObjectToObject(response, "stats");
+    cJSON_AddNumberToObject(stats_json, "evaluations", stats.evaluations);
+    cJSON_AddNumberToObject(stats_json, "triggers", stats.triggers);
+    cJSON_AddNumberToObject(stats_json, "failures", stats.failures);
+    free(rules);
+    return response;
+}
+
+typedef struct {
+    char **lines;
+    int capacity;
+    int count;
+    int next;
+} mcp_log_tail_t;
+
+static void collect_log_file(const char *path, void *arg)
+{
+    mcp_log_tail_t *tail = (mcp_log_tail_t *)arg;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return;
+    /* MCP returns a bounded diagnostic tail, not the complete archive. Seek
+     * close enough to EOF to contain max_lines (stored lines are capped by
+     * LOG_LINE_MAX) so a 10-line request never scans a multi-megabyte history. */
+    if (fseek(file, 0, SEEK_END) == 0) {
+        long size = ftell(file);
+        long window = (long)tail->capacity * 384L;
+        long start = size > window ? size - window : 0;
+        if (fseek(file, start, SEEK_SET) == 0 && start > 0) {
+            char discard[384];
+            (void)fgets(discard, sizeof(discard), file);
+        }
+    } else {
+        rewind(file);
+    }
+    char line[384];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        size_t length = strlen(line);
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+            line[--length] = '\0';
+        }
+        char *copy = strdup(line);
+        if (copy == NULL) break;
+        free(tail->lines[tail->next]);
+        tail->lines[tail->next] = copy;
+        tail->next = (tail->next + 1) % tail->capacity;
+        if (tail->count < tail->capacity) ++tail->count;
+    }
+    fclose(file);
+}
+
+static cJSON *call_export_logs(cJSON *arguments, bool *is_error)
+{
+    const char *stream_name = "system";
+    cJSON *stream = cJSON_GetObjectItem(arguments, "stream");
+    if (cJSON_IsString(stream)) stream_name = stream->valuestring;
+    log_store_stream_t selected;
+    if (strcmp(stream_name, "system") == 0) selected = LOG_STORE_STREAM_SYSTEM;
+    else if (strcmp(stream_name, "modbus") == 0) selected = LOG_STORE_STREAM_MODBUS;
+    else {
+        *is_error = true;
+        return cJSON_Parse("{\"error\":\"stream must be system or modbus\"}");
+    }
+    int max_lines = 100;
+    cJSON *limit = cJSON_GetObjectItem(arguments, "max_lines");
+    if (cJSON_IsNumber(limit)) max_lines = limit->valueint;
+    if (max_lines < 1 || max_lines > 200) {
+        *is_error = true;
+        return cJSON_Parse("{\"error\":\"max_lines must be between 1 and 200\"}");
+    }
+
+    mcp_log_tail_t tail = {
+        .lines = calloc((size_t)max_lines, sizeof(char *)),
+        .capacity = max_lines,
+    };
+    if (tail.lines == NULL) {
+        *is_error = true;
+        return cJSON_Parse("{\"error\":\"out of memory\"}");
+    }
+    const char *active_path = log_store_path(selected);
+    if (active_path != NULL) collect_log_file(active_path, &tail);
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddStringToObject(response, "stream", stream_name);
+    cJSON_AddNumberToObject(response, "line_count", tail.count);
+    cJSON *lines = cJSON_AddArrayToObject(response, "lines");
+    int first = tail.count < tail.capacity ? 0 : tail.next;
+    for (int i = 0; i < tail.count; ++i) {
+        int index = (first + i) % tail.capacity;
+        cJSON_AddItemToArray(lines, cJSON_CreateString(tail.lines[index]));
+    }
+    for (int i = 0; i < tail.capacity; ++i) free(tail.lines[i]);
+    free(tail.lines);
+    return response;
+}
+
+static esp_err_t lookup_rule_point(const char *device_id, const char *point_id,
+                                   bool *writable, float *minimum, float *maximum)
+{
+    amm_mapping_entry_t *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t err = amm_find_mapping_by_point(device_id, point_id, entry);
+    if (err == ESP_OK) {
+        if (writable != NULL) *writable = entry->constraint.writable;
+        if (minimum != NULL) *minimum = entry->constraint.valid_range_min;
+        if (maximum != NULL) *maximum = entry->constraint.valid_range_max;
+    }
+    free(entry);
+    return err;
+}
+
 /* Validate and optionally persist a rule. When `commit` is false the function
  * only validates and returns a preview (the rule_preview tool). When true it
  * re-validates and, if the gateway write switch is enabled, persists it
@@ -426,8 +578,8 @@ static cJSON *call_configure_rule(cJSON *arguments, bool commit, bool *is_error)
     item = cJSON_GetObjectItem(arguments, "interlock_required_state");
     rule.interlock_required_state = cJSON_IsTrue(item);
 
-    amm_mapping_entry_t source;
-    if (amm_find_mapping_by_point(rule.source_device, rule.source_point, &source) != ESP_OK) {
+    if (lookup_rule_point(rule.source_device, rule.source_point,
+                          NULL, NULL, NULL) != ESP_OK) {
         *is_error = true;
         return rule_response(&rule, false, false, "source point is not mapped", 0);
     }
@@ -437,9 +589,8 @@ static cJSON *call_configure_rule(cJSON *arguments, bool commit, bool *is_error)
                              "interlock device and point must be provided together", 0);
     }
     if (rule.interlock_device[0] != '\0') {
-        amm_mapping_entry_t interlock;
-        if (amm_find_mapping_by_point(rule.interlock_device, rule.interlock_point,
-                                      &interlock) != ESP_OK) {
+        if (lookup_rule_point(rule.interlock_device, rule.interlock_point,
+                              NULL, NULL, NULL) != ESP_OK) {
             *is_error = true;
             return rule_response(&rule, false, false, "interlock point is not mapped", 0);
         }
@@ -455,17 +606,19 @@ static cJSON *call_configure_rule(cJSON *arguments, bool commit, bool *is_error)
             return rule_response(&rule, false, false, "missing write target", 0);
         }
         item = cJSON_GetObjectItem(arguments, "target_value");
-        amm_mapping_entry_t target;
+        bool target_writable = false;
+        float target_minimum = 0.0f;
+        float target_maximum = 0.0f;
         if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
-            amm_find_mapping_by_point(rule.target_device, rule.target_point,
-                                      &target) != ESP_OK) {
+            lookup_rule_point(rule.target_device, rule.target_point,
+                              &target_writable, &target_minimum,
+                              &target_maximum) != ESP_OK) {
             *is_error = true;
             return rule_response(&rule, false, false, "write target is not mapped", 0);
         }
         rule.target_value = (float)item->valuedouble;
-        if (!target.constraint.writable ||
-            rule.target_value < target.constraint.valid_range_min ||
-            rule.target_value > target.constraint.valid_range_max) {
+        if (!target_writable || rule.target_value < target_minimum ||
+            rule.target_value > target_maximum) {
             *is_error = true;
             return rule_response(&rule, false, false,
                                  "write target is read-only or value is outside its safe range", 0);
@@ -507,6 +660,7 @@ static uint8_t tool_required_scope(const char *name)
 {
     if (strcmp(name, "write_point") == 0) return MCP_SCOPE_WRITE;
     if (strcmp(name, "rule_commit") == 0) return MCP_SCOPE_WRITE;
+    if (strcmp(name, "rule_delete") == 0) return MCP_SCOPE_WRITE;
     if (strcmp(name, "discover_modbus_devices") == 0) return MCP_SCOPE_WRITE;
     return MCP_SCOPE_READ;
 }
@@ -583,14 +737,47 @@ static cJSON *tool_call(const char *name, cJSON *arguments, bool *is_error)
         return response;
     }
     if (strcmp(name, "get_cache_status") == 0) {
+        offline_store_stats_t store;
+        offline_store_get_stats(&store);
         cJSON *response = cJSON_CreateObject();
         cJSON_AddNumberToObject(response, "records", uif_get_cached_count());
         cJSON_AddNumberToObject(response, "usage_percent", uif_get_cache_usage_percent());
         cJSON_AddNumberToObject(response, "data_loss", uif_get_data_loss_count());
+        cJSON_AddNumberToObject(response, "flash_records", store.flash_records);
+        cJSON_AddNumberToObject(response, "tf_records", store.tf_records);
+        cJSON_AddBoolToObject(response, "flash_ready", store.flash_ready);
+        cJSON_AddBoolToObject(response, "tf_mounted", store.tf_mounted);
+        if (store.flash_oldest_valid) {
+            cJSON_AddNumberToObject(response, "flash_oldest_sequence",
+                                    store.flash_oldest_sequence);
+        }
+        if (store.tf_oldest_valid) {
+            cJSON_AddNumberToObject(response, "tf_oldest_sequence",
+                                    store.tf_oldest_sequence);
+        }
         return response;
     }
+    if (strcmp(name, "list_rules") == 0) return call_list_rules();
     if (strcmp(name, "rule_preview") == 0) return call_configure_rule(arguments, false, is_error);
     if (strcmp(name, "rule_commit") == 0) return call_configure_rule(arguments, true, is_error);
+    if (strcmp(name, "rule_delete") == 0) {
+        runtime_config_t config;
+        runtime_config_get(&config);
+        cJSON *id = cJSON_GetObjectItem(arguments, "rule_id");
+        esp_err_t err = !config.mcp_write_enabled ? ESP_ERR_NOT_ALLOWED :
+            (!cJSON_IsNumber(id) || id->valuedouble < 1 ||
+             id->valuedouble > UINT32_MAX || floor(id->valuedouble) != id->valuedouble)
+                ? ESP_ERR_INVALID_ARG
+                : automation_delete_rule((uint32_t)id->valuedouble);
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddBoolToObject(response, "deleted", err == ESP_OK);
+        cJSON_AddStringToObject(response, "reason", !config.mcp_write_enabled
+            ? "MCP writes are disabled by gateway configuration"
+            : esp_err_to_name(err));
+        *is_error = err != ESP_OK;
+        return response;
+    }
+    if (strcmp(name, "export_logs") == 0) return call_export_logs(arguments, is_error);
     *is_error = true;
     return cJSON_Parse("{\"error\":\"unknown tool\"}");
 }
@@ -691,7 +878,7 @@ static esp_err_t mcp_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "authentication_failures", s_auth_failure_total);
     cJSON_AddNumberToObject(root, "last_authorized_uptime_ms",
                             (double)s_last_authorized_ms);
-    cJSON_AddNumberToObject(root, "tool_count", 8);
+    cJSON_AddNumberToObject(root, "tool_count", 11);
     char *text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (text == NULL) {

@@ -18,6 +18,17 @@ typedef struct {
     offline_medium_t medium;
 } offline_record_t;
 
+typedef struct {
+    int flash_records;
+    int tf_records;
+    uint32_t flash_oldest_sequence;
+    uint32_t tf_oldest_sequence;
+    bool flash_oldest_valid;
+    bool tf_oldest_valid;
+    bool flash_ready;
+    bool tf_mounted;
+} offline_store_stats_t;
+
 esp_err_t offline_store_init(void);
 esp_err_t offline_store_put(uint32_t sequence_id, const char *topic, const char *payload);
 esp_err_t offline_store_peek_oldest(offline_record_t *out);
@@ -26,5 +37,6 @@ int offline_store_count(void);
 int offline_store_usage_percent(void);
 int offline_store_data_loss_count(void);
 bool offline_store_flash_ready(void);
+void offline_store_get_stats(offline_store_stats_t *out);
 
 #endif

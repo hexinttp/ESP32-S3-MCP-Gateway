@@ -312,14 +312,36 @@ esp_err_t offline_store_peek_oldest(offline_record_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    uint32_t flash_seq = 0, tf_seq = 0;
-    bool flash = find_oldest_in(FLASH_CACHE_DIR, &flash_seq);
-    bool tf = tf_storage_is_mounted() && find_oldest_in(TF_CACHE_DIR, &tf_seq);
+    uint32_t flash_seq = s_flash_oldest;
+    uint32_t tf_seq = s_tf_oldest;
+    bool flash = s_flash_oldest_valid;
+    bool tf = tf_storage_is_mounted() && s_tf_oldest_valid;
     esp_err_t err = ESP_ERR_NOT_FOUND;
     if (flash && (!tf || flash_seq <= tf_seq)) {
         err = read_record(FLASH_CACHE_DIR, flash_seq, OFFLINE_MEDIUM_FLASH, out);
     } else if (tf) {
         err = read_record(TF_CACHE_DIR, tf_seq, OFFLINE_MEDIUM_TF, out);
+    }
+    /* Recover the index once if removable media changed or a write was
+     * interrupted. The normal replay path no longer rescans both FAT
+     * directories for every cached record. */
+    if (err != ESP_OK && (flash || tf)) {
+        load_store_state(FLASH_CACHE_DIR, &s_flash_count, &s_flash_oldest,
+                         &s_flash_oldest_valid);
+        if (tf_storage_is_mounted()) {
+            load_store_state(TF_CACHE_DIR, &s_tf_count, &s_tf_oldest,
+                             &s_tf_oldest_valid);
+        }
+        flash_seq = s_flash_oldest;
+        tf_seq = s_tf_oldest;
+        flash = s_flash_oldest_valid;
+        tf = tf_storage_is_mounted() && s_tf_oldest_valid;
+        if (flash && (!tf || flash_seq <= tf_seq)) {
+            err = read_record(FLASH_CACHE_DIR, flash_seq,
+                              OFFLINE_MEDIUM_FLASH, out);
+        } else if (tf) {
+            err = read_record(TF_CACHE_DIR, tf_seq, OFFLINE_MEDIUM_TF, out);
+        }
     }
     xSemaphoreGive(s_mutex);
     return err;
@@ -368,3 +390,20 @@ int offline_store_usage_percent(void)
 
 int offline_store_data_loss_count(void) { return s_data_loss; }
 bool offline_store_flash_ready(void) { return s_flash_ready; }
+
+void offline_store_get_stats(offline_store_stats_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (s_mutex == NULL) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    out->flash_records = s_flash_count;
+    out->tf_records = tf_storage_is_mounted() ? s_tf_count : 0;
+    out->flash_oldest_sequence = s_flash_oldest;
+    out->tf_oldest_sequence = s_tf_oldest;
+    out->flash_oldest_valid = s_flash_oldest_valid;
+    out->tf_oldest_valid = tf_storage_is_mounted() && s_tf_oldest_valid;
+    out->flash_ready = s_flash_ready;
+    out->tf_mounted = tf_storage_is_mounted();
+    xSemaphoreGive(s_mutex);
+}

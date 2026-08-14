@@ -139,8 +139,22 @@ typedef struct {
 
 /* Forward declaration – used by add/remove before its definition below. */
 static esp_err_t amm_save_to_nvs_unlocked(void);
+static esp_err_t amm_save_table_to_nvs_unlocked(
+    const amm_mapping_entry_t *table, int count);
 static esp_err_t amm_save_entry_to_nvs_unlocked(int index);
 static esp_err_t amm_save_rollback_unlocked(void);
+
+/* A full 1000-entry active table and another 1000-entry rollback blob cannot
+ * coexist reliably in the 1 MB AMM NVS partition. Keep persistent rollback
+ * for the formally validated scale range and let larger capacity operations
+ * proceed without wedging clear/update/import. */
+#define AMM_ROLLBACK_MAX_ENTRIES 256
+
+static bool amm_snapshot_permits_mutation(esp_err_t err)
+{
+    return err == ESP_OK || err == ESP_ERR_NOT_FOUND ||
+           err == ESP_ERR_NOT_SUPPORTED;
+}
 
 static uint8_t amm_point_register_count(data_type_t data_type)
 {
@@ -381,7 +395,7 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
             s_mapping_table[i].function_code == entry->function_code &&
             s_mapping_table[i].register_address == entry->register_address) {
             esp_err_t snapshot = amm_save_rollback_unlocked();
-            if (snapshot != ESP_OK && snapshot != ESP_ERR_NOT_FOUND) {
+            if (!amm_snapshot_permits_mutation(snapshot)) {
                 amm_unlock();
                 return snapshot;
             }
@@ -402,7 +416,7 @@ esp_err_t amm_add_mapping(const amm_mapping_entry_t *entry)
     }
 
     esp_err_t snapshot = amm_save_rollback_unlocked();
-    if (snapshot != ESP_OK && snapshot != ESP_ERR_NOT_FOUND) {
+    if (!amm_snapshot_permits_mutation(snapshot)) {
         amm_unlock();
         return snapshot;
     }
@@ -452,7 +466,7 @@ esp_err_t amm_remove_mapping(uint8_t slave_id, uint16_t reg_addr)
             s_mapping_table[i].slave_id == slave_id &&
             s_mapping_table[i].register_address == reg_addr) {
             esp_err_t snapshot = amm_save_rollback_unlocked();
-            if (snapshot != ESP_OK) {
+            if (!amm_snapshot_permits_mutation(snapshot)) {
                 amm_unlock();
                 return snapshot;
             }
@@ -482,7 +496,7 @@ esp_err_t amm_remove_mapping_for_channel(source_protocol_t protocol, uint8_t cha
             entry->channel_id == channel_id && entry->slave_id == slave_id &&
             entry->register_address == reg_addr) {
             esp_err_t snapshot = amm_save_rollback_unlocked();
-            if (snapshot != ESP_OK) {
+            if (!amm_snapshot_permits_mutation(snapshot)) {
                 amm_unlock();
                 return snapshot;
             }
@@ -533,7 +547,7 @@ esp_err_t amm_clear_mappings(void)
 {
     amm_lock();
     esp_err_t snapshot_err = amm_save_rollback_unlocked();
-    if (snapshot_err != ESP_OK && snapshot_err != ESP_ERR_NOT_FOUND) {
+    if (!amm_snapshot_permits_mutation(snapshot_err)) {
         amm_unlock();
         return snapshot_err;
     }
@@ -541,11 +555,20 @@ esp_err_t amm_clear_mappings(void)
     nvs_handle_t handle = 0;
     esp_err_t ret = nvs_open_from_partition(
         s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret == ESP_OK && snapshot_err == ESP_ERR_NOT_SUPPORTED) {
+        /* At large scale no rollback image is retained. Reclaim every stale
+         * entry key so a later import starts with the full NVS budget. */
+        ret = nvs_erase_all(handle);
+    }
     if (ret == ESP_OK) {
         ret = nvs_set_i32(handle, AMM_NVS_KEY_COUNT, 0);
     }
     if (ret == ESP_OK) {
         ret = nvs_set_u32(handle, AMM_NVS_KEY_SCHEMA, AMM_NVS_SCHEMA_VERSION);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u32(handle, AMM_NVS_KEY_POLL_MS,
+                          s_default_poll_interval_ms);
     }
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
@@ -575,7 +598,7 @@ esp_err_t amm_update_mapping(int index, const amm_mapping_entry_t *entry)
         return ESP_ERR_NOT_FOUND;
     }
     esp_err_t snapshot = amm_save_rollback_unlocked();
-    if (snapshot != ESP_OK) {
+    if (!amm_snapshot_permits_mutation(snapshot)) {
         amm_unlock();
         return snapshot;
     }
@@ -703,7 +726,9 @@ esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
     esp_err_t result = ESP_OK;
 
     amm_lock();
-    if (amm_save_rollback_unlocked() != ESP_OK && s_mapping_count > 0) {
+    uint32_t previous_model_version = s_model_version;
+    if (!amm_snapshot_permits_mutation(amm_save_rollback_unlocked()) &&
+        s_mapping_count > 0) {
         amm_unlock();
         free(staging);
         return ESP_FAIL;
@@ -777,13 +802,19 @@ esp_err_t amm_import_mappings(const amm_mapping_entry_t *entries, int count,
     }
 
     if (result == ESP_OK) {
-        memset(s_mapping_table, 0,
-               (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
-        memcpy(s_mapping_table, staging,
-               (size_t)staged_count * sizeof(s_mapping_table[0]));
-        s_mapping_count = staged_count;
-        result = amm_save_to_nvs_unlocked();
+        /* Persist the staged table before publishing it to polling/readers.
+         * A failed NVS transaction must not leave a new volatile model behind
+         * while reboot still restores the old one. */
+        result = amm_save_table_to_nvs_unlocked(staging, staged_count);
+        if (result == ESP_OK) {
+            memset(s_mapping_table, 0,
+                   (size_t)s_mapping_capacity * sizeof(s_mapping_table[0]));
+            memcpy(s_mapping_table, staging,
+                   (size_t)staged_count * sizeof(s_mapping_table[0]));
+            s_mapping_count = staged_count;
+        }
     }
+    if (result != ESP_OK) s_model_version = previous_model_version;
     amm_unlock();
     free(staging);
 
@@ -1071,7 +1102,7 @@ esp_err_t amm_set_poll_interval_all(uint32_t poll_interval_ms)
     }
     amm_lock();
     esp_err_t err = amm_save_rollback_unlocked();
-    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    if (!amm_snapshot_permits_mutation(err)) {
         amm_unlock();
         return err;
     }
@@ -1170,6 +1201,15 @@ static esp_err_t amm_save_entry_to_nvs_unlocked(int index)
  */
 static esp_err_t amm_save_to_nvs_unlocked(void)
 {
+    return amm_save_table_to_nvs_unlocked(s_mapping_table, s_mapping_count);
+}
+
+static esp_err_t amm_save_table_to_nvs_unlocked(
+    const amm_mapping_entry_t *table, int count)
+{
+    if (table == NULL || count < 0 || count > s_mapping_capacity) {
+        return ESP_ERR_INVALID_ARG;
+    }
     nvs_handle_t handle;
     esp_err_t ret = nvs_open_from_partition(
         s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -1179,7 +1219,7 @@ static esp_err_t amm_save_to_nvs_unlocked(void)
     }
 
     /* Persist total slot count (active + inactive) */
-    ret = nvs_set_i32(handle, AMM_NVS_KEY_COUNT, (int32_t)s_mapping_count);
+    ret = nvs_set_i32(handle, AMM_NVS_KEY_COUNT, (int32_t)count);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS set count failed: %s", esp_err_to_name(ret));
         nvs_close(handle);
@@ -1203,11 +1243,10 @@ static esp_err_t amm_save_to_nvs_unlocked(void)
 
     /* Persist each entry as a binary blob */
     char key[20];
-    for (int i = 0; i < s_mapping_count; i++) {
+    for (int i = 0; i < count; i++) {
         amm_nvs_entry_key(i, key, sizeof(key));
         ret = nvs_set_blob(handle, key,
-                           &s_mapping_table[i],
-                           sizeof(amm_mapping_entry_t));
+                           &table[i], sizeof(table[i]));
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "NVS set blob[%d] failed: %s", i, esp_err_to_name(ret));
             nvs_close(handle);
@@ -1215,19 +1254,52 @@ static esp_err_t amm_save_to_nvs_unlocked(void)
         }
     }
 
-    ret = nvs_commit(handle);
+    /* Imports may shrink the table substantially (for example 1000 -> 2).
+     * Remove no-longer-addressable blobs in the same NVS transaction. */
+    for (int i = count; ret == ESP_OK && i < s_mapping_count; ++i) {
+        amm_nvs_entry_key(i, key, sizeof(key));
+        ret = nvs_erase_key(handle, key);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;
+    }
+
+    if (ret == ESP_OK) ret = nvs_commit(handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS commit failed: %s", esp_err_to_name(ret));
     }
 
     nvs_close(handle);
-    ESP_LOGD(TAG, "Saved %d mapping entries to NVS", s_mapping_count);
+    ESP_LOGD(TAG, "Saved %d mapping entries to NVS", count);
     return ret;
 }
 
 static esp_err_t amm_save_rollback_unlocked(void)
 {
     if (s_mapping_count <= 0) return ESP_ERR_NOT_FOUND;
+    if (s_mapping_count > AMM_ROLLBACK_MAX_ENTRIES) {
+        nvs_handle_t cleanup = 0;
+        esp_err_t cleanup_err = nvs_open_from_partition(
+            s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &cleanup);
+        if (cleanup_err == ESP_OK) {
+            esp_err_t count_err = nvs_erase_key(cleanup,
+                                                AMM_NVS_KEY_ROLLBACK_COUNT);
+            if (count_err != ESP_OK && count_err != ESP_ERR_NVS_NOT_FOUND) {
+                cleanup_err = count_err;
+            }
+            esp_err_t blob_err = nvs_erase_key(cleanup, AMM_NVS_KEY_ROLLBACK);
+            if (cleanup_err == ESP_OK && blob_err != ESP_OK &&
+                blob_err != ESP_ERR_NVS_NOT_FOUND) {
+                cleanup_err = blob_err;
+            }
+            if (cleanup_err == ESP_OK) cleanup_err = nvs_commit(cleanup);
+            nvs_close(cleanup);
+        }
+        if (cleanup_err != ESP_OK) return cleanup_err;
+        ESP_LOGW(TAG,
+                 "Persistent rollback skipped at %d mappings (limit=%d); "
+                 "capacity operation remains available",
+                 s_mapping_count, AMM_ROLLBACK_MAX_ENTRIES);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     nvs_handle_t handle;
     esp_err_t err = nvs_open_from_partition(
         s_nvs_partition, AMM_NVS_NAMESPACE, NVS_READWRITE, &handle);

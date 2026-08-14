@@ -8,6 +8,7 @@
 #include "config/runtime_config.h"
 #include "cloud_adapter/cloud_adapter.h"
 #include "esp_timer.h"
+#include "eval/eval_logger.h"
 
 static const char *TAG = "UIF";
 static bool s_initialized;
@@ -19,7 +20,6 @@ static volatile int64_t s_replay_retry_after_ms;
 
 #define UIF_CLOUD_RESPONSE_TIMEOUT_MS 20000
 #define UIF_CLOUD_REJECT_RETRY_MS     60000
-#define UIF_CLOUD_INVALID_RETRY_MS    300000
 #define UIF_CLOUD_PACING_RETRY_MS     30000
 
 static void replay_acknowledged(uint32_t sequence_id)
@@ -183,13 +183,24 @@ void uif_replay_cloud_response(bool gateway_topic, bool accepted, int error_code
     s_replay_outstanding = false;
     s_replay_sequence = 0;
     s_replay_sent_ms = 0;
-    int64_t delay_ms = (error_code == 402 || error_code == 406 ||
-                        error_code == 413)
-        ? UIF_CLOUD_INVALID_RETRY_MS
-        : UIF_CLOUD_REJECT_RETRY_MS;
+    bool non_retryable = error_code == 402 || error_code == 406 ||
+                         error_code == 413;
+    if (non_retryable) {
+        /* Schema/size errors cannot become valid by retrying the same bytes.
+         * Remove the poison record so later durable data can progress, while
+         * preserving the boundary in metrics and the system log. */
+        if (offline_store_remove(sequence_id) == ESP_OK) {
+            eval_increment_metric("data_loss_count", 1);
+            ESP_LOGE(TAG,
+                     "Cloud permanently rejected replay seq=%lu errcode=%d; removed",
+                     (unsigned long)sequence_id, error_code);
+        }
+    }
+    int64_t delay_ms = non_retryable ? 1000 : UIF_CLOUD_REJECT_RETRY_MS;
     s_replay_retry_after_ms = esp_timer_get_time() / 1000 + delay_ms;
-    ESP_LOGW(TAG, "Cloud rejected replay seq=%lu errcode=%d; retained for retry",
-             (unsigned long)sequence_id, error_code);
+    ESP_LOGW(TAG, "Cloud rejected replay seq=%lu errcode=%d; %s",
+             (unsigned long)sequence_id, error_code,
+             non_retryable ? "removed as non-retryable" : "retained for retry");
 }
 
 void uif_destroy(void)

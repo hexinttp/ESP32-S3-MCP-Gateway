@@ -576,7 +576,7 @@ static discover_scan_params_t s_full_request;
 
 static void bus_scan_task(void *argument)
 {
-    (void)argument;
+    bool stack_uses_caps = argument != NULL;
     discover_scan_params_t params = {
         .slave_start = s_bus_request.start,
         .slave_end = s_bus_request.end,
@@ -599,7 +599,11 @@ static void bus_scan_task(void *argument)
                             err == ESP_OK ? DISCOVER_PHASE_COMPLETE : DISCOVER_PHASE_ERROR,
                             err);
     s_scan_task = NULL;
-    vTaskDelete(NULL);
+    if (stack_uses_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 esp_err_t modbus_discover_scan_bus(uint8_t start, uint8_t end)
@@ -613,7 +617,14 @@ esp_err_t modbus_discover_scan_bus(uint8_t start, uint8_t end)
         .end = end
     };
     discover_set_task_state(true, false, DISCOVER_PHASE_BUS_SCAN, ESP_OK);
-    if (xTaskCreate(bus_scan_task, "mb_discover", 4096, NULL, 3, &s_scan_task) != pdPASS) {
+    BaseType_t task_created = xTaskCreateWithCaps(
+        bus_scan_task, "mb_discover", 4096, (void *)1, 3, &s_scan_task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_created != pdPASS) {
+        task_created = xTaskCreate(
+            bus_scan_task, "mb_discover", 4096, NULL, 3, &s_scan_task);
+    }
+    if (task_created != pdPASS) {
         discover_set_task_state(false, true, DISCOVER_PHASE_ERROR, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }

@@ -34,6 +34,31 @@
 
 static const char *TAG = "MAIN";
 
+/* Queue control blocks must stay in internal RAM, but their item storage is
+ * ordinary CPU memory and can safely live in PSRAM. Keeping multi-kilobyte
+ * TCM/MQTT queue payloads out of scarce internal SRAM leaves enough headroom
+ * for lwIP and HTTP during large mapping imports. */
+static StaticQueue_t s_raw_queue_cb;
+static StaticQueue_t s_context_queue_cb;
+static StaticQueue_t s_mqtt_queue_cb;
+static uint8_t *s_raw_queue_storage;
+static uint8_t *s_context_queue_storage;
+static uint8_t *s_mqtt_queue_storage;
+
+static QueueHandle_t create_psram_queue(UBaseType_t length, UBaseType_t item_size,
+                                        StaticQueue_t *control, uint8_t **storage)
+{
+    size_t bytes = (size_t)length * item_size;
+    *storage = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (*storage == NULL) return NULL;
+    QueueHandle_t queue = xQueueCreateStatic(length, item_size, *storage, control);
+    if (queue == NULL) {
+        heap_caps_free(*storage);
+        *storage = NULL;
+    }
+    return queue;
+}
+
 /* Printed on every boot so an unexpected restart (panic, watchdog, brownout)
  * can be identified from the serial log even when the crash itself was missed. */
 static const char *reset_reason_name(esp_reset_reason_t reason)
@@ -218,9 +243,15 @@ void app_main(void)
         if (err != ESP_OK) ESP_LOGW(TAG, "RS485 Modbus RTU unavailable: %s", esp_err_to_name(err));
     }
 
-    QueueHandle_t raw = xQueueCreate(QUEUE_RAW_DATA_SIZE, sizeof(modbus_read_result_t));
-    QueueHandle_t context = xQueueCreate(QUEUE_CONTEXT_SIZE, sizeof(tcm_context_t));
-    QueueHandle_t mqtt_out = xQueueCreate(QUEUE_MQTT_OUT_SIZE, sizeof(mqtt_out_msg_t));
+    QueueHandle_t raw = create_psram_queue(
+        QUEUE_RAW_DATA_SIZE, sizeof(modbus_read_result_t),
+        &s_raw_queue_cb, &s_raw_queue_storage);
+    QueueHandle_t context = create_psram_queue(
+        QUEUE_CONTEXT_SIZE, sizeof(tcm_context_t),
+        &s_context_queue_cb, &s_context_queue_storage);
+    QueueHandle_t mqtt_out = create_psram_queue(
+        QUEUE_MQTT_OUT_SIZE, sizeof(mqtt_out_msg_t),
+        &s_mqtt_queue_cb, &s_mqtt_queue_storage);
     if (!raw || !context || !mqtt_out) {
         ESP_LOGE(TAG, "Pipeline queue allocation failed: raw=%p context=%p mqtt=%p",
                  raw, context, mqtt_out);

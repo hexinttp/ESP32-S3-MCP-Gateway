@@ -52,6 +52,8 @@ static QueueHandle_t s_mqtt_out_queue  = NULL;
 /* Async offline-cache queue: publish_task enqueues here non-blockingly and
    cache_writer_task performs the (slow/blocking) SPI-Flash FAT write. */
 static QueueHandle_t s_cache_queue      = NULL;
+static StaticQueue_t s_cache_queue_cb;
+static uint8_t *s_cache_queue_storage   = NULL;
 /* The publish task stack is large (ThingsCloud path nests deeply) and internal
    DRAM is too tight to host it, so it lives in PSRAM. The TCB must stay in
    internal RAM (a requirement of FreeRTOS static allocation). */
@@ -72,6 +74,7 @@ static SemaphoreHandle_t s_network_state_mutex  = NULL;
 
 static volatile bool s_running = false;
 static volatile bool s_modbus_poll_paused = false;
+static int64_t s_last_replay_deferred_log_ms = 0;
 
 /* ======================== Helper: Thread-safe network state ======================== */
 
@@ -541,6 +544,9 @@ static void cache_writer_task(void *arg)
                 ESP_LOGW(TAG, "Async cache write failed for seq=%lu (err=0x%x)",
                          (unsigned long)ctx.sequence_id, err);
             }
+            /* FAT fsync can monopolize a core. Yield between records so the
+             * idle task and protocol workers can run under sustained outage. */
+            vTaskDelay(1);
         }
     }
     s_task_cache_writer = NULL;
@@ -589,13 +595,19 @@ static void replay_task(void *arg)
         esp_err_t replay_err = uif_replay_all(s_mqtt_out_queue);
         if (replay_err == ESP_OK) {
             int cached_count = uif_get_cached_count();
-            ESP_LOGI(TAG, "Cache replay completed, %d records still cached", cached_count);
             if (cached_count < cached_before) {
                 eval_increment_metric("replayed_records",
                                       (uint32_t)(cached_before - cached_count));
+                ESP_LOGI(TAG, "Cache replay advanced: %d records still cached",
+                         cached_count);
             }
         } else {
-            ESP_LOGW(TAG, "Cache replay deferred (err=0x%x)", replay_err);
+            int64_t log_now_ms = esp_timer_get_time() / 1000;
+            if (s_last_replay_deferred_log_ms == 0 ||
+                log_now_ms - s_last_replay_deferred_log_ms >= 10000) {
+                ESP_LOGW(TAG, "Cache replay deferred (err=0x%x)", replay_err);
+                s_last_replay_deferred_log_ms = log_now_ms;
+            }
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
     }
@@ -706,7 +718,13 @@ void scheduler_init(QueueHandle_t raw_q,
     /* Async offline-cache queue (publish_task -> cache_writer_task). Its depth is
        intentionally small: offline persistence is best-effort and a slow/blocking
        SPI-Flash write must never back-pressure the real-time telemetry path. */
-    s_cache_queue = xQueueCreate(16, sizeof(tcm_context_t));
+    s_cache_queue_storage = heap_caps_malloc(
+        16U * sizeof(tcm_context_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_cache_queue_storage != NULL) {
+        s_cache_queue = xQueueCreateStatic(16, sizeof(tcm_context_t),
+                                           s_cache_queue_storage,
+                                           &s_cache_queue_cb);
+    }
     if (s_cache_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create async cache queue");
     }
@@ -845,6 +863,11 @@ void scheduler_stop(void)
         vSemaphoreDelete(s_replay_trigger);
         s_replay_trigger = NULL;
     }
+    if (s_cache_queue_storage != NULL) {
+        heap_caps_free(s_cache_queue_storage);
+        s_cache_queue_storage = NULL;
+        s_cache_queue = NULL;
+    }
 
     ESP_LOGI(TAG, "Scheduler stopped");
 }
@@ -882,7 +905,6 @@ void scheduler_set_network_state(network_state_t state)
            Flash record and allow it to be scheduled again after reconnect. */
         uif_replay_connection_lost();
     }
-
     /* Trigger replay when transitioning to ONLINE from a non-online state */
     if (state == NET_ONLINE && prev != NET_ONLINE) {
         ESP_LOGI(TAG, "Signaling replay task for cache flush");

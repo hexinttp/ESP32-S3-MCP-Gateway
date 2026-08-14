@@ -2717,7 +2717,10 @@ esp_err_t web_server_start(uint16_t port)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
-    config.stack_size = 8192;
+    /* MCP rule validation nests JSON handling, AMM lookups and persistence.
+     * The lookup workspaces are heap-backed; keep an additional request-stack
+     * guard for the remaining HTTP/MCP call chain. */
+    config.stack_size = 10240;
     config.task_priority = 5;
     config.max_uri_handlers = 60;
     config.max_open_sockets = 4;

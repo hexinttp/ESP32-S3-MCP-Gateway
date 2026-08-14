@@ -36,6 +36,8 @@ static int64_t s_last_publish_ms = 0;
 static volatile int s_last_response_code = 0;
 static volatile bool s_upload_suspended = false;
 static volatile int64_t s_rate_block_until_ms = 0;
+static int64_t s_last_throttle_log_ms = 0;
+static uint32_t s_suppressed_throttle_logs = 0;
 
 static bool adapter_lock(void)
 {
@@ -103,7 +105,18 @@ static esp_err_t tc_publish_telemetry(const char *topic, const char *payload)
 {
     if (!tc_rate_allow()) {
         s_throttled_count++;
-        ESP_LOGW(TAG, "Flow-control throttle: holding telemetry to '%s' (rate limited)", topic);
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (s_last_throttle_log_ms == 0 ||
+            now_ms - s_last_throttle_log_ms >= 10000) {
+            ESP_LOGW(TAG,
+                     "Flow-control throttle: holding telemetry to '%s' "
+                     "(rate limited, suppressed=%lu)",
+                     topic, (unsigned long)s_suppressed_throttle_logs);
+            s_last_throttle_log_ms = now_ms;
+            s_suppressed_throttle_logs = 0;
+        } else {
+            s_suppressed_throttle_logs++;
+        }
         return ESP_ERR_NO_MEM;
     }
     esp_err_t err = mqtt_publish(topic, payload, 0);
@@ -601,13 +614,24 @@ static bool fill_property_value(const tcm_context_t *ctx, cloud_property_update_
 static void add_context_to_agg(const tcm_context_t *ctx)
 {
     if (!agg_ensure_buffer()) return;
-    if (s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX) return;
-    cloud_property_update_t *p = &s_agg[s_agg_count];
-    if (!fill_property_value(ctx, p)) return;
+    char address[40];
     thingscloud_format_device_address((uint8_t)ctx->channel_id, ctx->slave_id,
-                                      p->device_address, sizeof(p->device_address));
+                                      address, sizeof(address));
+    cloud_property_update_t *p = NULL;
+    for (int i = 0; i < s_agg_count; ++i) {
+        if (strcmp(s_agg[i].device_address, address) == 0 &&
+            strcmp(s_agg[i].property_key, ctx->point_id) == 0) {
+            p = &s_agg[i];
+            break;
+        }
+    }
+    if (p == NULL) {
+        if (s_agg_count >= THINGSCLOUD_AGG_BUFFER_MAX) return;
+        p = &s_agg[s_agg_count++];
+    }
+    if (!fill_property_value(ctx, p)) return;
+    strlcpy(p->device_address, address, sizeof(p->device_address));
     strlcpy(p->property_key, ctx->point_id, sizeof(p->property_key));
-    s_agg_count++;
 }
 
 static bool agg_ensure_gw_buffer(void)
@@ -636,10 +660,6 @@ static bool agg_ensure_gw_buffer(void)
 static void add_context_to_gw_agg(const tcm_context_t *ctx)
 {
     if (!agg_ensure_gw_buffer()) return;
-    if (s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX) return;
-    cloud_property_update_t *p = &s_gw_agg[s_gw_count];
-    if (!fill_property_value(ctx, p)) return;
-
     char key[64];
     if (ctx->gateway_property_key[0] != '\0') {
         if (!thingscloud_gateway_key_valid(ctx->gateway_property_key)) {
@@ -655,8 +675,19 @@ static void add_context_to_gw_agg(const tcm_context_t *ctx)
                  ctx->point_id);
         return;
     }
+    cloud_property_update_t *p = NULL;
+    for (int i = 0; i < s_gw_count; ++i) {
+        if (strcmp(s_gw_agg[i].property_key, key) == 0) {
+            p = &s_gw_agg[i];
+            break;
+        }
+    }
+    if (p == NULL) {
+        if (s_gw_count >= THINGSCLOUD_AGG_BUFFER_MAX) return;
+        p = &s_gw_agg[s_gw_count++];
+    }
+    if (!fill_property_value(ctx, p)) return;
     strlcpy(p->property_key, key, sizeof(p->property_key));
-    s_gw_count++;
 }
 
 esp_err_t thingscloud_publish_context(const tcm_context_t *ctx)
@@ -684,7 +715,11 @@ esp_err_t thingscloud_publish_context(const tcm_context_t *ctx)
     if (full) {
         s_dropped_count++;
         adapter_unlock();
-        return ESP_ERR_NO_MEM;
+        /* The MQTT session is healthy but a durable replay currently owns the
+         * cloud response channel. Keep the newest aggregate already buffered
+         * and report pressure via dropped_count; this is not an offline event
+         * and must not recursively create more UIF records. */
+        return ESP_OK;
     }
     bool should_flush = false;
     if (rt.mqtt.report_mode == MQ_REPORT_GATEWAY) {
